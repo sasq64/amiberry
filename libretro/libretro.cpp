@@ -170,6 +170,9 @@ static std::string content_temp_directory;
 static std::string cached_model;
 static std::string cached_kickstart_override;
 static std::string cached_cpu_model;
+static std::string cached_jit;
+static std::string cached_cpu_speed;
+static std::string cached_z3mem_size;
 static std::string cached_chipset;
 static std::string cached_chipset_aga;
 static std::string cached_audio_rate;
@@ -677,7 +680,10 @@ static void log_mouse_motion(int16_t dx, int16_t dy)
 static const struct retro_variable variables[] = {
 	{ "amiberry_model", "Amiga Model; A500|A500OG|A500+|A600|A1200OG|A1200|A4030|A4040|CD32|CD32FR|CDTV" },
 	{ "amiberry_kickstart", "Kickstart ROM; auto|kick.rom|kick13.rom|kick20.rom|kick31.rom|kick205.rom|kick40068.A1200|kick40068.A4000|cd32.rom|cdtv.rom" },
-	{ "amiberry_cpu_model", "CPU Model; auto|68000|68010|68020|68030" },
+	{ "amiberry_cpu_model", "CPU Model; auto|68000|68010|68020|68030|68040|68060" },
+	{ "amiberry_z3mem_size", "Zorro III RAM (MB); auto|0|1|2|4|8|16|32|64|128|256|512" },
+	{ "amiberry_jit", "JIT Recompiler (68020+); disabled|enabled" },
+	{ "amiberry_cpu_speed", "CPU Speed; default|real|max" },
 	{ "amiberry_chipset", "Chipset; auto|ocs|ecs" },
 	{ "amiberry_chipset_aga", "Chipset (AGA Models); auto|ocs|ecs|aga" },
 	{ "amiberry_audio_rate", "Audio Rate (Hz); auto|44100|48000" },
@@ -776,9 +782,64 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "68010", "68010" },
 			{ "68020", "68020" },
 			{ "68030", "68030" },
+			{ "68040", "68040" },
+			{ "68060", "68060" },
 			{ NULL, NULL }
 		},
 		"auto"
+	},
+	{
+		"amiberry_z3mem_size",
+		"Zorro III RAM (MB)",
+		"Zorro III RAM",
+		"Zorro III (32-bit) fast RAM. Requires a 68020 or better CPU and a model with 32-bit addressing. Uses model defaults when set to Auto. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "auto", "Auto" },
+			{ "0", "None" },
+			{ "1", "1 MB" },
+			{ "2", "2 MB" },
+			{ "4", "4 MB" },
+			{ "8", "8 MB" },
+			{ "16", "16 MB" },
+			{ "32", "32 MB" },
+			{ "64", "64 MB" },
+			{ "128", "128 MB" },
+			{ "256", "256 MB" },
+			{ "512", "512 MB" },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_jit",
+		"JIT Recompiler (68020+)",
+		"JIT Recompiler",
+		"Use the 68K JIT recompiler. Requires a 68020 or better CPU and turns off cycle-exact timing, so leave it off for timing-sensitive OCS/ECS software. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "disabled", "Disabled" },
+			{ "enabled", "Enabled" },
+			{ NULL, NULL }
+		},
+		"disabled"
+	},
+	{
+		"amiberry_cpu_speed",
+		"CPU Speed",
+		"CPU Speed",
+		"How fast the emulated CPU runs. 'real' throttles it to the modelled machine's clock; 'max' runs it as fast as the host allows, which is what accelerated software (68030+ demos, WHDLoad) expects. 'default' leaves the model preset's own choice alone. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "default", "Model default" },
+			{ "real", "Real (throttled)" },
+			{ "max", "Fastest possible" },
+			{ NULL, NULL }
+		},
+		"default"
 	},
 	{
 		"amiberry_chipset",
@@ -3052,6 +3113,12 @@ static void snapshot_core_options()
 	cached_kickstart_override = kick ? kick : "";
 	const char* cpu_model = get_option_value("amiberry_cpu_model");
 	cached_cpu_model = cpu_model ? cpu_model : "";
+	const char* jit = get_option_value("amiberry_jit");
+	cached_jit = jit ? jit : "";
+	const char* cpu_speed = get_option_value("amiberry_cpu_speed");
+	cached_cpu_speed = cpu_speed ? cpu_speed : "";
+	const char* z3mem = get_option_value("amiberry_z3mem_size");
+	cached_z3mem_size = z3mem ? z3mem : "";
 	const char* chipset = get_option_value("amiberry_chipset");
 	cached_chipset = chipset ? chipset : "";
 	const char* chipset_aga = get_option_value("amiberry_chipset_aga");
@@ -4016,6 +4083,53 @@ static void core_entry(void)
 	const char* cpu_model = cached_cpu_model.empty() ? nullptr : cached_cpu_model.c_str();
 	if (!is_rp9 && cpu_model && strcmp(cpu_model, "auto") != 0) {
 		push_s_option(std::string("cpu_model=") + cpu_model);
+		// 68040/68060 have an on-chip FPU, and the preset's 68882 is not a valid
+		// pairing for them.  They are also 32-bit parts, so drop the 24-bit
+		// address space a 68000-era preset would otherwise leave set.
+		if (strcmp(cpu_model, "68040") == 0 || strcmp(cpu_model, "68060") == 0) {
+			push_s_option(std::string("fpu_model=") + cpu_model);
+			push_s_option("address_space_24=false");
+		}
+	}
+
+	const char* z3mem = cached_z3mem_size.empty() ? nullptr : cached_z3mem_size.c_str();
+	if (!is_rp9 && z3mem && strcmp(z3mem, "auto") != 0) {
+		// Zorro III lives above the 24-bit window, so it is only reachable with
+		// a 32-bit address space.
+		push_s_option("address_space_24=false");
+		push_s_option(std::string("z3mem_size=") + z3mem);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "Zorro III RAM: %s MB\n", z3mem);
+	}
+
+	// JIT.  The bip_*() entry points main.cpp uses for --model are the two-arg
+	// Amiberry wrappers, which call bip_xxx(p, 0, 0, 0) directly and so skip the
+	// buildin_default_prefs() that built_in_prefs() would have run first.  That
+	// leaves cpu_cycle_exact at the value default_prefs() set, and fixup_cpu()
+	// then zeroes cachesize with "JIT and cycle-exact can't be enabled
+	// simultaneously" — so a preset's own cachesize never survives.  Clear the
+	// cycle-exact flags and set cachesize here, after --model, where the -s
+	// options are applied late enough to win.
+	if (!is_rp9 && !cached_jit.empty() && cached_jit == "enabled") {
+		push_s_option("cpu_cycle_exact=false");
+		push_s_option("cpu_memory_cycle_exact=false");
+		push_s_option("blitter_cycle_exact=false");
+		push_s_option("cpu_compatible=false");
+		push_s_option("cachesize=16384");
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "JIT enabled (cachesize=16384, cycle-exact off)\n");
+	}
+
+	// The model presets pick the CPU speed via set_680x0_compa(), and the
+	// 2-arg bip_* wrappers main.cpp uses hardcode compa=0, which always means
+	// "real" - the emulated CPU is throttled to the modelled machine's clock
+	// even for a 68040. Software that expects an accelerator (Starstruck's
+	// depacker, WHDLoad titles) then runs tens of times slower than under
+	// p-uae, which defaults to unthrottled. Pushed after --model so it wins.
+	if (!is_rp9 && !cached_cpu_speed.empty() && cached_cpu_speed != "default") {
+		push_s_option("cpu_speed=" + cached_cpu_speed);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "CPU speed: %s\n", cached_cpu_speed.c_str());
 	}
 
 	const char* chipset = cached_chipset_value();
