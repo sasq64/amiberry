@@ -4320,6 +4320,26 @@ static void core_entry(void)
 				log_cb(RETRO_LOG_INFO, "CD image: %s\n", game_path);
 			std::string cd_opt = std::string("cdimage0=") + game_path + ",image";
 			push_s_option(cd_opt);
+		} else if (dir_exists(game_path)) {
+			// A plain directory is mounted as a bootable dir-as-harddrive, the
+			// way P-UAE does it.  Frontends hand over a prepared tree (a
+			// generated s/startup-sequence plus the demo's files) rather than an
+			// image, and without this the path would fall through to the
+			// positional branch below and be offered to the emulator as a
+			// floppy, leaving no bootable media at all.
+			// Format: filesystem2=rw,DEVNAME:VOLNAME:PATH,bootpri
+			std::string vol = game_path;
+			const size_t slash = vol.find_last_of("/\\");
+			if (slash != std::string::npos)
+				vol.erase(0, slash + 1);
+			while (!vol.empty() && (vol.back() == '/' || vol.back() == '\\'))
+				vol.pop_back();
+			if (vol.empty())
+				vol = "DH0";
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "Directory hard drive: %s (volume %s)\n",
+					game_path, vol.c_str());
+			push_s_option("filesystem2=rw,DH0:" + vol + ":" + std::string(game_path) + ",0");
 		} else if (game_ext == "hdf" || game_ext == "hdz") {
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO, "HDF image: %s\n", game_path);
