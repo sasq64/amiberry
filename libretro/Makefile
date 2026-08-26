@@ -427,6 +427,8 @@ SOURCES_JIT := $(AMIBERRY_DIR)/src/jit/compemu.cpp \
                $(AMIBERRY_DIR)/src/jit/compstbl.cpp
 
 # Disable JIT for 64-bit x86 libretro builds (addressing 32-bit pointer checks).
+# Override with `make JIT=1` to build the recompiler back in.
+ifneq ($(JIT), 1)
 ifneq (,$(findstring x86_64,$(ARCH)))
    FLAGS += -DLIBRETRO_NO_JIT
    SOURCES_JIT :=
@@ -434,6 +436,7 @@ endif
 ifneq (,$(findstring amd64,$(ARCH)))
    FLAGS += -DLIBRETRO_NO_JIT
    SOURCES_JIT :=
+endif
 endif
 
 SOURCES_PPC := $(AMIBERRY_DIR)/src/ppc/ppc.cpp \
