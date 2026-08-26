@@ -1,0 +1,134 @@
+name: libretro core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [demarc]
+    paths-ignore:
+      - '**.md'
+      - 'wiki/**'
+      - '.github/ISSUE_TEMPLATE/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    # Oldest supported runner, so the core links against an older glibc and
+    # stays loadable on the widest range of RetroArch installs.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config zlib1g-dev curl file
+
+      - name: Build core
+        run: make -C libretro platform=unix -j"$(nproc)"
+
+      - name: Inspect core
+        run: |
+          file libretro/amiberry_libretro.so
+          ls -l libretro/amiberry_libretro.so
+          cat libretro/amiberry_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry_libretro-linux-x86_64
+          path: |
+            libretro/amiberry_libretro.so
+            libretro/amiberry_libretro.info
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install pkgconf || true
+
+      - name: Build core
+        run: make -C libretro platform=osx ARCH=arm64 -j"$(sysctl -n hw.ncpu)"
+
+      - name: Inspect core
+        run: |
+          file libretro/amiberry_libretro.dylib
+          ls -l libretro/amiberry_libretro.dylib
+          cat libretro/amiberry_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry_libretro-macos-arm64
+          path: |
+            libretro/amiberry_libretro.dylib
+            libretro/amiberry_libretro.info
+          if-no-files-found: error
+
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # CLANG64 matches the toolchain the libretro Makefile prefers on Windows
+      # (it probes /clang64/bin/clang.exe), and keeps the core's ABI aligned
+      # with the Clang/LLD-based main Amiberry Windows build.
+      - name: Set up MSYS2 (CLANG64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          release: false
+          install: >-
+            make
+            curl
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-libiconv
+
+      - name: Build core
+        run: make -C libretro platform=win -j"$(nproc)"
+
+      - name: Inspect core
+        run: |
+          file libretro/amiberry_libretro.dll || true
+          ls -l libretro/amiberry_libretro.dll
+          cat libretro/amiberry_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry_libretro-windows-x64
+          path: |
+            libretro/amiberry_libretro.dll
+            libretro/amiberry_libretro.info
+          if-no-files-found: error

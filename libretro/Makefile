@@ -130,7 +130,9 @@ FLAGS += -DAMIBERRY -DLIBRETRO -DWITH_PPC -DWITH_QEMU_CPU -DUTF8PROC_STATIC -D_F
 FLAGS += -DAMIBERRY_VERSION=\"$(AMIBERRY_VERSION)\" -DAMIBERRY_VERSION_PRE_RELEASE=\"\"
 FLAGS += -DAMIBERRY_VERSION_MAJOR=$(AMIBERRY_VERSION_MAJOR) -DAMIBERRY_VERSION_MINOR=$(AMIBERRY_VERSION_MINOR) -DAMIBERRY_VERSION_PATCH=$(AMIBERRY_VERSION_PATCH)
 FLAGS += -DAMIBERRY_IS_PRE_RELEASE=0
-FLAGS += -DAMIBERRY_BUILD_YEAR=$(shell date +%Y) -DAMIBERRY_BUILD_MONTH=$(shell date +%-m) -DAMIBERRY_BUILD_DAY=$(shell date +%-d)
+# `date +%-m` (strip leading zero) is a GNU extension; BSD/macOS date does not
+# support it, so strip the padding with sed instead to keep the build portable.
+FLAGS += -DAMIBERRY_BUILD_YEAR=$(shell date +%Y) -DAMIBERRY_BUILD_MONTH=$(shell date +%m | sed 's/^0//') -DAMIBERRY_BUILD_DAY=$(shell date +%d | sed 's/^0//')
 FLAGS += -DAMIBERRY_BUILD_DATE=\"$(shell date +%Y-%m-%d)\"
 FLAGS += -DOSDEP_GFX_PLATFORM_HEADER=\"libretro/gfx_platform_internal.h\"
 FLAGS += -DOSDEP_AMIBERRY_PLATFORM_HEADER=\"libretro/amiberry_platform_internal.h\"
