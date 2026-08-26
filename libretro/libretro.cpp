@@ -1838,7 +1838,13 @@ static bool find_kickstart_in_system_dir(const char* model, char* out, size_t ou
 	const char* candidates_a500p[] = { "kick20.rom", "kick204.rom", "kick.rom" };
 	const char* candidates_a600[] = { "kick205.rom", "kick20.rom", "kick31.rom", "kick.rom" };
 	const char* candidates_a1200[] = { "kick31.rom", "kick40068.A1200", "kick.rom" };
-	const char* candidates_a4000[] = { "kick31.rom", "kick40068.A4000", "kick.rom" };
+	// kick40068.A1200 is the same 3.1 revision (40.68) but it is *not* an A4000
+	// ROM: booted on an A4000 config it brings up a Gayle/A1200 machine whose
+	// AmigaOS never adds the RAMSEY motherboard RAM or the Zorro III board, so
+	// anything wanting real fastram dies with "Out of memory" (Starstruck asks
+	// for one 48 MB block). Kept as a last resort so an A4000 config still
+	// boots at all, but warned about below - it is not a working substitute.
+	const char* candidates_a4000[] = { "kick31.rom", "kick40068.A4000", "kick.rom", "kick40068.A1200" };
 	const char* candidates_cd32[] = { "cd32.rom", "amiga-os-310-cd32.rom", "kick40060.CD32", "kick31.rom", "kick.rom" };
 	const char* candidates_cdtv[] = { "cdtv.rom", "kick34005.CDTV", "kick13.rom", "kick.rom" };
 
@@ -1876,6 +1882,13 @@ static bool find_kickstart_in_system_dir(const char* model, char* out, size_t ou
 	for (size_t i = 0; i < count; i++) {
 		const std::string candidate = path_join(system_dir, candidates[i]);
 		if (file_readable(candidate.c_str())) {
+			if (log_cb && base == "A4000" && strcmp(candidates[i], "kick40068.A1200") == 0) {
+				log_cb(RETRO_LOG_WARN,
+					"No A4000 Kickstart in the system dir - falling back to %s. "
+					"The machine will boot but has no usable fast RAM; add "
+					"kick40068.A4000 (or kick31.rom) for a working A4000.\n",
+					candidates[i]);
+			}
 			strncpy(out, candidate.c_str(), out_size - 1);
 			out[out_size - 1] = '\0';
 			return true;
