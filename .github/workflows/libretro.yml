@@ -34,13 +34,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config zlib1g-dev curl file
 
+      # JIT=1 is the Makefile default now, but pass it explicitly so an upstream
+      # merge that restores the old x86_64 exclusion cannot silently ship an
+      # interpreter-only core.
       - name: Build core
-        run: make -C libretro platform=unix -j"$(nproc)"
+        run: make -C libretro platform=unix JIT=1 -j"$(nproc)"
 
       - name: Inspect core
         run: |
           file libretro/amiberry_libretro.so
           ls -l libretro/amiberry_libretro.so
+          # Fail if the recompiler was left out: such a core still offers the
+          # "JIT Recompiler" option, which then only turns cycle-exact timing off.
+          grep -qa 'JIT: cache=' libretro/amiberry_libretro.so
           cat libretro/amiberry_libretro.info
 
       - name: Upload core
@@ -68,12 +74,15 @@ jobs:
         run: brew install pkgconf || true
 
       - name: Build core
-        run: make -C libretro platform=osx ARCH=arm64 -j"$(sysctl -n hw.ncpu)"
+        run: make -C libretro platform=osx ARCH=arm64 JIT=1 -j"$(sysctl -n hw.ncpu)"
 
       - name: Inspect core
         run: |
           file libretro/amiberry_libretro.dylib
           ls -l libretro/amiberry_libretro.dylib
+          # Fail if the recompiler was left out: such a core still offers the
+          # "JIT Recompiler" option, which then only turns cycle-exact timing off.
+          grep -qa 'JIT: cache=' libretro/amiberry_libretro.dylib
           cat libretro/amiberry_libretro.info
 
       - name: Upload core
@@ -116,12 +125,15 @@ jobs:
             mingw-w64-clang-x86_64-libiconv
 
       - name: Build core
-        run: make -C libretro platform=win -j"$(nproc)"
+        run: make -C libretro platform=win JIT=1 -j"$(nproc)"
 
       - name: Inspect core
         run: |
           file libretro/amiberry_libretro.dll || true
           ls -l libretro/amiberry_libretro.dll
+          # Fail if the recompiler was left out: such a core still offers the
+          # "JIT Recompiler" option, which then only turns cycle-exact timing off.
+          grep -qa 'JIT: cache=' libretro/amiberry_libretro.dll
           cat libretro/amiberry_libretro.info
 
       - name: Upload core

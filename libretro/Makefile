@@ -428,17 +428,14 @@ SOURCES_JIT := $(AMIBERRY_DIR)/src/jit/compemu.cpp \
                $(AMIBERRY_DIR)/src/jit/compemu_support.cpp \
                $(AMIBERRY_DIR)/src/jit/compstbl.cpp
 
-# Disable JIT for 64-bit x86 libretro builds (addressing 32-bit pointer checks).
-# Override with `make JIT=1` to build the recompiler back in.
-ifneq ($(JIT), 1)
-ifneq (,$(findstring x86_64,$(ARCH)))
+# Build the recompiler on every JIT-capable target (x86_64 and AArch64, see
+# sysconfig.h), matching the CMake desktop build's USE_JIT default.  x86_64 was
+# excluded here, which shipped cores whose "JIT Recompiler" core option did
+# nothing but switch cycle-exact timing off.  `make JIT=0` drops back to the
+# interpreter; object files do not track this, so run `make clean` when flipping it.
+ifeq ($(JIT), 0)
    FLAGS += -DLIBRETRO_NO_JIT
    SOURCES_JIT :=
-endif
-ifneq (,$(findstring amd64,$(ARCH)))
-   FLAGS += -DLIBRETRO_NO_JIT
-   SOURCES_JIT :=
-endif
 endif
 
 SOURCES_PPC := $(AMIBERRY_DIR)/src/ppc/ppc.cpp \
