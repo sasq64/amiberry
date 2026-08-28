@@ -170,6 +170,7 @@ static std::string content_temp_directory;
 static std::string cached_model;
 static std::string cached_kickstart_override;
 static std::string cached_cpu_model;
+static std::string cached_fpu_model;
 static std::string cached_jit;
 static std::string cached_cpu_speed;
 static std::string cached_z3mem_size;
@@ -681,6 +682,7 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_model", "Amiga Model; A500|A500OG|A500+|A600|A1200OG|A1200|A4030|A4040|CD32|CD32FR|CDTV" },
 	{ "amiberry_kickstart", "Kickstart ROM; auto|kick.rom|kick13.rom|kick20.rom|kick31.rom|kick205.rom|kick40068.A1200|kick40068.A4000|cd32.rom|cdtv.rom" },
 	{ "amiberry_cpu_model", "CPU Model; auto|68000|68010|68020|68030|68040|68060" },
+	{ "amiberry_fpu_model", "FPU Model; auto|none|68881|68882|internal" },
 	{ "amiberry_z3mem_size", "Zorro III RAM (MB); auto|0|1|2|4|8|16|32|64|128|256|512" },
 	{ "amiberry_jit", "JIT Recompiler (68020+); disabled|enabled" },
 	{ "amiberry_cpu_speed", "CPU Speed; default|real|max" },
@@ -784,6 +786,23 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "68030", "68030" },
 			{ "68040", "68040" },
 			{ "68060", "68060" },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_fpu_model",
+		"FPU Model",
+		"FPU Model",
+		"Add a maths coprocessor. 'Internal' is the FPU built into a 68040/68060. A 68881/68882 needs a 68020 or better CPU. Uses the model preset's own FPU when set to Auto. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "auto", "Auto" },
+			{ "none", "None" },
+			{ "68881", "68881" },
+			{ "68882", "68882" },
+			{ "internal", "Internal (68040/68060)" },
 			{ NULL, NULL }
 		},
 		"auto"
@@ -1818,6 +1837,28 @@ static std::string model_base_name(const char* model)
 	if (strncmp(model, "CD32", 4) == 0) return "CD32";
 	if (strncmp(model, "CDTV", 4) == 0) return "CDTV";
 	return model;
+}
+
+// The CPU a model preset leaves in place when "CPU Model" is on auto.
+// Mirrors the bip_*() presets in src/cfgfile.cpp.
+static int preset_default_cpu(const char* model)
+{
+	const std::string base = model_base_name(model);
+	if (base == "A4000")
+		return (model && strcmp(model, "A4040") == 0) ? 68040 : 68030;
+	if (base == "A1200" || base == "CD32")
+		return 68020;
+	return 68000;
+}
+
+// The FPU a model preset leaves in place when "FPU Model" is on auto.  Only the
+// A4000-based presets ship one: bip_a4000() sets 68882, and our A4040 override
+// replaces it with the 68040's internal FPU.
+static int preset_default_fpu(const char* model)
+{
+	if (model_base_name(model) != "A4000")
+		return 0;
+	return (model && strcmp(model, "A4040") == 0) ? 68040 : 68882;
 }
 
 static bool find_kickstart_in_system_dir(const char* model, char* out, size_t out_size)
@@ -3126,6 +3167,8 @@ static void snapshot_core_options()
 	cached_kickstart_override = kick ? kick : "";
 	const char* cpu_model = get_option_value("amiberry_cpu_model");
 	cached_cpu_model = cpu_model ? cpu_model : "";
+	const char* fpu_model = get_option_value("amiberry_fpu_model");
+	cached_fpu_model = fpu_model ? fpu_model : "";
 	const char* jit = get_option_value("amiberry_jit");
 	cached_jit = jit ? jit : "";
 	const char* cpu_speed = get_option_value("amiberry_cpu_speed");
@@ -4093,23 +4136,71 @@ static void core_entry(void)
 		}
 	}
 
+	// CPU and FPU.  cfgfile's "cpu_model=" handler zeroes fpu_model, so the FPU
+	// has to be pushed after it or the preset's coprocessor silently disappears.
 	const char* cpu_model = cached_cpu_model.empty() ? nullptr : cached_cpu_model.c_str();
-	if (!is_rp9 && cpu_model && strcmp(cpu_model, "auto") != 0) {
+	const bool cpu_override = cpu_model && strcmp(cpu_model, "auto") != 0;
+	const int effective_cpu = cpu_override ? atoi(cpu_model) : preset_default_cpu(model);
+	if (!is_rp9 && cpu_override) {
 		push_s_option(std::string("cpu_model=") + cpu_model);
-		// 68040/68060 have an on-chip FPU, and the preset's 68882 is not a valid
-		// pairing for them.  They are also 32-bit parts, so drop the 24-bit
-		// address space a 68000-era preset would otherwise leave set.
-		if (strcmp(cpu_model, "68040") == 0 || strcmp(cpu_model, "68060") == 0) {
-			push_s_option(std::string("fpu_model=") + cpu_model);
-			push_s_option("address_space_24=false");
+		// 68030 and up are fully 32-bit parts, so drop the 24-bit address space
+		// a 68000-era preset (or the A1200's 68EC020) would otherwise leave set.
+		// cfgfile spells this one "cpu_24bit_addressing"; "address_space_24" is
+		// only the internal field name and is silently ignored as an option.
+		if (effective_cpu >= 68030)
+			push_s_option("cpu_24bit_addressing=false");
+	}
+
+	const char* fpu_model = cached_fpu_model.empty() ? nullptr : cached_fpu_model.c_str();
+	if (!is_rp9) {
+		int fpu = -1;
+		if (!fpu_model || strcmp(fpu_model, "auto") == 0) {
+			// Only re-state the preset's FPU when an explicit CPU override wiped
+			// it; otherwise leave the preset entirely alone.
+			if (cpu_override) {
+				const int preset_fpu = preset_default_fpu(model);
+				if (effective_cpu >= 68040)
+					fpu = effective_cpu;
+				else if (preset_fpu && effective_cpu >= 68020)
+					// A 68040's internal FPU is not a valid pairing for a
+					// downgraded CPU; give it the coprocessor instead.
+					fpu = preset_fpu >= 68040 ? 68882 : preset_fpu;
+			}
+		} else if (strcmp(fpu_model, "none") == 0) {
+			fpu = 0;
+		} else if (strcmp(fpu_model, "internal") == 0) {
+			// Only the 68040/68060 have one; fall back to the coprocessor an
+			// accelerated 68020/68030 would have carried.
+			fpu = effective_cpu >= 68040 ? effective_cpu : 68882;
+		} else {
+			fpu = atoi(fpu_model);
+			// fixup_cpu() rewrites any FPU on a 68040/68060 to the internal one.
+			if (effective_cpu >= 68040)
+				fpu = effective_cpu;
 		}
+
+		if (fpu >= 0) {
+			push_s_option("fpu_model=" + std::to_string(fpu));
+			if (log_cb) {
+				if (fpu == 0)
+					log_cb(RETRO_LOG_INFO, "FPU: none\n");
+				else
+					log_cb(RETRO_LOG_INFO, "FPU: %d\n", fpu);
+			}
+		}
+		// fixup_cpu() drops an FPU on a 68000/68010 running in compatible or
+		// cycle-exact mode, which is every preset we hand out.
+		if (fpu > 0 && effective_cpu < 68020 && log_cb)
+			log_cb(RETRO_LOG_WARN,
+				"FPU %d requires a 68020 or better CPU; it will be disabled on the %d\n",
+				fpu, effective_cpu);
 	}
 
 	const char* z3mem = cached_z3mem_size.empty() ? nullptr : cached_z3mem_size.c_str();
 	if (!is_rp9 && z3mem && strcmp(z3mem, "auto") != 0) {
 		// Zorro III lives above the 24-bit window, so it is only reachable with
 		// a 32-bit address space.
-		push_s_option("address_space_24=false");
+		push_s_option("cpu_24bit_addressing=false");
 		push_s_option(std::string("z3mem_size=") + z3mem);
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "Zorro III RAM: %s MB\n", z3mem);
@@ -4821,6 +4912,9 @@ void retro_run(void)
 		if (path_extension_lower(game_path) == "rp9")
 			sync_rp9_disk_control_media();
 		core_started = true;
+		libretro_debug_log("boot prefs: cpu=%d fpu=%d 24bit=%d jit=%d\n",
+			currprefs.cpu_model, currprefs.fpu_model,
+			(int)currprefs.address_space_24, currprefs.cachesize);
 		update_memory_map();
 		return;
 	}
