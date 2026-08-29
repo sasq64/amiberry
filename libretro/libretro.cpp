@@ -1858,6 +1858,45 @@ static bool dir_exists(const std::string& path)
 	return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+// A WHDLoad release that has already been unpacked to a directory: the shape a
+// frontend hands over when it extracts the .lha itself.  amiberry's whdbooter
+// takes a directory as happily as an archive (it scans one for .slave files the
+// same way), so all that is missing is recognising the content as WHDLoad in the
+// first place -- which extension matching cannot do for a directory.
+//
+// Releases keep the slave either at the top level or one level down, in the game
+// folder the archive carried, so a shallow scan is enough; going deeper would
+// only cost time on directory content that is not WHDLoad at all.
+static bool dir_contains_whdload_slave(const std::string& path, int depth = 2)
+{
+	if (path.empty())
+		return false;
+
+	struct RDIR* dir = retro_opendir(path.c_str());
+	if (!dir)
+		return false;
+
+	bool found = false;
+	std::vector<std::string> subdirectories;
+	while (!found && retro_readdir(dir) > 0) {
+		const char* name = retro_dirent_get_name(dir);
+		if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+			continue;
+		if (retro_dirent_is_dir(dir, nullptr)) {
+			if (depth > 0)
+				subdirectories.push_back(path_join(path, name));
+		} else if (path_extension_lower(name) == "slave") {
+			found = true;
+		}
+	}
+	retro_closedir(dir);
+
+	for (auto it = subdirectories.begin(); !found && it != subdirectories.end(); ++it)
+		found = dir_contains_whdload_slave(*it, depth - 1);
+
+	return found;
+}
+
 // Map a model preset name to its base model family for kickstart/CD detection.
 // e.g. "A1200OG" -> "A1200", "A4030" -> "A4000", "CD32FR" -> "CD32"
 static std::string model_base_name(const char* model)
@@ -4204,7 +4243,9 @@ static void core_entry(void)
 	std::string game_ext;
 	if (game_path[0])
 		game_ext = path_extension_lower(game_path);
-	const bool is_whdload = (game_ext == "lha" || game_ext == "lzh");
+	const bool is_whdload_dir = game_path[0] && dir_exists(game_path)
+		&& dir_contains_whdload_slave(game_path);
+	const bool is_whdload = (game_ext == "lha" || game_ext == "lzh") || is_whdload_dir;
 	const bool is_rp9 = game_ext == "rp9";
 	const bool is_cd = content_is_cd || is_cd_extension(game_ext);
 	const bool user_kick_override = !cached_kickstart_override.empty() && cached_kickstart_override != "auto";
@@ -5171,7 +5212,8 @@ bool retro_load_game(const struct retro_game_info *info)
 		path = info->path;
 
 	const std::string ext = info_ext && info_ext->ext ? info_ext->ext : path_extension_lower(path);
-	const bool is_whdload = (ext == "lha" || ext == "lzh");
+	const bool is_whdload_dir = dir_exists(path) && dir_contains_whdload_slave(path);
+	const bool is_whdload = (ext == "lha" || ext == "lzh") || is_whdload_dir;
 	const bool is_rp9 = ext == "rp9";
 	libretro_debug_log("retro_load_game: path='%s' ext='%s' is_whdload=%d is_rp9=%d\n",
 		path.c_str(), ext.c_str(), is_whdload ? 1 : 0, is_rp9 ? 1 : 0);
@@ -5267,7 +5309,7 @@ bool retro_load_game(const struct retro_game_info *info)
 			disk_ejected = false;
 			last_disk_index = 0;
 			last_disk_ejected = false;
-			if (!is_rp9) {
+			if (!is_rp9 && !is_whdload_dir) {
 				DiskImage image;
 				image.path = package_path;
 				disk_images.push_back(image);

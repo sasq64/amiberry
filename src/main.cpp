@@ -1415,7 +1415,19 @@ static void parse_cmdline (int argc, TCHAR **argv)
 			{
 				auto* const txt = parsetextpath(argv[++i]);
 				const auto txt2 = get_filename_extension(txt); // Extract the extension from the string  (incl '.')
-				if (_tcsicmp(txt2.c_str(), ".rp9") == 0)
+				std::error_code autoload_ec;
+				if (std::filesystem::is_directory(txt, autoload_ec))
+				{
+					// An unpacked WHDLoad release. The whdbooter scans a directory for
+					// .slave files exactly as it scans an archive, so the only thing it
+					// needs is to be told that this path is WHDLoad content: an extension
+					// cannot say so for a directory.
+					write_log("WHDLoad (directory)... %s\n", txt);
+					add_file_to_mru_list(lstMRUWhdloadList, std::string(txt));
+					whdload_prefs.whdload_filename = std::string(txt);
+					whdload_auto_prefs(&currprefs, txt);
+				}
+				else if (_tcsicmp(txt2.c_str(), ".rp9") == 0)
 				{
 					write_log("RP9... %s\n", txt);
 					if (target_cfgfile_load(&currprefs, txt, CONFIG_TYPE_ALL, 0))
