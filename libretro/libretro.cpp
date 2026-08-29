@@ -173,6 +173,8 @@ static std::string cached_cpu_model;
 static std::string cached_fpu_model;
 static std::string cached_jit;
 static std::string cached_cpu_speed;
+static std::string cached_chipmem_size;
+static std::string cached_bogomem_size;
 static std::string cached_z3mem_size;
 static std::string cached_chipset;
 static std::string cached_chipset_aga;
@@ -685,6 +687,8 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_kickstart", "Kickstart ROM; auto|kick.rom|kick13.rom|kick20.rom|kick31.rom|kick205.rom|kick40068.A1200|kick40068.A4000|cd32.rom|cdtv.rom" },
 	{ "amiberry_cpu_model", "CPU Model; auto|68000|68010|68020|68030|68040|68060" },
 	{ "amiberry_fpu_model", "FPU Model; auto|none|68881|68882|internal" },
+	{ "amiberry_chipmem_size", "Chip RAM; auto|1|2|4|8|16" },
+	{ "amiberry_bogomem_size", "Slow RAM; auto|0|2|4|6|7" },
 	{ "amiberry_z3mem_size", "Zorro III RAM (MB); auto|0|1|2|4|8|16|32|64|128|256|512" },
 	{ "amiberry_jit", "JIT Recompiler (68020+); disabled|enabled" },
 	{ "amiberry_cpu_speed", "CPU Speed; default|real|max" },
@@ -812,6 +816,42 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "68881", "68881" },
 			{ "68882", "68882" },
 			{ "internal", "Internal (68040/68060)" },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_chipmem_size",
+		"Chip RAM",
+		"Chip RAM",
+		"Size of Chip RAM, the memory the custom chips can reach. More than 512 KB needs an ECS Agnus (1-2 MB) or AGA (up to 8 MB); the model presets pick a matching Agnus, so raising this on an OCS model leaves the extra RAM invisible to the chipset. Uses model defaults when set to Auto. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "auto", "Auto" },
+			{ "1", "512 KB" },
+			{ "2", "1 MB" },
+			{ "4", "2 MB" },
+			{ "8", "4 MB" },
+			{ "16", "8 MB" },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_bogomem_size",
+		"Slow RAM",
+		"Slow RAM",
+		"Size of Slow RAM (also called bogo or trapdoor RAM) at 0xC00000. This is the A500's classic 512 KB trapdoor expansion. Sizes above 1.5 MB do not exist on machines with a Gary/Ramsey chipset (A600 and later), and 1.5 MB is unavailable with the JIT enabled. Uses model defaults when set to Auto. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "auto", "Auto" },
+			{ "0", "None" },
+			{ "2", "512 KB" },
+			{ "4", "1 MB" },
+			{ "6", "1.5 MB" },
+			{ "7", "1.8 MB" },
 			{ NULL, NULL }
 		},
 		"auto"
@@ -3522,6 +3562,10 @@ static void snapshot_core_options()
 	cached_jit = jit ? jit : "";
 	const char* cpu_speed = get_option_value("amiberry_cpu_speed");
 	cached_cpu_speed = cpu_speed ? cpu_speed : "";
+	const char* chipmem = get_option_value("amiberry_chipmem_size");
+	cached_chipmem_size = chipmem ? chipmem : "";
+	const char* bogomem = get_option_value("amiberry_bogomem_size");
+	cached_bogomem_size = bogomem ? bogomem : "";
 	const char* z3mem = get_option_value("amiberry_z3mem_size");
 	cached_z3mem_size = z3mem ? z3mem : "";
 	const char* chipset = get_option_value("amiberry_chipset");
@@ -4682,6 +4726,28 @@ static void core_entry(void)
 			log_cb(RETRO_LOG_WARN,
 				"FPU %d requires a 68020 or better CPU; it will be disabled on the %d\n",
 				fpu, effective_cpu);
+	}
+
+	// Chip and Slow RAM.  cfgfile counts chipmem_size in 512K units and
+	// bogomem_size in 256K units, which is what the option values already are,
+	// so they go straight through.  Pushed after --model (and after the
+	// preset's own bogomem_size=0 for A500OG) so the user's choice wins.
+	const char* chipmem = cached_chipmem_size.empty() ? nullptr : cached_chipmem_size.c_str();
+	if (!is_rp9 && chipmem && strcmp(chipmem, "auto") != 0) {
+		push_s_option(std::string("chipmem_size=") + chipmem);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "Chip RAM: %d KB\n", atoi(chipmem) * 512);
+	}
+
+	const char* bogomem = cached_bogomem_size.empty() ? nullptr : cached_bogomem_size.c_str();
+	if (!is_rp9 && bogomem && strcmp(bogomem, "auto") != 0) {
+		push_s_option(std::string("bogomem_size=") + bogomem);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "Slow RAM: %d KB\n", atoi(bogomem) * 256);
+		// fixup_prefs() drops 1.5MB of Slow RAM when the JIT is on, and caps
+		// Slow RAM at 1.5MB on any machine with a Gary/Ramsey chipset.
+		if (atoi(bogomem) == 6 && !cached_jit.empty() && cached_jit == "enabled" && log_cb)
+			log_cb(RETRO_LOG_WARN, "1.5 MB of Slow RAM is unsupported with the JIT; it will be reduced to 1 MB\n");
 	}
 
 	const char* z3mem = cached_z3mem_size.empty() ? nullptr : cached_z3mem_size.c_str();
