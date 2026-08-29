@@ -128,6 +128,34 @@ inline void libretro_crop_clamp_rect(const int surface_w, const int surface_h,
 	rect.y = std::clamp(rect.y, 0, surface_h - rect.h);
 }
 
+// Manual crop option values are expressed in lores pixels and single scanlines
+// so a fixed setting keeps its meaning when the resolution autoswitcher moves
+// the surface between lores/hires/superhires or single/double line output.
+// Offsets are signed, so this scales by multiplication rather than shifting.
+inline int libretro_crop_scale_lores(const int lores_units, const int shift)
+{
+	const int clamped_shift = std::clamp(shift, 0, 3);
+	return lores_units * (1 << clamped_shift);
+}
+
+// Centre a target-sized rectangle on an anchor point, nudged by an offset, and
+// clamp it into the surface. Used by the fixed presets and by the manual crop.
+inline LibretroCropRect libretro_crop_rect_from_anchor(const int surface_w, const int surface_h,
+	const int anchor_x, const int anchor_y, const int target_w, const int target_h,
+	const int offset_x, const int offset_y)
+{
+	LibretroCropRect rect = {};
+	if (surface_w <= 0 || surface_h <= 0 || target_w <= 0 || target_h <= 0)
+		return rect;
+
+	rect.w = std::min(target_w, surface_w);
+	rect.h = std::min(target_h, surface_h);
+	rect.x = anchor_x + offset_x - rect.w / 2;
+	rect.y = anchor_y + offset_y - rect.h / 2;
+	libretro_crop_clamp_rect(surface_w, surface_h, rect);
+	return rect;
+}
+
 inline bool libretro_crop_find_visible_content_bounds(const LibretroCropPixelBuffer& buffer,
 	const uint32_t border_color, LibretroCropRect& bounds)
 {

@@ -708,7 +708,12 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_analog_sensitivity", "Analog Sensitivity; 18|15|20|25|30|10" },
 	{ "amiberry_analog", "Analog Input; enabled|disabled" },
 	{ "amiberry_internal_vsync", "Internal VSync; disabled|standard|standard_50" },
-	{ "amiberry_crop_overscan", "Crop Overscan; disabled|enabled|small|medium|large|extra" },
+	{ "amiberry_overscan", "Overscan; overscan|tv_narrow|tv_standard|tv_wide|broadcast|extreme|ultra|ultra_hv|ultra_csync" },
+	{ "amiberry_crop_overscan", "Crop Overscan; disabled|enabled|small|medium|large|extra|manual" },
+	{ "amiberry_crop_width", "Manual Crop Width (lores px); auto|256|264|272|280|288|296|304|312|320|328|336|344|352|360|368|376" },
+	{ "amiberry_crop_height", "Manual Crop Height (lines); auto|176|184|192|200|208|216|224|232|240|248|256|264|272|280|288" },
+	{ "amiberry_crop_offset_h", "Crop Offset Horizontal (lores px); 0|-32|-30|-28|-26|-24|-22|-20|-18|-16|-14|-12|-10|-8|-6|-4|-2|2|4|6|8|10|12|14|16|18|20|22|24|26|28|30|32" },
+	{ "amiberry_crop_offset_v", "Crop Offset Vertical (lines); 0|-16|-15|-14|-13|-12|-11|-10|-9|-8|-7|-6|-5|-4|-3|-2|-1|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16" },
 	{ "amiberry_joy_as_mouse", "Joystick As Mouse; disabled|port1|port2|both" },
 	{ "amiberry_input_log", "Input Log File; disabled|enabled" },
 #ifdef WITH_MIDI
@@ -1153,10 +1158,31 @@ static struct retro_core_option_v2_definition option_defs[] = {
 		"double"
 	},
 	{
+		"amiberry_overscan",
+		"Overscan",
+		"Overscan",
+		"How much of the Amiga display the chipset emulation rasterises, matching Amiberry's Display > Overscan setting. This changes the size of the emulated frame itself rather than trimming it afterwards, so narrower modes drop border area the program never draws and wider modes expose border effects that would otherwise be cut off. Overscan is the default; use Crop Overscan to trim whatever this produces.",
+		NULL,
+		"video",
+		{
+			{ "overscan", "Overscan" },
+			{ "tv_narrow", "TV Narrow" },
+			{ "tv_standard", "TV Standard" },
+			{ "tv_wide", "TV Wide" },
+			{ "broadcast", "Broadcast" },
+			{ "extreme", "Extreme" },
+			{ "ultra", "Ultra" },
+			{ "ultra_hv", "Ultra H/V" },
+			{ "ultra_csync", "Ultra CSync" },
+			{ NULL, NULL }
+		},
+		"overscan"
+	},
+	{
 		"amiberry_crop_overscan",
 		"Crop Overscan",
 		"Crop Overscan",
-		"Trim the Amiga overscan borders. Automatic uses content-aware detection of the drawn region; fixed presets use increasingly tighter centered crops for games with unstable display changes. No effect in RTG/Workbench (Picasso96) modes.",
+		"Trim the Amiga overscan borders. Automatic uses content-aware detection of the drawn region; fixed presets use increasingly tighter centered crops for games with unstable display changes; Manual uses the exact size set below. No effect in RTG/Workbench (Picasso96) modes.",
 		NULL,
 		"video",
 		{
@@ -1166,9 +1192,157 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "medium", "Fixed 320x240" },
 			{ "large", "Fixed 320x200" },
 			{ "extra", "Fixed 320x180" },
+			{ "manual", "Manual" },
 			{ NULL, NULL }
 		},
 		"disabled"
+	},
+	{
+		"amiberry_crop_width",
+		"Manual Crop Width",
+		"Crop Width",
+		"Width of the Manual crop rectangle, in lores pixels. The value is scaled to the running resolution, so it keeps the same visible width when the resolution autoswitcher moves between Lores, Hires and Super Hires. Automatic keeps the full width the chipset reports. Only used when Crop Overscan is set to Manual.",
+		NULL,
+		"video",
+		{
+			{ "auto", "Automatic" },
+			{ "256", NULL },
+			{ "264", NULL },
+			{ "272", NULL },
+			{ "280", NULL },
+			{ "288", NULL },
+			{ "296", NULL },
+			{ "304", NULL },
+			{ "312", NULL },
+			{ "320", NULL },
+			{ "328", NULL },
+			{ "336", NULL },
+			{ "344", NULL },
+			{ "352", NULL },
+			{ "360", NULL },
+			{ "368", NULL },
+			{ "376", NULL },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_crop_height",
+		"Manual Crop Height",
+		"Crop Height",
+		"Height of the Manual crop rectangle, in single scanlines. The value is scaled to the running line mode, so it keeps the same visible height in both Single Line and Double Line output. Automatic keeps the full height the chipset reports. Only used when Crop Overscan is set to Manual.",
+		NULL,
+		"video",
+		{
+			{ "auto", "Automatic" },
+			{ "176", NULL },
+			{ "184", NULL },
+			{ "192", NULL },
+			{ "200", NULL },
+			{ "208", NULL },
+			{ "216", NULL },
+			{ "224", NULL },
+			{ "232", NULL },
+			{ "240", NULL },
+			{ "248", NULL },
+			{ "256", NULL },
+			{ "264", NULL },
+			{ "272", NULL },
+			{ "280", NULL },
+			{ "288", NULL },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_crop_offset_h",
+		"Crop Offset Horizontal",
+		"Crop Offset X",
+		"Shift the crop rectangle sideways, in lores pixels, for programs whose picture does not sit in the middle of the display area. Applies to the fixed presets and to Manual; Automatic derives the exact drawn region on its own and ignores this.",
+		NULL,
+		"video",
+		{
+			{ "0", NULL },
+			{ "-32", NULL },
+			{ "-30", NULL },
+			{ "-28", NULL },
+			{ "-26", NULL },
+			{ "-24", NULL },
+			{ "-22", NULL },
+			{ "-20", NULL },
+			{ "-18", NULL },
+			{ "-16", NULL },
+			{ "-14", NULL },
+			{ "-12", NULL },
+			{ "-10", NULL },
+			{ "-8", NULL },
+			{ "-6", NULL },
+			{ "-4", NULL },
+			{ "-2", NULL },
+			{ "2", NULL },
+			{ "4", NULL },
+			{ "6", NULL },
+			{ "8", NULL },
+			{ "10", NULL },
+			{ "12", NULL },
+			{ "14", NULL },
+			{ "16", NULL },
+			{ "18", NULL },
+			{ "20", NULL },
+			{ "22", NULL },
+			{ "24", NULL },
+			{ "26", NULL },
+			{ "28", NULL },
+			{ "30", NULL },
+			{ "32", NULL },
+			{ NULL, NULL }
+		},
+		"0"
+	},
+	{
+		"amiberry_crop_offset_v",
+		"Crop Offset Vertical",
+		"Crop Offset Y",
+		"Shift the crop rectangle up or down, in single scanlines, for programs whose picture does not sit in the middle of the display area. Applies to the fixed presets and to Manual; Automatic derives the exact drawn region on its own and ignores this.",
+		NULL,
+		"video",
+		{
+			{ "0", NULL },
+			{ "-16", NULL },
+			{ "-15", NULL },
+			{ "-14", NULL },
+			{ "-13", NULL },
+			{ "-12", NULL },
+			{ "-11", NULL },
+			{ "-10", NULL },
+			{ "-9", NULL },
+			{ "-8", NULL },
+			{ "-7", NULL },
+			{ "-6", NULL },
+			{ "-5", NULL },
+			{ "-4", NULL },
+			{ "-3", NULL },
+			{ "-2", NULL },
+			{ "-1", NULL },
+			{ "1", NULL },
+			{ "2", NULL },
+			{ "3", NULL },
+			{ "4", NULL },
+			{ "5", NULL },
+			{ "6", NULL },
+			{ "7", NULL },
+			{ "8", NULL },
+			{ "9", NULL },
+			{ "10", NULL },
+			{ "11", NULL },
+			{ "12", NULL },
+			{ "13", NULL },
+			{ "14", NULL },
+			{ "15", NULL },
+			{ "16", NULL },
+			{ NULL, NULL }
+		},
+		"0"
 	},
 	{
 		"amiberry_statusline",
@@ -1295,6 +1469,30 @@ static bool update_core_option_visibility(void)
 
 	disp.key = "amiberry_chipset_aga";
 	disp.visible = aga_model;
+	environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &disp);
+
+	// The manual rectangle only means something in Manual mode, and the
+	// offsets only in the modes that place a rectangle of a size we chose;
+	// Automatic derives the drawn region exactly and ignores both.
+	const char* crop = get_option_value("amiberry_crop_overscan");
+	const bool manual_crop = crop && strcmp(crop, "manual") == 0;
+	const bool offset_crop = manual_crop
+		|| (crop && strcmp(crop, "disabled") != 0 && strcmp(crop, "enabled") != 0);
+
+	disp.key = "amiberry_crop_width";
+	disp.visible = manual_crop;
+	environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &disp);
+
+	disp.key = "amiberry_crop_height";
+	disp.visible = manual_crop;
+	environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &disp);
+
+	disp.key = "amiberry_crop_offset_h";
+	disp.visible = offset_crop;
+	environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &disp);
+
+	disp.key = "amiberry_crop_offset_v";
+	disp.visible = offset_crop;
 	environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &disp);
 
 	return true;
@@ -2497,7 +2695,8 @@ enum class libretro_crop_mode
 	fixed_small,
 	fixed_medium,
 	fixed_large,
-	fixed_extra
+	fixed_extra,
+	manual
 };
 
 static libretro_crop libretro_submitted_crop = {};
@@ -2519,6 +2718,8 @@ static libretro_crop_mode get_libretro_crop_mode()
 		return libretro_crop_mode::fixed_large;
 	if (strcmp(v, "extra") == 0)
 		return libretro_crop_mode::fixed_extra;
+	if (strcmp(v, "manual") == 0)
+		return libretro_crop_mode::manual;
 	return libretro_crop_mode::auto_crop;
 }
 
@@ -2826,7 +3027,7 @@ static void libretro_expand_crop_to_minimum_frame(const SDL_Surface* surface, li
 	libretro_update_crop_aspect(crop);
 }
 
-static bool libretro_crop_anchor_from_display_limits(const SDL_Surface* surface, int& anchor_x, int& anchor_y)
+static bool libretro_crop_display_limits_rect(const SDL_Surface* surface, SDL_Rect& out)
 {
 	if (!surface || surface->w <= 0 || surface->h <= 0)
 		return false;
@@ -2856,54 +3057,126 @@ static bool libretro_crop_anchor_from_display_limits(const SDL_Surface* surface,
 	if (rect.w <= 0 || rect.h <= 0)
 		return false;
 
-	anchor_x = rect.x + rect.w / 2;
-	anchor_y = rect.y + rect.h / 2;
+	out = rect;
+	return true;
+}
+
+// Manual crop sizes and offsets, in lores pixels and single scanlines.
+// Zero means "automatic" for the sizes and "unshifted" for the offsets.
+struct LibretroManualCrop {
+	int width_lores;
+	int height_lines;
+	int offset_x_lores;
+	int offset_y_lines;
+};
+
+static int libretro_crop_option_to_int(const char* key)
+{
+	const char* value = get_option_value(key);
+	if (!value || !*value || strcmp(value, "auto") == 0)
+		return 0;
+	return atoi(value);
+}
+
+static LibretroManualCrop get_libretro_manual_crop_options()
+{
+	return {
+		libretro_crop_option_to_int("amiberry_crop_width"),
+		libretro_crop_option_to_int("amiberry_crop_height"),
+		libretro_crop_option_to_int("amiberry_crop_offset_h"),
+		libretro_crop_option_to_int("amiberry_crop_offset_v")
+	};
+}
+
+// Builds a crop rectangle of the requested size, centred on the display area
+// the chipset reports and nudged by the user's offsets. Sizes and offsets are
+// given in lores pixels / single scanlines and scaled to the running pixel
+// grid, so a setting keeps the same visible extent when the resolution
+// autoswitcher moves between Lores/Hires/Super Hires or Single/Double Line.
+// A size of zero falls back to the full reported display extent on that axis.
+static bool libretro_crop_rect_from_lores_size(const SDL_Surface* surface,
+	const int width_lores, const int height_lines,
+	const int offset_x_lores, const int offset_y_lines, libretro_crop& crop)
+{
+	if (!surface || surface->w <= 0 || surface->h <= 0)
+		return false;
+
+	const int hres = std::clamp(currprefs.gfx_resolution, RES_LORES, RES_SUPERHIRES);
+	const int vres = std::clamp(currprefs.gfx_vresolution, VRES_NONDOUBLE, VRES_QUAD);
+
+	SDL_Rect limits = { 0, 0, surface->w, surface->h };
+	libretro_crop_display_limits_rect(surface, limits);
+
+	const int target_w = width_lores > 0
+		? libretro_crop_scale_lores(width_lores, hres)
+		: limits.w;
+	const int target_h = height_lines > 0
+		? libretro_crop_scale_lores(height_lines, vres)
+		: limits.h;
+
+	const LibretroCropRect rect = libretro_crop_rect_from_anchor(surface->w, surface->h,
+		limits.x + limits.w / 2, limits.y + limits.h / 2,
+		target_w, target_h,
+		libretro_crop_scale_lores(offset_x_lores, hres),
+		libretro_crop_scale_lores(offset_y_lines, vres));
+	if (!libretro_crop_rect_valid(rect))
+		return false;
+
+	crop.x = rect.x;
+	crop.y = rect.y;
+	crop.w = rect.w;
+	crop.h = rect.h;
+	crop.active = true;
 	return true;
 }
 
 static bool libretro_fixed_crop_from_surface(const SDL_Surface* surface,
 	const libretro_crop_mode mode, libretro_crop& crop)
 {
-	if (!surface || surface->w <= 0 || surface->h <= 0)
-		return false;
-
-	int target_w = 0;
 	int target_h = 0;
 	switch (mode) {
 		case libretro_crop_mode::fixed_small:
-			target_w = 640;
-			target_h = 512;
+			target_h = 256;
 			break;
 		case libretro_crop_mode::fixed_medium:
-			target_w = 640;
-			target_h = 480;
+			target_h = 240;
 			break;
 		case libretro_crop_mode::fixed_large:
-			target_w = 640;
-			target_h = 400;
+			target_h = 200;
 			break;
 		case libretro_crop_mode::fixed_extra:
-			target_w = 640;
-			target_h = 360;
+			target_h = 180;
 			break;
 		default:
 			return false;
 	}
 
-	target_w = std::clamp(target_w, std::min(320, surface->w), surface->w);
-	target_h = std::clamp(target_h, std::min(240, surface->h), surface->h);
-	int anchor_x = surface->w / 2;
-	int anchor_y = surface->h / 2;
-	libretro_crop_anchor_from_display_limits(surface, anchor_x, anchor_y);
-	crop.x = std::clamp(anchor_x - target_w / 2, 0, surface->w - target_w);
-	crop.y = std::clamp(anchor_y - target_h / 2, 0, surface->h - target_h);
-	crop.w = target_w;
-	crop.h = target_h;
-	crop.active = crop.w > 0 && crop.h > 0;
-	if (crop.active) {
-		libretro_fit_fixed_crop_to_visible_content(surface, crop);
-		libretro_update_crop_aspect(crop);
+	const LibretroManualCrop opts = get_libretro_manual_crop_options();
+	if (!libretro_crop_rect_from_lores_size(surface, 320, target_h,
+			opts.offset_x_lores, opts.offset_y_lines, crop)) {
+		return false;
 	}
+
+	// Recentring on the drawn content is what keeps an off-centre program
+	// inside a preset rectangle, but it would silently undo an offset the
+	// user set on purpose, so it only runs while the offsets are neutral.
+	if (opts.offset_x_lores == 0 && opts.offset_y_lines == 0)
+		libretro_fit_fixed_crop_to_visible_content(surface, crop);
+	libretro_update_crop_aspect(crop);
+	return crop.active;
+}
+
+// Manual is exact by definition: unlike the fixed presets the rectangle is
+// never nudged to keep drawn content inside it.
+static bool libretro_manual_crop_from_surface(const SDL_Surface* surface, libretro_crop& crop)
+{
+	const LibretroManualCrop opts = get_libretro_manual_crop_options();
+	if (!libretro_crop_rect_from_lores_size(surface, opts.width_lores, opts.height_lines,
+			opts.offset_x_lores, opts.offset_y_lines, crop)) {
+		return false;
+	}
+
+	libretro_update_crop_aspect(crop);
 	return crop.active;
 }
 
@@ -3140,8 +3413,10 @@ libretro_crop libretro_compute_crop(void)
 	if (crop_mode != libretro_crop_mode::auto_crop) {
 		libretro_reset_submitted_crop();
 		libretro_disable_core_auto_crop();
-		if (libretro_fixed_crop_from_surface(surface, crop_mode, crop))
-			return libretro_cache_crop(crop);
+		if (crop_mode == libretro_crop_mode::manual)
+			libretro_manual_crop_from_surface(surface, crop);
+		else
+			libretro_fixed_crop_from_surface(surface, crop_mode, crop);
 		return libretro_cache_crop(crop);
 	}
 	if (libretro_preserves_rp9_manifest_crop()) {
@@ -3761,6 +4036,46 @@ static void apply_libretro_statusline_options(void)
 		currprefs.leds_on_screen_multiplier[i] = mult;
 		changed_prefs.leds_on_screen_multiplier[i] = mult;
 	}
+}
+
+// Mirrors the overscanmodes[] table in cfgfile.cpp, which is what the
+// gfx_overscanmode config key and Amiberry's Display > Overscan combo use.
+static const char* const libretro_overscan_mode_names[] = {
+	"tv_narrow", "tv_standard", "tv_wide", "overscan",
+	"broadcast", "extreme", "ultra", "ultra_hv", "ultra_csync"
+};
+
+// Returns the gfx_overscanmode index, or -1 when the option is unset or holds
+// a value this core does not know about.
+static int parse_overscan_mode_option(const char* value)
+{
+	if (!value || !*value)
+		return -1;
+	for (int i = 0; i < static_cast<int>(std::size(libretro_overscan_mode_names)); i++) {
+		if (strcmp(value, libretro_overscan_mode_names[i]) == 0)
+			return i;
+	}
+	return -1;
+}
+
+// Overscan changes how much of the display the chipset rasterises, so unlike
+// the crop options it alters the emulated frame itself rather than trimming it.
+static void apply_libretro_overscan_option(void)
+{
+	const int mode = parse_overscan_mode_option(get_option_value("amiberry_overscan"));
+	if (mode < 0)
+		return;
+	if (currprefs.gfx_overscanmode == mode && changed_prefs.gfx_overscanmode == mode)
+		return;
+
+	changed_prefs.gfx_overscanmode = mode;
+	// The visible area is about to change size, so the cached crop rectangle
+	// and the published geometry are both stale.
+	libretro_reset_crop_policy();
+	last_geometry_width = -1;
+	last_geometry_height = -1;
+	last_geometry_aspect = -1.0f;
+	set_config_changed();
 }
 
 // Runtime counterpart of the boot-time gfx_resolution / gfx_linemode wiring.
@@ -4476,6 +4791,12 @@ static void core_entry(void)
 				vres_fixed ? cached_video_vresolution.c_str() : "auto");
 	}
 
+	const int overscan_mode = parse_overscan_mode_option(get_option_value("amiberry_overscan"));
+	if (overscan_mode >= 0) {
+		push_s_option(std::string("gfx_overscanmode=")
+			+ libretro_overscan_mode_names[overscan_mode]);
+	}
+
 	const bool automatic_crop = get_libretro_crop_mode() == libretro_crop_mode::auto_crop;
 	if (libretro_should_queue_auto_crop_options(automatic_crop, is_rp9)) {
 		push_s_option("gfx_auto_crop=true");
@@ -5134,6 +5455,7 @@ void retro_run(void)
 		apply_libretro_input_options();
 		apply_libretro_statusline_options();
 		apply_libretro_video_resolution_options();
+		apply_libretro_overscan_option();
 #ifdef WITH_MIDI
 		apply_libretro_midi_options();
 #endif

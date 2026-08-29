@@ -127,6 +127,65 @@ static void test_rp9_manifest_clip_owns_automatic_crop()
 		"Explicit disabled or fixed crop modes must override an RP9 clip");
 }
 
+static void test_lores_units_scale_to_the_running_pixel_grid()
+{
+	expect_eq(libretro_crop_scale_lores(320, 0), 320,
+		"Lores output keeps the option value as-is");
+	expect_eq(libretro_crop_scale_lores(320, 1), 640,
+		"Hires output doubles the option value");
+	expect_eq(libretro_crop_scale_lores(320, 2), 1280,
+		"Super Hires output quadruples the option value");
+	expect_eq(libretro_crop_scale_lores(-6, 1), -12,
+		"Negative offsets scale without shifting a negative value");
+	expect_eq(libretro_crop_scale_lores(200, -1), 200,
+		"Out-of-range resolutions are clamped instead of scaling wildly");
+}
+
+static void test_manual_rect_centres_on_the_anchor()
+{
+	const LibretroCropRect rect = libretro_crop_rect_from_anchor(
+		752, 574, 376, 287, 640, 512, 0, 0);
+
+	expect_eq(rect.w, 640, "Manual width is used verbatim when it fits");
+	expect_eq(rect.h, 512, "Manual height is used verbatim when it fits");
+	expect_eq(rect.x, 56, "Manual crop centres horizontally on the anchor");
+	expect_eq(rect.y, 31, "Manual crop centres vertically on the anchor");
+}
+
+static void test_manual_rect_applies_offsets()
+{
+	const LibretroCropRect rect = libretro_crop_rect_from_anchor(
+		752, 574, 376, 287, 640, 512, -16, 8);
+
+	expect_eq(rect.x, 40, "A negative horizontal offset shifts the crop left");
+	expect_eq(rect.y, 39, "A positive vertical offset shifts the crop down");
+	expect_eq(rect.w, 640, "Offsets must not resize the crop");
+	expect_eq(rect.h, 512, "Offsets must not resize the crop");
+}
+
+static void test_manual_rect_stays_inside_the_surface()
+{
+	const LibretroCropRect shoved = libretro_crop_rect_from_anchor(
+		752, 574, 376, 287, 640, 512, 400, -400);
+
+	expect_eq(shoved.x, 112, "An extreme offset clamps to the right edge");
+	expect_eq(shoved.y, 0, "An extreme offset clamps to the top edge");
+
+	const LibretroCropRect oversized = libretro_crop_rect_from_anchor(
+		752, 574, 376, 287, 1024, 800, 0, 0);
+
+	expect_eq(oversized.w, 752, "A crop wider than the surface is capped");
+	expect_eq(oversized.h, 574, "A crop taller than the surface is capped");
+	expect_eq(oversized.x, 0, "A capped crop starts at the surface origin");
+	expect_eq(oversized.y, 0, "A capped crop starts at the surface origin");
+
+	const LibretroCropRect empty = libretro_crop_rect_from_anchor(
+		752, 574, 376, 287, 0, 512, 0, 0);
+
+	expect_true(!libretro_crop_rect_valid(empty),
+		"A zero-sized request yields no rectangle");
+}
+
 int main()
 {
 	test_expands_to_visible_pixels_below_crop();
@@ -134,6 +193,10 @@ int main()
 	test_fixed_crop_shifts_to_keep_content_visible();
 	test_libretro_stabilizer_uses_short_mode_change_delays();
 	test_rp9_manifest_clip_owns_automatic_crop();
+	test_lores_units_scale_to_the_running_pixel_grid();
+	test_manual_rect_centres_on_the_anchor();
+	test_manual_rect_applies_offsets();
+	test_manual_rect_stays_inside_the_surface();
 
 	return failures == 0 ? 0 : 1;
 }
