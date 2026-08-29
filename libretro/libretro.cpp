@@ -175,6 +175,7 @@ static std::string cached_jit;
 static std::string cached_cpu_speed;
 static std::string cached_chipmem_size;
 static std::string cached_bogomem_size;
+static std::string cached_fastmem_size;
 static std::string cached_z3mem_size;
 static std::string cached_chipset;
 static std::string cached_chipset_aga;
@@ -689,6 +690,7 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_fpu_model", "FPU Model; auto|none|68881|68882|internal" },
 	{ "amiberry_chipmem_size", "Chip RAM; auto|1|2|4|8|16" },
 	{ "amiberry_bogomem_size", "Slow RAM; auto|0|2|4|6|7" },
+	{ "amiberry_fastmem_size", "Zorro II Fast RAM (MB); auto|0|1|2|4|8" },
 	{ "amiberry_z3mem_size", "Zorro III RAM (MB); auto|0|1|2|4|8|16|32|64|128|256|512" },
 	{ "amiberry_jit", "JIT Recompiler (68020+); disabled|enabled" },
 	{ "amiberry_cpu_speed", "CPU Speed; default|real|max" },
@@ -852,6 +854,24 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "4", "1 MB" },
 			{ "6", "1.5 MB" },
 			{ "7", "1.8 MB" },
+			{ NULL, NULL }
+		},
+		"auto"
+	},
+	{
+		"amiberry_fastmem_size",
+		"Zorro II Fast RAM (MB)",
+		"Zorro II Fast RAM",
+		"Zorro II (24-bit) autoconfig fast RAM, the classic side/trapdoor expansion. Works on any CPU, unlike Zorro III RAM, but the Zorro II address space caps it at 8 MB. Uses model defaults when set to Auto. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "auto", "Auto" },
+			{ "0", "None" },
+			{ "1", "1 MB" },
+			{ "2", "2 MB" },
+			{ "4", "4 MB" },
+			{ "8", "8 MB" },
 			{ NULL, NULL }
 		},
 		"auto"
@@ -3566,6 +3586,8 @@ static void snapshot_core_options()
 	cached_chipmem_size = chipmem ? chipmem : "";
 	const char* bogomem = get_option_value("amiberry_bogomem_size");
 	cached_bogomem_size = bogomem ? bogomem : "";
+	const char* fastmem = get_option_value("amiberry_fastmem_size");
+	cached_fastmem_size = fastmem ? fastmem : "";
 	const char* z3mem = get_option_value("amiberry_z3mem_size");
 	cached_z3mem_size = z3mem ? z3mem : "";
 	const char* chipset = get_option_value("amiberry_chipset");
@@ -4748,6 +4770,17 @@ static void core_entry(void)
 		// Slow RAM at 1.5MB on any machine with a Gary/Ramsey chipset.
 		if (atoi(bogomem) == 6 && !cached_jit.empty() && cached_jit == "enabled" && log_cb)
 			log_cb(RETRO_LOG_WARN, "1.5 MB of Slow RAM is unsupported with the JIT; it will be reduced to 1 MB\n");
+	}
+
+	// Zorro II fast RAM.  cfgfile_readramboard() counts fastmem_size in
+	// megabytes, so the option value goes straight through.  Pushed after
+	// --model so it beats the fastmem_size=8 the A600/A1200/CD32FR presets
+	// above push for themselves.
+	const char* fastmem = cached_fastmem_size.empty() ? nullptr : cached_fastmem_size.c_str();
+	if (!is_rp9 && fastmem && strcmp(fastmem, "auto") != 0) {
+		push_s_option(std::string("fastmem_size=") + fastmem);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "Zorro II Fast RAM: %s MB\n", fastmem);
 	}
 
 	const char* z3mem = cached_z3mem_size.empty() ? nullptr : cached_z3mem_size.c_str();
