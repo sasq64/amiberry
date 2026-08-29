@@ -182,6 +182,8 @@ static std::string cached_sound_filter;
 static std::string cached_stereo_sep;
 static std::string cached_floppy_speed;
 static std::string cached_video_standard;
+static std::string cached_video_resolution;
+static std::string cached_video_vresolution;
 static int cached_audio_rate_value = 44100;
 static const char* get_option_value(const char* key);
 
@@ -694,6 +696,8 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_stereo_separation", "Stereo Separation; 0|1|2|3|4|5|6|7|8|9|10" },
 	{ "amiberry_floppy_speed", "Floppy Speed; 0|100|200|400|800" },
 	{ "amiberry_video_standard", "Video Standard; auto|pal|ntsc" },
+	{ "amiberry_video_resolution", "Video Resolution; hires|auto|lores|superhires" },
+	{ "amiberry_video_vresolution", "Video Line Mode; double|auto|single" },
 	{ "amiberry_statusline", "On-Screen Status Line; disabled|enabled" },
 	{ "amiberry_statusline_size", "On-Screen Status Line Size; 1x|2x|3x|4x" },
 	{ "amiberry_port0_device", "Port 1 Device; mouse|joystick" },
@@ -1116,6 +1120,37 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ NULL, NULL }
 		},
 		"auto"
+	},
+	{
+		"amiberry_video_resolution",
+		"Video Resolution",
+		"Resolution",
+		"Horizontal chipset resolution of the emulated output. Automatic follows the running program (Amiberry's resolution autoswitch). Higher resolutions cost more emulation time but are required for 640/1280-pixel modes to look sharp.",
+		NULL,
+		"video",
+		{
+			{ "auto", "Automatic" },
+			{ "lores", "Low" },
+			{ "hires", "High" },
+			{ "superhires", "Super-High" },
+			{ NULL, NULL }
+		},
+		"hires"
+	},
+	{
+		"amiberry_video_vresolution",
+		"Video Line Mode",
+		"Line Mode",
+		"Vertical line mode of the emulated output. Single Line draws one output line per Amiga scanline; Double Line doubles them, which is required for interlaced modes to be shown in full. Automatic follows the running program. When only one of Resolution / Line Mode is set to Automatic, the fixed one acts as a lower bound for the autoswitcher.",
+		NULL,
+		"video",
+		{
+			{ "auto", "Automatic" },
+			{ "single", "Single Line" },
+			{ "double", "Double Line" },
+			{ NULL, NULL }
+		},
+		"double"
 	},
 	{
 		"amiberry_crop_overscan",
@@ -3192,6 +3227,49 @@ static void snapshot_core_options()
 	cached_floppy_speed = floppy_spd ? floppy_spd : "";
 	const char* vid_std = get_option_value("amiberry_video_standard");
 	cached_video_standard = vid_std ? vid_std : "";
+	const char* vid_res = get_option_value("amiberry_video_resolution");
+	cached_video_resolution = vid_res ? vid_res : "";
+	const char* vid_vres = get_option_value("amiberry_video_vresolution");
+	cached_video_vresolution = vid_vres ? vid_vres : "";
+}
+
+// "auto" (or an unset option) leaves the axis to the resolution autoswitcher;
+// anything else pins it. Returns false for the automatic case.
+static bool parse_video_resolution_option(const char* value, int& res)
+{
+	if (!value || !*value || strcmp(value, "auto") == 0)
+		return false;
+	if (strcmp(value, "lores") == 0)
+		res = RES_LORES;
+	else if (strcmp(value, "superhires") == 0)
+		res = RES_SUPERHIRES;
+	else
+		res = RES_HIRES;
+	return true;
+}
+
+static bool parse_video_vresolution_option(const char* value, int& vres)
+{
+	if (!value || !*value || strcmp(value, "auto") == 0)
+		return false;
+	vres = strcmp(value, "single") == 0 ? VRES_NONDOUBLE : VRES_DOUBLE;
+	return true;
+}
+
+// cfgfile spellings for gfx_resolution and for the autoswitcher's
+// gfx_autoresolution_min_horizontal / _min_vertical bounds.
+static const char* horizmode_option_name(const int res)
+{
+	switch (res) {
+		case RES_LORES: return "lores";
+		case RES_SUPERHIRES: return "superhires";
+		default: return "hires";
+	}
+}
+
+static const char* vertmode_option_name(const int vres)
+{
+	return vres == VRES_NONDOUBLE ? "single" : "double";
 }
 
 static const char* cached_chipset_value()
@@ -3597,6 +3675,9 @@ static void apply_port_device(struct uae_prefs* prefs, unsigned port, unsigned d
 {
 	const TCHAR* name = _T("none");
 	int mode = -1;
+	// Outlives the branch below: inputdevice_joyport_config() reads through
+	// "name" after the block that fills it has ended.
+	TCHAR joy_name[8];
 	const unsigned base_device = device & RETRO_DEVICE_MASK;
 	if (base_device == RETRO_DEVICE_MOUSE) {
 		name = _T("mouse");
@@ -3604,7 +3685,6 @@ static void apply_port_device(struct uae_prefs* prefs, unsigned port, unsigned d
 	} else if (base_device == RETRO_DEVICE_JOYPAD || base_device == RETRO_DEVICE_ANALOG) {
 		if (joy_index < 0 || joy_index > 3)
 			joy_index = static_cast<int>(port);
-		TCHAR joy_name[8];
 		_sntprintf(joy_name, sizeof joy_name, _T("joy%d"), joy_index);
 		name = joy_name;
 		mode = JSEM_MODE_JOYSTICK;
@@ -3642,6 +3722,58 @@ static void apply_libretro_statusline_options(void)
 		currprefs.leds_on_screen_multiplier[i] = mult;
 		changed_prefs.leds_on_screen_multiplier[i] = mult;
 	}
+}
+
+// Runtime counterpart of the boot-time gfx_resolution / gfx_linemode wiring.
+// Only runs when the frontend reports a changed option, so pinning an axis here
+// cannot fight the autoswitcher on the frames in between.
+static void apply_libretro_video_resolution_options(void)
+{
+	// RP9 owns its display setup: apply_video_and_clip() derives the manifest's
+	// crop rectangle from the resolution in effect at load time, so moving
+	// either axis afterwards would leave that rectangle scaled for the wrong
+	// pixel grid. The boot-time wiring skips RP9 for the same reason.
+	if (path_extension_lower(game_path) == "rp9")
+		return;
+
+	int res = RES_HIRES;
+	int vres = VRES_DOUBLE;
+	const bool res_fixed = parse_video_resolution_option(
+		get_option_value("amiberry_video_resolution"), res);
+	const bool vres_fixed = parse_video_vresolution_option(
+		get_option_value("amiberry_video_vresolution"), vres);
+
+	const int autores = (res_fixed && vres_fixed) ? 0 : 1;
+	const int minh = res_fixed ? res : RES_LORES;
+	const int minv = vres_fixed ? vres : VRES_NONDOUBLE;
+
+	bool changed = changed_prefs.gfx_autoresolution != autores
+		|| changed_prefs.gfx_autoresolution_minh != minh
+		|| changed_prefs.gfx_autoresolution_minv != minv;
+
+	changed_prefs.gfx_autoresolution = autores;
+	changed_prefs.gfx_autoresolution_minh = minh;
+	changed_prefs.gfx_autoresolution_minv = minv;
+
+	if (res_fixed && changed_prefs.gfx_resolution != res) {
+		changed_prefs.gfx_resolution = res;
+		changed = true;
+	}
+	if (vres_fixed && changed_prefs.gfx_vresolution != vres) {
+		changed_prefs.gfx_vresolution = vres;
+		changed = true;
+	}
+
+	if (!changed)
+		return;
+
+	// The visible area is expressed in chipset pixels, so the cached crop and
+	// the published geometry are both stale once either axis moves.
+	libretro_reset_crop_policy();
+	last_geometry_width = -1;
+	last_geometry_height = -1;
+	last_geometry_aspect = -1.0f;
+	set_config_changed();
 }
 
 static void apply_libretro_input_options(void)
@@ -4267,6 +4399,40 @@ static void core_entry(void)
 			push_s_option("ntsc=true");
 		else if (cached_video_standard == "pal")
 			push_s_option("ntsc=false");
+	}
+
+	// Chipset resolution / line mode.  An axis left on "auto" is handed to
+	// Amiberry's resolution autoswitch (gfx_autoresolution), which drives both
+	// axes together; a pinned axis is then fed to it as a lower bound, which is
+	// the only per-axis control the autoswitcher offers.  With both axes pinned
+	// the autoswitcher stays off and the values apply verbatim.
+	if (!is_rp9) {
+		int res = RES_HIRES;
+		int vres = VRES_DOUBLE;
+		const bool res_fixed = parse_video_resolution_option(
+			cached_video_resolution.empty() ? nullptr : cached_video_resolution.c_str(), res);
+		const bool vres_fixed = parse_video_vresolution_option(
+			cached_video_vresolution.empty() ? nullptr : cached_video_vresolution.c_str(), vres);
+
+		if (res_fixed && res != RES_HIRES)
+			push_s_option(std::string("gfx_resolution=") + horizmode_option_name(res));
+		// gfx_linemode is the only cfgfile spelling of gfx_vresolution, and it
+		// also resets the scanline fields; only push it when the line mode is
+		// actually changing away from the default so gfx_iscanlines survives.
+		if (vres_fixed && vres == VRES_NONDOUBLE)
+			push_s_option("gfx_linemode=none");
+
+		if (!res_fixed || !vres_fixed) {
+			push_s_option("gfx_autoresolution=1");
+			push_s_option(std::string("gfx_autoresolution_min_horizontal=")
+				+ horizmode_option_name(res_fixed ? res : RES_LORES));
+			push_s_option(std::string("gfx_autoresolution_min_vertical=")
+				+ vertmode_option_name(vres_fixed ? vres : VRES_NONDOUBLE));
+		}
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "Video resolution: %s, line mode: %s\n",
+				res_fixed ? cached_video_resolution.c_str() : "auto",
+				vres_fixed ? cached_video_vresolution.c_str() : "auto");
 	}
 
 	const bool automatic_crop = get_libretro_crop_mode() == libretro_crop_mode::auto_crop;
@@ -4926,6 +5092,7 @@ void retro_run(void)
 	if (libretro_options_dirty) {
 		apply_libretro_input_options();
 		apply_libretro_statusline_options();
+		apply_libretro_video_resolution_options();
 #ifdef WITH_MIDI
 		apply_libretro_midi_options();
 #endif
