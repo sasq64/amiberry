@@ -1868,6 +1868,19 @@ static bool is_cd_extension(const std::string& ext)
 		|| ext == "nrg" || ext == "mds" || ext == "chd";
 }
 
+// The floppy-image extensions we advertise in `valid_extensions`, minus the
+// ones core_entry routes somewhere else first (lha/lzh to WHDLoad, m3u to the
+// disk list, the CD set, hdf/hdz to hardfile2). `uae` is deliberately absent:
+// a config file handed over as content still has to reach main.cpp's config
+// loader, so it keeps the positional path.
+//
+// Compared against `path_extension_lower`, so the caller's case never matters.
+static bool is_floppy_extension(const std::string& ext)
+{
+	return ext == "adf" || ext == "adz" || ext == "dms" || ext == "fdi"
+		|| ext == "raw" || ext == "ipf" || ext == "zip" || ext == "7z";
+}
+
 // Detect CD32/CDTV content by reading sector 16 of an ISO image.
 // Sector 16 (LBA 16) is in the ISO 9660 system area. Amiga CD32/CDTV discs
 // place a 4-byte trademark string at offset 8: "CD32", "CDTV", or "COMM".
@@ -5073,6 +5086,28 @@ static void core_entry(void)
 				if (log_cb)
 					log_cb(RETRO_LOG_INFO, "HDF saves dir: %s\n", saves_path.c_str());
 			}
+		} else if (is_floppy_extension(game_ext)) {
+			// Pass the disk image via `-s floppy0=` instead of a positional
+			// arg, for the same reason the CD branch above uses `cdimage0=`:
+			// main.cpp's positional dispatch is the fragile path.  Its floppy
+			// branch (`main.cpp:1542`) compares the extension with the
+			// case-*sensitive* `_tcscmp`, while `get_filename_extension`
+			// (`main.cpp:1248`) hands it back verbatim -- so an uppercase
+			// `.DMS`/`.ADF`, which is common in scene releases, misses every
+			// arm, falls through to the generic tail that only recognises
+			// configs and statefiles, and is dropped without a word.  The
+			// emulator then boots to the Kickstart insert-disk screen.  `.fdi`
+			// and `.raw` are not in that branch at all, in any case.
+			//
+			// `floppy0=` sets `floppyslots[0].df` (`cfgfile.cpp:6673`), which
+			// is exactly what `disk_insert(0, ...)` would have set and what the
+			// disc-swap code reads back.  What this gives up is main.cpp's
+			// lookup of a `<image name>.uae` config in the configurations dir;
+			// that would fight with the core options anyway.
+			const std::string floppy_path = canonicalize_existing_host_path(game_path);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "Floppy image: %s\n", floppy_path.c_str());
+			push_s_option("floppy0=" + floppy_path);
 		} else {
 			safe_strdup(game_path);
 		}
