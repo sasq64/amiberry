@@ -214,7 +214,23 @@ extern "C" off_t posixemu_seek(int fd, off_t offset, int whence)
 		const struct retro_vfs_interface* vfs = libretro_get_vfs_interface();
 		if (vfs && vfs->seek) {
 			const int64_t ret = vfs->seek(handle, offset, vfs_whence(whence));
-			return ret < 0 ? static_cast<off_t>(-1) : static_cast<off_t>(ret);
+			if (ret < 0)
+				return static_cast<off_t>(-1);
+			/* lseek() must return the resulting offset, but a frontend's
+			 * retro_vfs_seek_t returns 0 on success (fseek semantics) as
+			 * often as it returns the position -- see vfs_cookie_seek() in
+			 * stdioemu_vfs.cpp for why. Ask tell() rather than guess; the
+			 * usual lseek(fd, 0, SEEK_END) size probe reads as an empty
+			 * file otherwise. */
+			if (vfs->tell) {
+				const int64_t pos = vfs->tell(handle);
+				if (pos < 0) {
+					errno = ESPIPE;
+					return static_cast<off_t>(-1);
+				}
+				return static_cast<off_t>(pos);
+			}
+			return static_cast<off_t>(ret);
 		}
 		errno = ESPIPE;
 		return static_cast<off_t>(-1);

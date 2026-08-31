@@ -137,7 +137,30 @@ static int vfs_cookie_seek(void* c, off64_t* offset, int whence)
 		errno = ESPIPE;
 		return -1;
 	}
-	*offset = ret;
+
+	/* glibc's fopencookie wants the *resulting* position written back to
+	 * *offset, and retro_vfs_seek_t is documented to return exactly that.
+	 * Nothing implements the documentation: libretro-common's reference
+	 * retro_vfs_file_seek_impl() ends in fseeko(), so it returns 0 on
+	 * success, and frontends follow it (a core that pulls in
+	 * file_stream_transforms.h gets `#define fseek rfseek` and tests the
+	 * result as an error code, so returning the position would break it).
+	 * Trusting the return value therefore pins every stream at position 0:
+	 * fseek(f, 0, SEEK_END); ftell(f) yields 0, zfile_fopen_2() records
+	 * size 0, and scan_single_rom_file() sees every Kickstart as an empty
+	 * file -- "ROM loader.. (<none>)" and a black screen for WHDLoad
+	 * content. Ask tell() for the real position instead, and only fall
+	 * back to the return value if the frontend has no tell(). */
+	if (vfs->tell) {
+		const int64_t pos = vfs->tell(cookie->handle);
+		if (pos < 0) {
+			errno = ESPIPE;
+			return -1;
+		}
+		*offset = pos;
+	} else {
+		*offset = ret;
+	}
 	return 0;
 }
 
