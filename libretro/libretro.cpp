@@ -1,6 +1,7 @@
 #include "libretro.h"
 #include "libretro_shared.h"
 #include "libretro_crop_helpers.h"
+#include "libretro_path_helpers.h"
 #ifdef LIBRETRO
 #include "sdl_compat.h"
 #endif
@@ -299,10 +300,15 @@ static bool sync_amiberry_home_dir_from_frontend()
 	// because the env var was inherited from a prior session or a parent shell.
 	if (environ_cb) {
 		const char* dir = nullptr;
+		// Normalise on the way in: a frontend that canonicalises with a modern
+		// API hands over a Windows `\\?\` extended-length path, which the CRT's
+		// directory calls cannot open. Everything downstream — the env vars
+		// below, get_home_directory(), the ROM scan, plugin loading — derives
+		// from these two, so this is the one place worth stripping it.
 		if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir && dir[0] != '\0')
-			system_dir = dir;
+			system_dir = libretro_strip_verbatim_prefix(dir);
 		if (environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) && dir && dir[0] != '\0')
-			save_dir = dir;
+			save_dir = libretro_strip_verbatim_prefix(dir);
 		if (save_dir.empty())
 			save_dir = system_dir;
 	}
@@ -5347,7 +5353,7 @@ void retro_set_environment(retro_environment_t cb)
 	{
 		const char* dir = nullptr;
 		if (environ_cb(RETRO_ENVIRONMENT_GET_CONTENT_DIRECTORY, &dir) && dir)
-			content_dir = dir;
+			content_dir = libretro_strip_verbatim_prefix(dir);
 		// Capture system_dir/save_dir and (re-)export AMIBERRY_HOME_DIR so amiberry's
 		// get_home_directory() does not fall back to $HOME/Amiberry. This is the
 		// earliest of several defensive call sites — see also retro_init,

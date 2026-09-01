@@ -10,6 +10,7 @@
 #include "registry.h"
 #include "fsdb.h"
 #include "uae.h"
+#include "libretro_path_helpers.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -448,30 +449,23 @@ struct libretro_rom_scan_data
 	int got;
 };
 
-static std::string libretro_path_join(const std::string& dir, const std::string& file)
-{
-	if (dir.empty())
-		return file;
-	if (file.empty())
-		return dir;
-	const char last = dir.back();
-	if (last == '/' || last == '\\')
-		return dir + file;
-	return dir + "/" + file;
-}
-
 static void libretro_append_scan_candidate(std::vector<libretro_rom_scan_candidate>& candidates,
 	const std::string& path, const bool deepscan)
 {
 	if (path.empty())
 		return;
 
+	// Whatever the frontend handed us may still carry Windows' `\\?\` prefix,
+	// which _fullpath() preserves and opendir() then chokes on — see
+	// libretro_strip_verbatim_prefix().
+	const std::string plain = libretro_strip_verbatim_prefix(path);
+
 	TCHAR resolved[MAX_DPATH] = {};
 #ifdef _WIN32
-	if (_fullpath(resolved, path.c_str(), MAX_DPATH) == nullptr)
+	if (_fullpath(resolved, plain.c_str(), MAX_DPATH) == nullptr)
 		return;
 #else
-	if (realpath(path.c_str(), resolved) == nullptr)
+	if (realpath(plain.c_str(), resolved) == nullptr)
 		return;
 #endif
 

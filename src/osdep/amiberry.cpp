@@ -61,6 +61,11 @@
 #include <parser.h>
 #include <sstream>
 
+#ifdef LIBRETRO
+// -I<libretro dir> is only on the include path for the libretro build.
+#include "libretro_path_helpers.h"
+#endif
+
 #include "amiberry_input.h"
 #include "amiberry_adpf.h"
 #include "amiberry_rp9.h"
@@ -8242,8 +8247,13 @@ std::string get_home_directory(const bool portable_mode)
 		const auto env_home_dir = getenv("AMIBERRY_HOME_DIR");
 		if (env_home_dir != nullptr && env_home_dir[0] != '\0')
 		{
-			write_log("libretro: Using home directory from AMIBERRY_HOME_DIR: %s\n", env_home_dir);
-			return { env_home_dir };
+			// The shim strips this from the dirs it exports itself, but the var
+			// may equally have been inherited from a shell or a parent process —
+			// and a Windows `\\?\` path here would poison every host path we
+			// build from it. See libretro_strip_verbatim_prefix().
+			const auto home_dir = libretro_strip_verbatim_prefix(env_home_dir);
+			write_log("libretro: Using home directory from AMIBERRY_HOME_DIR: %s\n", home_dir.c_str());
+			return home_dir;
 		}
 		write_log("libretro: AMIBERRY_HOME_DIR not set — refusing to fall back to host home dir\n");
 		return {};
