@@ -260,6 +260,27 @@ static void clear_shm ()
 	}
 }
 
+/* Hand the natmem reservation back to the OS.
+ *
+ * Win32 wants MEM_RELEASE with a zero size ("the whole reservation"), while
+ * the POSIX shim above turns the call into munmap(), which rejects a zero
+ * length — so the two need different arguments for the same thing. Getting
+ * this wrong is silent: the free fails and the 4GB stays mapped.
+ */
+static void free_natmem ()
+{
+	if (!natmem_reserved)
+		return;
+#ifdef _WIN32
+	VirtualFree (natmem_reserved, 0, MEM_RELEASE);
+#else
+	VirtualFree (natmem_reserved, natmem_reserved_size, MEM_RELEASE);
+#endif
+	natmem_reserved = nullptr;
+	natmem_offset = nullptr;
+	natmem_reserved_size = 0;
+}
+
 bool preinit_shm ()
 {
 	uae_u64 total64;
@@ -272,11 +293,7 @@ bool preinit_shm ()
 	MEMORYSTATUSEX memstatsex;
 #endif
 
-	if (natmem_reserved)
-		VirtualFree (natmem_reserved, 0, MEM_RELEASE);
-
-	natmem_reserved = nullptr;
-	natmem_offset = nullptr;
+	free_natmem ();
 
 	GetSystemInfo (&si);
 	size_t max_allowed_mman = 512 + 256;
@@ -698,6 +715,35 @@ void free_shm ()
 	for (int & i : ortgmem_type) {
 		i = -1;
 	}
+}
+
+/* Give the natmem reservation itself back to the OS, on top of what
+ * `free_shm()` releases.
+ *
+ * Amiberry never does this on its own: the reservation is 4GB of address
+ * space, and a process that is about to exit anyway has nothing to gain from
+ * unmapping it. A libretro core is not that process — the frontend dlcloses it
+ * and loads it again for the next title, and each fresh copy of the library
+ * starts with `natmem_reserved` null, so the previous one's 4GB stays mapped
+ * for the lifetime of the frontend.
+ *
+ * Three demos into a playlist that walls off the address space around the
+ * newly loaded core, the JIT can no longer place its translation cache within
+ * the ±2GB that RIP-relative addressing of the emulator's globals needs, and
+ * the core silently falls back to the interpreter. See `retro_deinit`.
+ */
+void release_shm ()
+{
+	free_shm ();
+	if (!natmem_reserved)
+		return;
+	write_log (_T("MMAN: Releasing %p-%p (0x%zx %zuM)\n"),
+			   natmem_reserved, natmem_reserved + natmem_reserved_size,
+			   natmem_reserved_size, natmem_reserved_size / (1024 * 1024));
+	free_natmem ();
+	max_z3fastmem = 0;
+	max_physmem = 0;
+	canbang = false;
 }
 
 void mapped_free (addrbank *ab)

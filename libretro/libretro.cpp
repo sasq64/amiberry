@@ -5248,10 +5248,37 @@ void retro_init(void)
 	minimum_audio_latency_requested = false;
 }
 
+/* Give back the address space the emulation reserved, now that the core fiber
+ * has run `amiberry_main` to completion and nothing will touch it again.
+ *
+ * A standalone Amiberry never bothers: it holds the 4GB natmem reservation and
+ * the JIT's translation cache until the process exits, and the OS reclaims
+ * both. A libretro core does not get that exit — the frontend keeps running and
+ * loads the core again for the next title, often as a fresh copy of the library
+ * so that two instances can overlap, and a fresh copy starts with its own null
+ * `natmem_reserved` and knows nothing of what the previous one mapped.
+ *
+ * Leaked, each run walls off another 4GB. Three demos in, the newly loaded
+ * core's globals no longer have 16MB free within the ±2GB that RIP-relative
+ * addressing of the translation cache needs; the JIT halves its request until
+ * it gives up, disables itself, and the demo crawls along in the interpreter.
+ */
+static void release_host_address_space()
+{
+#ifdef JIT
+	/* Declared in jit/compemu.h, which is awkward to include here (it drags in
+	 * the JIT's platform headers); the definition is in compemu_support. */
+	extern void compiler_exit(void);
+	compiler_exit();
+#endif
+	release_shm();
+}
+
 void retro_deinit(void)
 {
 	shutdown_core_fiber();
 	delete_core_fiber();
+	release_host_address_space();
 	libretro_debug_close();
 	update_input_log_file(false);
 	last_input_log_file = false;

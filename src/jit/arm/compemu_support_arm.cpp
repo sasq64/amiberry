@@ -2202,8 +2202,18 @@ void compiler_exit(void)
     jit_log("data_wasted = %ld bytes", data_wasted);
 #endif
 #endif
+#endif
 
-    // Deallocate translation cache
+    /* Deallocate translation cache and popallspace.
+     *
+     * UAE used to skip this: the emulator was on its way out of the process,
+     * so the OS would reclaim the mappings anyway. That does not hold for the
+     * libretro core, which is unloaded and loaded again for the next title
+     * within one long-lived frontend — every unload would leak the cache and
+     * the branch-range window it sits in. `build_comp()` calls
+     * `create_popalls()` and `alloc_cache()` on every CPU rebuild, so dropping
+     * both here is also safe if this instance is used again.
+     */
     if (compiled_code) {
 #if defined(CPU_AARCH64)
         /* Don't free separately if part of the combined popallspace block */
@@ -2214,9 +2224,11 @@ void compiler_exit(void)
         vm_release(compiled_code, cache_size * 1024);
 #endif
         compiled_code = 0;
+        max_compile_start = 0;
+        current_compile_p = 0;
+        cache_size = 0;
     }
 
-    // Deallocate popallspace
     if (popallspace) {
 #if defined(CPU_AARCH64)
         vm_release(popallspace, popall_combined_alloc_size ? popall_combined_alloc_size : POPALLSPACE_SIZE);
@@ -2228,7 +2240,6 @@ void compiler_exit(void)
 #endif
         popallspace = 0;
     }
-#endif
 
 #ifdef PROFILE_COMPILE_TIME
     jit_log("### Compile Block statistics");
