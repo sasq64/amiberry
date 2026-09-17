@@ -4359,6 +4359,7 @@ static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_
 	case RETROK_PAUSE: scancode = SDL_SCANCODE_PAUSE; break;
 	case RETROK_ESCAPE: scancode = SDL_SCANCODE_ESCAPE; break;
 	case RETROK_SPACE: scancode = SDL_SCANCODE_SPACE; break;
+	case RETROK_QUOTE: scancode = SDL_SCANCODE_APOSTROPHE; break;
 	case RETROK_COMMA: scancode = SDL_SCANCODE_COMMA; break;
 	case RETROK_MINUS: scancode = SDL_SCANCODE_MINUS; break;
 	case RETROK_PERIOD: scancode = SDL_SCANCODE_PERIOD; break;
