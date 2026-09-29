@@ -134,6 +134,7 @@ static bool full_line_draw;
 
 static void denise_handle_quick_strobe(uae_u16 strobe, int offset, int vpos);
 static void draw_denise_vsync(int);
+static void set_pixtotal_max(void);
 static void denise_update_reg(uae_u16 reg, uae_u16 v, uae_u32 linecnt);
 static void draw_denise_line(int gfx_ypos, nln_how how, uae_u32 linecnt, int startpos, int startcycle, int endcycle, int skip_start, int skip_end, int dtotal,
 	int calib_start, int calib_len, bool lol, int hdelay, bool blanked, bool borderline, bool finalseg, struct linestate *ls);
@@ -4262,6 +4263,7 @@ static void expand_drga(struct denise_rga *rd)
 					denise_lol_shift_prev = 0;
 					denise_lol_shift_enable = true;
 				}
+				set_pixtotal_max();
 			}
 		}
 	}
@@ -5704,6 +5706,10 @@ static void set_pixtotal_max(void)
 	denise_pixtotal_max = denise_pixtotal_totalmax;
 	if (buf1) {
 		int maxw = addrdiff((uae_u32*)xlinebuffer_end, (uae_u32*)xlinebuffer) >> lts_hres_shift;
+		// buf1 may be ahead of denise_pixtotal (LOL shift), so measure the room left from it
+		if (buf1 >= (uae_u32*)xlinebuffer_start && buf1 <= (uae_u32*)xlinebuffer_end) {
+			maxw = (addrdiff((uae_u32*)xlinebuffer_end, buf1) >> lts_hres_shift) + std::max(denise_pixtotal, 0);
+		}
 		int resw = denise_pixtotal_max;
 		if (resw > maxw) {
 			denise_pixtotal_max = maxw;
