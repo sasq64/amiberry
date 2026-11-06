@@ -123,13 +123,15 @@ next blit from its blitter interrupt and acks INTREQ afterwards, so the done
 interrupt was cleared before it was taken and the demo hung. Fix: use
 `event2_newevent_x`, which scales.
 
-## 4. x86-64 JIT miscompile with flag liveness + followed constant jumps
+## 4. Klone/DCS breaks under the x86-64 JIT
 
-**Status:** open. Klone/DCS (demozoo 8120) runs fine on the interpreter, but
-under JIT a plot loop writes through its own code (`sub.w d3,d2; blt` guarding
-`move.b d5,(a2)+; dbra d2`), and the demo dies on an illegal instruction.
-Either `compnf=false` or `comp_constjump=false` alone makes it work, which
-points at flag liveness across blocks joined by followed jumps.
+**Status:** open. Klone/DCS (demozoo 8120) runs fine on the interpreter (also
+with the non-cycle-exact blitter), but under JIT it ends in the Kickstart idle
+loop at a varying point. In one traced run a plot loop (`sub.w d3,d2; blt`
+guarding `move.b d5,(a2)+; dbra d2`) had overwritten the demo's own code and it
+died on an illegal instruction. `compnf=false` and `comp_constjump=false` each
+looked like fixes over 1500 frames but both still fail over 3000, so the
+failure is timing-dependent and neither is a workaround.
 
 ## 5. Denise AGA renderer null write at boot; JIT SIGSEGV handler makes it fatal
 
