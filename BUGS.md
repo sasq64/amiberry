@@ -109,3 +109,32 @@ READ of size 1
 ```
 
 Fix: hoist the array to function scope so it outlives the branch.
+
+---
+
+## 3. Non-cycle-exact blitter finished 512x too early — FIXED locally
+
+**Status:** fixed in `src/blitter.cpp`; belongs upstream. Introduced by the
+WinUAE merge `552274b6`, which replaced `event2_newevent(ev2_blitter, n, 0)`
+(scales by `CYCLE_UNIT`) with `event2_newevent_xx(-1, n, 0, blitter_handler)`
+(raw `evt_t`) in three places. Every non-cycle-exact blit (anything with JIT)
+completed in `n` sub-cycle units instead of `n` CCKs. Closer/CNCD restarts the
+next blit from its blitter interrupt and acks INTREQ afterwards, so the done
+interrupt was cleared before it was taken and the demo hung. Fix: use
+`event2_newevent_x`, which scales.
+
+## 4. x86-64 JIT miscompile with flag liveness + followed constant jumps
+
+**Status:** open. Klone/DCS (demozoo 8120) runs fine on the interpreter, but
+under JIT a plot loop writes through its own code (`sub.w d3,d2; blt` guarding
+`move.b d5,(a2)+; dbra d2`), and the demo dies on an illegal instruction.
+Either `compnf=false` or `comp_constjump=false` alone makes it work, which
+points at flag liveness across blocks joined by followed jumps.
+
+## 5. Denise AGA renderer null write at boot; JIT SIGSEGV handler makes it fatal
+
+**Status:** open, intermittent (~4/5 runs with `cpu_compatible=false`, JIT off).
+`lts_aga_fm0_n0_p2_ilores_dhires` writes to address 0x8 while Kickstart is at
+`00f80e5c`. The JIT's `sigsegv_handler` is installed even with JIT off, treats
+the fault as a JIT fault, "redirects" to `popall_do_nothing` (null) and crashes
+at 0x240, hiding the original fault. Seen with 376675 + `cpu_compatible=false`.

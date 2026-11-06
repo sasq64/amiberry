@@ -1003,7 +1003,7 @@ static void blitter_handler(uae_u32 data)
 	static int blitter_stuck;
 
 	if (!dmaen (DMA_BLITTER)) {
-		event2_newevent_xx(-1, 10, 0, blitter_handler);
+		event2_newevent_x(-1, 10, 0, blitter_handler);
 		blitter_stuck++;
 		if (blitter_stuck < 20000 || !immediate_blits)
 			return; /* gotta come back later. */
@@ -1016,7 +1016,7 @@ static void blitter_handler(uae_u32 data)
 	}
 	blitter_stuck = 0;
 	if (blit_slowdown > 0 && !immediate_blits) {
-		event2_newevent_xx(-1, makebliteventtime(blit_slowdown), 0, blitter_handler);
+		event2_newevent_x(-1, makebliteventtime(blit_slowdown), 0, blitter_handler);
 		blit_slowdown = -1;
 		return;
 	}
@@ -2151,7 +2151,7 @@ void do_blitter(int copper, uaecptr pc)
 	}
 	
 	blit_cyclecounter = cycles * blit_cyclecount;
-	event2_newevent_xx(-1, makebliteventtime(blit_cyclecounter), 0, blitter_handler);
+	event2_newevent_x(-1, makebliteventtime(blit_cyclecounter), 0, blitter_handler);
 }
 
 void blitter_check_start (void)
