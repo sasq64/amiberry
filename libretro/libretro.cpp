@@ -185,6 +185,8 @@ static std::string cached_audio_interpol;
 static std::string cached_sound_filter;
 static std::string cached_stereo_sep;
 static std::string cached_floppy_speed;
+static bool cached_floppy_sound = false;
+static int cached_floppy_sound_volume = 67;
 static std::string cached_video_standard;
 static std::string cached_video_resolution;
 static std::string cached_video_vresolution;
@@ -707,6 +709,8 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_sound_filter", "Sound Filter; off|emulated|on" },
 	{ "amiberry_stereo_separation", "Stereo Separation; 0|1|2|3|4|5|6|7|8|9|10" },
 	{ "amiberry_floppy_speed", "Floppy Speed; 0|100|200|400|800" },
+	{ "amiberry_floppy_sound", "Floppy Drive Sound; disabled|enabled" },
+	{ "amiberry_floppy_sound_volume", "Floppy Drive Sound Volume (%); 67|0|10|20|30|40|50|60|70|80|90|100" },
 	{ "amiberry_video_standard", "Video Standard; auto|pal|ntsc" },
 	{ "amiberry_video_resolution", "Video Resolution; hires|auto|lores|superhires" },
 	{ "amiberry_video_vresolution", "Video Line Mode; double|auto|single" },
@@ -1176,6 +1180,44 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ NULL, NULL }
 		},
 		"100"
+	},
+	{
+		"amiberry_floppy_sound",
+		"Floppy Drive Sound",
+		"Floppy Drive Sound",
+		"Emulate floppy drive motor, head step and insert sounds. Needs the drive_*.wav samples in <system>/floppy_sounds/.",
+		NULL,
+		"system",
+		{
+			{ "disabled", NULL },
+			{ "enabled", NULL },
+			{ NULL, NULL }
+		},
+		"disabled"
+	},
+	{
+		"amiberry_floppy_sound_volume",
+		"Floppy Drive Sound Volume",
+		"Floppy Drive Sound Volume",
+		"Volume of the floppy drive sounds, in percent of the samples' full level.",
+		NULL,
+		"system",
+		{
+			{ "0", NULL },
+			{ "10", NULL },
+			{ "20", NULL },
+			{ "30", NULL },
+			{ "40", NULL },
+			{ "50", NULL },
+			{ "60", NULL },
+			{ "67", "67 (Amiberry Default)" },
+			{ "70", NULL },
+			{ "80", NULL },
+			{ "90", NULL },
+			{ "100", NULL },
+			{ NULL, NULL }
+		},
+		"67"
 	},
 	{
 		"amiberry_video_standard",
@@ -3624,6 +3666,10 @@ static void snapshot_core_options()
 	cached_stereo_sep = stereo_sep ? stereo_sep : "";
 	const char* floppy_spd = get_option_value("amiberry_floppy_speed");
 	cached_floppy_speed = floppy_spd ? floppy_spd : "";
+	const char* floppy_snd = get_option_value("amiberry_floppy_sound");
+	cached_floppy_sound = floppy_snd && strcmp(floppy_snd, "enabled") == 0;
+	const char* floppy_vol = get_option_value("amiberry_floppy_sound_volume");
+	cached_floppy_sound_volume = floppy_vol ? std::clamp(atoi(floppy_vol), 0, 100) : 67;
 	const char* vid_std = get_option_value("amiberry_video_standard");
 	cached_video_standard = vid_std ? vid_std : "";
 	const char* vid_res = get_option_value("amiberry_video_resolution");
@@ -4867,6 +4913,12 @@ static void core_entry(void)
 
 	if (!is_rp9 && !cached_floppy_speed.empty() && cached_floppy_speed != "100") {
 		push_s_option("floppy_speed=" + cached_floppy_speed);
+	}
+
+	if (cached_floppy_sound) {
+		for (int i = 0; i < 4; i++)
+			push_s_option("floppy" + std::to_string(i) + "sound=1");
+		push_s_option("floppy_volume=" + std::to_string(100 - cached_floppy_sound_volume));
 	}
 
 	if (!is_rp9 && !cached_video_standard.empty() && cached_video_standard != "auto") {

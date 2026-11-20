@@ -38,5 +38,13 @@ static inline void osdep_platform_update_clipboard()
 
 static inline void osdep_platform_call_real_main(int argc, char** argv)
 {
+	// Drive sound samples come from the frontend's system dir.
+	const char* system_dir = getenv("AMIBERRY_LIBRETRO_SYSTEM_DIR");
+	if (system_dir && system_dir[0]) {
+		const std::string sounds = std::string(system_dir) + "/floppy_sounds/";
+		std::error_code ec;
+		if (std::filesystem::is_directory(sounds, ec))
+			set_floppy_sounds_path(sounds);
+	}
 	real_main(argc, argv);
 }
