@@ -133,10 +133,21 @@ died on an illegal instruction. `compnf=false` and `comp_constjump=false` each
 looked like fixes over 1500 frames but both still fail over 3000, so the
 failure is timing-dependent and neither is a workaround.
 
-## 5. Denise AGA renderer null write at boot; JIT SIGSEGV handler makes it fatal
+## 5. Denise renderer null write at boot; JIT SIGSEGV handler makes it fatal
 
-**Status:** open, intermittent (~4/5 runs with `cpu_compatible=false`, JIT off).
-`lts_aga_fm0_n0_p2_ilores_dhires` writes to address 0x8 while Kickstart is at
-`00f80e5c`. The JIT's `sigsegv_handler` is installed even with JIT off, treats
-the fault as a JIT fault, "redirects" to `popall_do_nothing` (null) and crashes
-at 0x240, hiding the original fault. Seen with 376675 + `cpu_compatible=false`.
+**Status:** patched locally in `get_line()` (`src/drawing.cpp`).
+`lts_aga_fm0_n0_p2_ilores_dhires` (and the ECS variant on a plain A500) writes
+to address 0x8 while Kickstart is at `00f80e5c`. The JIT's `sigsegv_handler` is
+installed even with JIT off, treats the fault as a JIT fault, "redirects" to
+`popall_do_nothing` (null) and either crashes or loops logging hundreds of
+thousands of `JIT: SIGSEGV` lines, hiding the original fault. Seen with 376675
++ `cpu_compatible=false`, and in ~2/5 boots of `rebels.adf`. What decides it
+is `amiberry_jit`, not the chipset: with it disabled an A500 and an A1200 fault
+alike (2/5, 3/5), with it enabled (which also clears the cycle-exact flags)
+neither does (0/5). That is why AGA releases, which demarc runs with the JIT,
+never showed it.
+
+Cause: `get_line()` clears `xlinebuffer`, and when `gfx_ypos` is outside
+`vb->inheight` nothing sets it again, yet `buf1 = xlinebuffer` still runs and
+the line is drawn through null. The fix points it at the scratch row
+(`setxlinebuffer(0, -1)`) in that case. Worth sending upstream.

@@ -6018,6 +6018,9 @@ static void get_line(int monid, int gfx_ypos, enum nln_how how, int lol_shift_pr
 
 	denise_pixtotal *= 2;
 
+	if (!xlinebuffer) {
+		setxlinebuffer(0, -1);
+	}
 	buf1 = (uae_u32*)xlinebuffer;
 	if (!xlinebuffer2) {
 		xlinebuffer2 = xlinebuffer;
