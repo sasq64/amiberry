@@ -190,6 +190,7 @@ static std::string cached_cpu_model;
 static std::string cached_fpu_model;
 static std::string cached_jit;
 static std::string cached_cpu_speed;
+static std::string cached_cpu_thread;
 static std::string cached_chipmem_size;
 static std::string cached_bogomem_size;
 static std::string cached_fastmem_size;
@@ -722,6 +723,7 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_z3mem_size", "Zorro III RAM (MB); auto|0|1|2|4|8|16|32|64|128|256|512" },
 	{ "amiberry_jit", "JIT Recompiler (68020+); disabled|enabled" },
 	{ "amiberry_cpu_speed", "CPU Speed; default|real|max" },
+	{ "amiberry_cpu_thread", "CPU Thread; enabled|disabled" },
 	{ "amiberry_chipset", "Chipset; auto|ocs|ecs" },
 	{ "amiberry_chipset_aga", "Chipset (AGA Models); auto|ocs|ecs|aga" },
 	{ "amiberry_audio_rate", "Audio Rate (Hz); auto|44100|48000" },
@@ -959,6 +961,20 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ NULL, NULL }
 		},
 		"default"
+	},
+	{
+		"amiberry_cpu_thread",
+		"CPU Thread",
+		"CPU Thread",
+		"Run the 68020+ CPU on its own thread. Disabled, a CPU at 'max' speed gives way when the host falls behind instead of slowing the whole machine. Core restart required.",
+		NULL,
+		"system",
+		{
+			{ "enabled", NULL },
+			{ "disabled", NULL },
+			{ NULL, NULL }
+		},
+		"enabled"
 	},
 	{
 		"amiberry_chipset",
@@ -3781,6 +3797,8 @@ static void snapshot_core_options()
 	cached_jit = jit ? jit : "";
 	const char* cpu_speed = get_option_value("amiberry_cpu_speed");
 	cached_cpu_speed = cpu_speed ? cpu_speed : "";
+	const char* cpu_thread = get_option_value("amiberry_cpu_thread");
+	cached_cpu_thread = cpu_thread ? cpu_thread : "";
 	const char* chipmem = get_option_value("amiberry_chipmem_size");
 	cached_chipmem_size = chipmem ? chipmem : "";
 	const char* bogomem = get_option_value("amiberry_bogomem_size");
@@ -5357,6 +5375,8 @@ static void core_entry(void)
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "CPU speed: %s\n", cached_cpu_speed.c_str());
 	}
+	if (!is_rp9 && cached_cpu_thread == "disabled")
+		push_s_option("cpu_threaded=false");
 
 	const char* chipset = cached_chipset_value();
 	if (!is_rp9 && chipset && strcmp(chipset, "auto") != 0) {
