@@ -29,6 +29,7 @@ struct bltinfo {
     bool blit_interrupt;
     bool blit_interrupt_trigger;
     int blit_main, blit_pending, blit_count_done;
+    int blit_stuck;
     int blit_queued;
     evt_t finishcycle_dmacon, finishcycle_copper;
     evt_t blt_ch_cycles[4];
@@ -51,9 +52,12 @@ extern void decide_blitter(int hpos);
 extern void blitter_done_notify(void);
 extern void blitter_slowdown(int, int, int, int);
 extern void blitter_check_start(void);
+// after a CPU write to a custom register, with the JIT: a nasty blit holds the CPU until it ends
+extern void blitter_cpu_write_nasty(void);
 extern void blitter_reset(void);
 extern void blitter_debugdump(void);
 extern void restore_blitter_start(void);
+extern void blitter_hsync(void);
 
 void blitter_loadbdat(uae_u16 v);
 void blitter_loadcdat(uae_u16 v);

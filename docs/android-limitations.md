@@ -2,27 +2,35 @@
 
 The Android version of Amiberry has some differences from the desktop (Linux/macOS/Windows) builds due to platform constraints.
 
+The Android version is currently in Closed Testing on Google Play, available only to Ko-fi members. For availability, setup, touch controls, and the launcher, see the [Android wiki page](https://github.com/BlitterStudio/amiberry/wiki/Android).
+
 ## Disabled Features
 
-### Serial Port Emulation
-Serial port support is excluded on Android. The host serial device APIs are not available.
+These build options are forced off for Android in `CMakeLists.txt`:
 
-### Network Stack (bsdsocket)
-TCP/IP emulation via bsdsocket is not available. The SLIRP network stack and direct socket emulation are disabled.
+- **CD32 Full Motion Video** — the MPEG decoder (`USE_LIBMPEG2`) is not built.
+- **MP3 decoding** — `USE_MPG123` is off, so MP3 audio tracks in CUE images and the ZZ9000 MP3/MHI decoders are unavailable.
+- **Genlock video, camera input, and ZZ9000 FFmpeg/WebP codecs** — `USE_VIDEOGRAB`, `USE_FFMPEG`, and `USE_WEBP` are off.
+- **uaenet** — the pcap and TAP backends are not available. The built-in SLIRP stack and `bsdsocket.library` emulation are still included.
+- **PowerPC** — `USE_PPC` and the QEMU-UAE plugin loader (`USE_QEMU_PPC`) are off.
+- **IPC socket and GPIO LEDs** — `USE_IPC_SOCKET` and `USE_GPIOD` are off.
 
-### CRT Shader Effects
-Six CRT shader effects are disabled on Android due to GPU performance constraints:
-- CRT Lottes
-- CRT Hyllian
-- CRT Caligari
-- CRT Easymode Halation
-- CRT Guest Advanced
-- CRT NewPixie
+MIDI is built with PortMidi's null backend, so no host MIDI devices are available. Portable mode and the built-in updater are not offered on Android; updates come through Google Play.
 
-The remaining shader effects (scanlines, aperture grille, etc.) work normally.
+### Shaders
+The Android launcher's **Native screen shader** list offers the built-in shaders (`none`, `tv`, `pc`, `lite`, `1084`) plus any `.glslp` presets and top-level `.glsl` files found in `Visuals/Shaders`. The built-in CRT effect switches to lighter shader and blur variants on mobile GPUs.
 
-### Fast Memory Mapping (natmem)
-The native memory mapping optimization used on desktop platforms is disabled on Android. This means the JIT compiler uses a different, slightly slower memory access path. This is necessary to avoid out-of-memory issues with Android's virtual memory management.
+### Model presets
+The launcher writes the whole machine a Quick Start model builds into its configuration (chipset extras such as the A3000's SCSI and Ramsey or the CD32's Akiko included), at the **Compatibility** level picked next to the model; new models start at the approximate level, as on the desktop. In Settings the model is the **Amiga model** on the CPU tab; **Review changes** lists what an unsaved new configuration changes from its model's preset (or an open configuration from its saved file), with a Revert per option. The overflow menu's **Quick setups** (Pixel perfect, Touch controls) set display and control options in one go. The CD32, CDTV and DraCo NVRAM files are kept in the emulator's `NVRAM` folder between launches. A few parts of a preset are not settings the launcher can write:
+- the 64 KB SRAM card of the CDTV "Floppy drive and 64KB SRAM card" configuration;
+- the CD drive of a CD32 or CDTV started without a disc.
+
+Changing the model keeps the inserted disks and CD. A medium the new model has no drive for (floppies on a CD32, a CD on an A500) is ejected, and a message offers Undo. Quick Start opens in **Recent** once something was launched, in **WHDLoad** when games are installed, and in **Disk** otherwise.
+
+### Settings coverage
+The launcher's Settings tabs show every option of the shared settings layer that means something on Android: each tab's own controls first, then one section per settings group (CPU, MMU, FPU, CPU speed, JIT; Chipset, Advanced chipset and Genlock, which start collapsed; Memory and ROMs; Display and Filters; Sound; Autofire, controllers and mouse, and On-screen controls; Floppy, CD and Filesystem), and a **Misc** tab for the miscellaneous options, expansions and the protection dongle. An option that is unavailable in the current machine is dimmed, and its section says why once. The second to fourth memory boards of a kind appear once the board before is fitted. The classic settings window is gone: expansion and accelerator boards, custom controls and the disk swapper list have their own editors, and the settings the window kept to itself (its theme and scale, the Quickstart panel's options) no longer exist on Android.
+
+Options for host windows, devices, serial ports, MIDI and PowerPC do not apply on Android and are not shown.
 
 ### FPU Signaling NaN Detection
 Hardware-based signaling NaN (SNAN) detection is disabled. This is a platform-independent limitation but particularly affects Android due to the ARM64 FPU behavior.
@@ -37,11 +45,17 @@ The Android build supports:
 
 ## Storage
 
-Amiberry requests the `MANAGE_EXTERNAL_STORAGE` permission to access ROM images, disk images, and game archives in user-chosen directories. If denied, the app operates within its scoped storage directory at:
+Imports copy files into the app's scoped storage directory, each into the folder of its kind (an `.adf` to `Floppies`, an `.lha` to `LHA`) whichever Files category is open:
 
 ```
 /storage/emulated/0/Android/data/com.blitterstudio.amiberry/files/
 ```
+
+Files ▸ ⋮ ▸ **Storage location** shows this path (with **Copy path**, except on TV). Importing a `.lha`/`.lzh` that holds no `.slave` file warns that it is not a WHDLoad game.
+
+Imports use the system document picker. Where none exists (Google TV resolves it to a stub that only says "You don't have an app that can do this"), and from Files ▸ Import ▸ **Browse device storage** on other devices, the launcher opens its own browser of internal storage, Downloads and USB drives. That browser needs the `MANAGE_EXTERNAL_STORAGE` (All Files Access) permission (READ_EXTERNAL_STORAGE on Android 10). It is not requested at startup: the Files tab shows an optional, dismissible card, and the browser explains the permission before opening the system grant screen, then opens by itself once the user returns with it granted.
+
+Storage ▸ **Hard drives** mounts host folders where they are (the device browser picks them, so it needs the same permission), archives, hardfiles, CD drives on an IDE or SCSI controller and tape drives, and creates new hardfiles (raw or dynamic VHD) in `HardDrives`. Physical drives, which the desktop's Add Hard Drive mounts, cannot be: Android gives apps no raw access to block devices. The Controller list holds the UAE, IDE and SCSI controllers and those of the expansion boards the machine has; the machine's own IDE or SCSI controller (A600, A1200, A3000, A4000) is the IDE (Auto) or SCSI (Auto) entry.
 
 ## Performance Notes
 
@@ -49,17 +63,46 @@ Amiberry requests the `MANAGE_EXTERNAL_STORAGE` permission to access ROM images,
 - GPU-intensive configurations (RTG high resolution, multiple bitplanes) may be slower than on desktop
 - Floppy drive sounds are supported but may add slight audio latency on some devices
 
+## On-Screen Keyboard Controls
+
+The on-screen keyboard has two independent ways to open it:
+
+- **On-Screen Keyboard Button** shows the green **KB** touch button on the on-screen joystick (`amiberry.vkbd_touch_button`). It only appears while the on-screen joystick is shown.
+- **On-Screen Keyboard Toggle Button** picks the controller button that opens and closes the keyboard. **Default** uses the native default binding; **None (disabled)** leaves the button available to the game.
+
+Turning the KB button off keeps the gamepad toggle working, so a TV or other gamepad-only device can hide all touch controls and still type. The keyboard is off entirely only when the KB button is off and the toggle is **None (disabled)**. A gamepad connected at startup hides the on-screen joystick but leaves the keyboard available.
+
+Saved configurations preserve Default, None and explicit button selections independently of remembered settings, both when opened in Settings and when launched from Configurations, Recent or a shared file. The same holds for their port, on-screen joystick, numeric keypad, mouse-map and analog mouse speed settings: remembered controls only fill the ones a configuration does not set, so older configurations without a toggle setting still inherit the remembered selection. Quick Start disk and CD launches and RP9 packages use the remembered controls. Configurations and remembered settings from older versions that had the keyboard switched off load with the KB button off and the toggle set to None.
+
+While the keyboard is open, the D-pad or left stick moves focus, South presses the focused key, and East closes the keyboard. Focus stays fixed while South is held. Opening the emulator GUI closes the keyboard so controller releases consumed by the GUI cannot leave stale keyboard holds when emulation resumes.
+
+A WHDLoad launch follows the same rule. WHDBooter chooses the hardware when the game starts, from its game database, the installed Kickstarts, or the game's own `<game>.uae` configuration. The launcher then applies its ports, on-screen controls, mouse map, analog mouse speed and shader, so its ports replace the ones WHDBooter assigns; whatever the game's own configuration sets explicitly takes precedence. Quick Start therefore shows only these launcher settings for a WHDLoad game, and names the game's configuration when it has one. `.lha`, `.lzh` and `.lzx` archives all boot.
+
+For WHDLoad launches, the launcher's port choices also override the default controllers and mice in `amiberry.conf` (`default_controller1`–`4`, `default_mouse1`/`2`), which WHDBooter would otherwise assign.
+
+The red **Hide** key in the top-right corner of the keyboard, above the arrow keys, closes it like Back or East. Tap it, or move focus onto it (Right from Help, or Up from Bksp) and press South. In portrait the keyboard docks at the bottom and the Amiga picture moves into the free space above it, so the keyboard covers as little of the picture as possible. The picture moves back when the keyboard closes. Landscape placement does not change.
+
+## Android TV and the In-Game Menu
+
+On Android TV (a leanback device) a new installation starts without the touch overlays: no on-screen joystick and no KB button, with Port 2 set to a controller. While no gamepad is connected, the remote's D-pad moves the Port 2 joystick and OK fires; Back still opens the menu. This is decided while the emulation runs, so configurations saved on a TV are the same as anywhere else, and connecting a gamepad hands Port 2 back to the configuration's device. A one-time hint says what the remote does; on other devices a one-time hint says that Back opens the menu.
+
+The in-game menu's **Controls** page shows the Port 1 and Port 2 devices, with **Swap ports**. Port changes there apply to the session; the on-screen joystick and keyboard switches are kept for the next launch. The **Settings** page's changes apply to the session only. Reset, Hard reset, Quit and saving over a used state slot ask first, with Cancel focused. The menu is the only settings UI over a running emulation: the built-in window it once offered is gone from the Android build.
+
 ## Desktop-Style Use on ChromeOS
 
 On large-screen/desktop-class devices (Chromebooks, freeform windowing), Amiberry launches as a landscape tablet-size window; on phone-standard launches these preferences are inert and behavior is unchanged. Physical-keyboard users on QWERTZ-style layouts get correct key mapping (the physical key positions are passed through and the AmigaOS keymap performs the layout mapping), and synthetic Enter events generated by a light touchpad tap are filtered out so they never reach the emulated machine.
+
+## Launcher Layout on Wide Screens
+
+The launcher adapts to the window width (Material 3 window size classes). From 600 dp (a tablet held upright) the navigation rail replaces the bottom bar, and Settings and Files list their tabs and categories down the left beside the content. From 840 dp (a landscape tablet, a Chromebook window, Android TV) Configurations shows the list beside the selected configuration's summary and actions, and Quick Start shows the launch mode and media beside the notices and current settings. A phone keeps the single-column layout, also when held sideways. With a D-pad, Left and Right move between the panes, and Right from the navigation rail always enters the tab's content; in Settings the page follows the category focus rests on, and Right enters the page at its first control. Open dropdowns start on their current value. On Android TV, focus starts in Quick Start's content, OK on a game in the WHDLoad game list starts it, body and help text is 1.2 times larger, the focus ring is a thicker light outline, and Configurations offers no Share (no TV app takes a shared file).
 
 ## RTG Display Modes
 
 When the host exposes only its native fullscreen mode, Picasso96 mode lists on Android are supplemented with a set of virtual resolutions (up to 2560x1440, subject to the configured RTG memory). These are marked with an `ANDROID` suffix.
 
-## GUI Scale
+## Building without the built-in GUI
 
-The GUI defaults to roughly 70% of automatic DPI scaling on Android (the desktop default is unchanged). Adjust it with the **GUI scale** setting under Display defaults (50–200%).
+The Android app is built with `AMIBERRY_NO_IMGUI` (`android/app/build.gradle`): none of the Dear ImGui GUI's code is compiled in, and the launcher, the in-game menu, the native dialogs and the on-screen keyboard replace it. The desktop, iOS and Mac App Store builds are unaffected.
 
 ## Building the APK on Windows
 

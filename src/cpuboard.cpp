@@ -26,7 +26,6 @@
 #include "newcpu.h"
 #include "ncr_scsi.h"
 #include "ncr9x_scsi.h"
-#include "debug.h"
 #include "flashrom.h"
 #include "uae.h"
 #ifdef WITH_PPC
@@ -560,6 +559,27 @@ static void REGPARAM2 blizzardram_nojit_bput(uaecptr addr, uae_u32 b)
 	blizzardram_nojit_bank.baseaddr[addr] = b;
 }
 #endif
+#else
+
+void cyberstorm_scsi_ram_put(uaecptr addr, uae_u32 v)
+{
+}
+
+uae_u32 cyberstorm_scsi_ram_get(uaecptr addr)
+{
+	return 0;
+}
+
+uae_u8 *REGPARAM2 cyberstorm_scsi_ram_xlate(uaecptr addr)
+{
+	return NULL;
+}
+
+int REGPARAM2 cyberstorm_scsi_ram_check(uaecptr a, uae_u32 b)
+{
+	return 0;
+}
+
 #endif // WITH_CPUBOARD
 
 static void no_rom_protect(void)
@@ -1634,6 +1654,20 @@ static void REGPARAM2 blizzardio_lput(uaecptr addr, uae_u32 v)
 	}
 }
 
+#else
+
+void cyberstorm_mk3_ppc_irq_setonly(int id, int level)
+{
+}
+
+void cyberstorm_mk3_ppc_irq(int id, int level)
+{
+}
+
+void blizzardppc_irq(int id, int level)
+{
+}
+
 #endif //WITH_CPUBOARD
 
 static void cpuboard_hsync(void)
@@ -1667,7 +1701,9 @@ void cpuboard_map(void)
 	if (is_magnum40(&currprefs)) {
 		map_banks(&blizzardio_bank, 0x0c0c0000 >> 16, 0x10000 >> 16, 0);
 	}
-	if (is_12gauge(&currprefs)) {
+	// Without board RAM its banks have no memory behind them (as the other
+	// boards, it maps none).
+	if (is_12gauge(&currprefs) && cpuboard_size) {
 		map_banks(&cpuboardmem1_bank, cpuboardmem1_bank.start >> 16, 0x01000000 >> 16, (cpuboard_size / 2) >> 16);
 		map_banks(&cpuboardmem2_bank, cpuboardmem2_bank.start >> 16, 0x01000000 >> 16, (cpuboard_size / 2) >> 16);
 	}
@@ -1846,6 +1882,11 @@ void cpuboard_reset(int hardreset)
 		io_reg[CSIII_REG_IPL_EMU] = 0x40;
 		io_reg[CSIII_REG_LOCK] = 0x01;
 	}
+#ifdef WITH_PPC
+	// IPL_EMU now masks PPC interrupts, so check_ppc_int_lvl() would never
+	// clear a latch left over from before the reset.
+	ppc_irq_pending = false;
+#endif
 	if (hardreset || is_keyboardreset())
 		a2630_io = 0;
 
@@ -1879,11 +1920,7 @@ void cpuboard_cleanup(void)
 #if 0
 } else {
 		if (blizzardram_nojit_bank.baseaddr) {
-#ifdef CPU_64_BIT
 			uae_vm_free(blizzardram_nojit_bank.baseaddr, blizzardram_nojit_bank.allocated);
-#else
-			xfree(blizzardram_nojit_bank.baseaddr);
-#endif
 		}
 	}
 #endif
@@ -2142,13 +2179,17 @@ static void cpuboard_init_2(void)
 			mapped_malloc(&blizzardram_bank);
 		}
 
-		blizzardmaprom_bank.baseaddr = blizzardram_bank.baseaddr + cpuboard_size - 524288;
-		blizzardmaprom_bank.start = BLIZZARDMK2_MAPROM_BASE;
-		blizzardmaprom_bank.reserved_size = 524288;
-		blizzardmaprom_bank.mask = 524288 - 1;
-		blizzardmaprom_bank.flags |= ABFLAG_INDIRECT | ABFLAG_NOALLOC;
-		mapped_malloc(&blizzardmaprom_bank);
-		blizzardmaprom_bank_mapped = true;
+		// The MAPROM is the top 512 KB of the board RAM: none without it
+		// (as on the MK4), or it pointed below a NULL base.
+		if (cpuboard_size > 524288) {
+			blizzardmaprom_bank.baseaddr = blizzardram_bank.baseaddr + cpuboard_size - 524288;
+			blizzardmaprom_bank.start = BLIZZARDMK2_MAPROM_BASE;
+			blizzardmaprom_bank.reserved_size = 524288;
+			blizzardmaprom_bank.mask = 524288 - 1;
+			blizzardmaprom_bank.flags |= ABFLAG_INDIRECT | ABFLAG_NOALLOC;
+			mapped_malloc(&blizzardmaprom_bank);
+			blizzardmaprom_bank_mapped = true;
+		}
 
 		maprom_base = blizzardram_bank.reserved_size - 524288;
 
@@ -2166,13 +2207,17 @@ static void cpuboard_init_2(void)
 			mapped_malloc(&blizzardram_bank);
 		}
 
-		blizzardmaprom_bank.baseaddr = blizzardram_bank.baseaddr + cpuboard_size - 524288;
-		blizzardmaprom_bank.start = BLIZZARDMK3_MAPROM_BASE;
-		blizzardmaprom_bank.reserved_size = 524288;
-		blizzardmaprom_bank.mask = 524288 - 1;
-		blizzardmaprom_bank.flags |= ABFLAG_INDIRECT | ABFLAG_NOALLOC;
-		mapped_malloc(&blizzardmaprom_bank);
-		blizzardmaprom_bank_mapped = true;
+		// The MAPROM is the top 512 KB of the board RAM: none without it
+		// (as on the MK4), or it pointed below a NULL base.
+		if (cpuboard_size > 524288) {
+			blizzardmaprom_bank.baseaddr = blizzardram_bank.baseaddr + cpuboard_size - 524288;
+			blizzardmaprom_bank.start = BLIZZARDMK3_MAPROM_BASE;
+			blizzardmaprom_bank.reserved_size = 524288;
+			blizzardmaprom_bank.mask = 524288 - 1;
+			blizzardmaprom_bank.flags |= ABFLAG_INDIRECT | ABFLAG_NOALLOC;
+			mapped_malloc(&blizzardmaprom_bank);
+			blizzardmaprom_bank_mapped = true;
+		}
 
 		maprom_base = blizzardram_bank.reserved_size - 524288;
 

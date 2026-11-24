@@ -1,0 +1,265 @@
+#!/bin/sh
+# Behavioral test for --dump-config. Runs a built amiberry binary in its
+# headless early-exit mode and asserts the resolved-configuration semantics.
+#
+# Usage: AMIBERRY_BIN=<path-to-amiberry> tests/test_dump_config.sh
+set -eu
+
+if [ -z "${AMIBERRY_BIN:-}" ]; then
+	echo "AMIBERRY_BIN must point at a built amiberry binary" >&2
+	exit 1
+fi
+bin="$AMIBERRY_BIN"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# Isolated environment: no user settings interfere with resolution.
+export HOME="$work"
+
+check()
+{
+	if ! grep -q "$2" "$1"; then
+		echo "expected '$2' in $1" >&2
+		cat "$1" >&2
+		exit 1
+	fi
+}
+
+# A 68040 config requesting 24-bit addressing must come back corrected:
+# fixup_prefs forces address_space_24 off on 68040+, and the correction must
+# be reported on stderr. This pins the post-fixup (resolved) semantics -- a
+# dump that merely echoed the .uae would fail here.
+printf 'config_description=dump-config test\ncpu_type=68040\ncpu_24bit_addressing=true\n' > "$work/probe.uae"
+"$bin" --dump-config -f "$work/probe.uae" > "$work/out.txt" 2> "$work/err.txt"
+# The dump must stay byte-exact: LF line endings only. On Windows this pins
+# the binary stdout mode (text mode would translate every LF to CRLF); on
+# other platforms it passes trivially. Checked first so a regression fails
+# with this message rather than a confusing content mismatch.
+cr="$(printf '\r')"
+if grep -q "$cr" "$work/out.txt"; then
+	echo "dump emitted CRLF line endings (Windows stdout left in text mode?)" >&2
+	exit 1
+fi
+check "$work/out.txt" '^cpu_model=68040$'
+check "$work/out.txt" '^cpu_24bit_addressing=false$'
+check "$work/err.txt" '24-bit address space is not supported with 68040'
+
+# Explicit controller-removal fallbacks must survive config parsing and
+# serialization. kbd3 selects keyboard layout C; none disables fallback.
+printf 'joyport0=joy0\njoyportdefault0=kbd3\njoyport1=joy1\njoyportdefault1=none\njoyport2=none\njoyportdefault2=none\njoyport3=none\njoyportdefault3=none\n' > "$work/joyport-default.uae"
+"$bin" --dump-config -f "$work/joyport-default.uae" > "$work/joyport-default.txt" 2>/dev/null
+check "$work/joyport-default.txt" '^joyportdefault0=kbd3$'
+check "$work/joyport-default.txt" '^joyportdefault1=none$'
+check "$work/joyport-default.txt" '^joyportdefault2=none$'
+check "$work/joyport-default.txt" '^joyportdefault3=none$'
+
+# Invalid keyboard-layout fallbacks must not escape the keyboard ID range.
+printf 'joyport0=joy0\njoyportdefault0=kbd11\n' > "$work/joyport-invalid-default.uae"
+"$bin" --dump-config -f "$work/joyport-invalid-default.uae" > "$work/joyport-invalid-default.txt" 2>/dev/null
+if grep -q '^joyportdefault0=' "$work/joyport-invalid-default.txt"; then
+	echo "invalid joyport keyboard fallback survived config parsing" >&2
+	exit 1
+fi
+
+# Input device mappings whose block begins with the mapping line itself,
+# without the name/empty/... header lines the editors write, must load for
+# the device kind the option spells. Without the header the parser used to
+# keep the previous device kind, took the missing-device path for the
+# keyboard and strdup'ed its absent names (SIGSEGV in read_inputdevice_config;
+# configs hand-written after desktop Amiberry/WinUAE examples do this).
+printf 'input.config=1\ninput.1.keyboard.0.button.58=SPC_FLOPPY0\ninput.1.mouse.0.axis.0=MOUSE1_HORIZ.0\ninput.1.joystick.0.button.0=JOY1_FIRE_BUTTON.0\ninput.1.joystick.1.button.0=JOY1_FIRE_BUTTON.0\n' > "$work/headerless-input.uae"
+"$bin" --dump-config -f "$work/headerless-input.uae" > "$work/headerless-input.txt" 2> "$work/headerless-input_err.txt" \
+	|| { echo "headerless input mapping lines crashed config parsing" >&2; exit 1; }
+if grep -q '^input\.1\.' "$work/headerless-input_err.txt"; then
+	echo "headerless input mapping lines were not consumed by the input parser:" >&2
+	grep '^input\.1\.' "$work/headerless-input_err.txt" >&2
+	exit 1
+fi
+
+# Defaults-only dump: header present, exits cleanly.
+"$bin" --dump-config > "$work/def.txt" 2> "$work/def_err.txt"
+check "$work/def.txt" '^; --dump-config: resolved configuration'
+check "$work/def.txt" '^; configuration file: (built-in defaults)$'
+
+# The target option is parsed from a config and from -s, then the same
+# serialization path a saved .uae uses retains its explicit false value.
+printf 'amiberry.multithreaded_denise=false\n' > "$work/multithreaded-denise.uae"
+"$bin" --dump-config -f "$work/multithreaded-denise.uae" > "$work/multithreaded-denise.txt" 2>/dev/null
+check "$work/multithreaded-denise.txt" '^amiberry.multithreaded_denise=false$'
+"$bin" --dump-config -s amiberry.multithreaded_denise=false > "$work/multithreaded-denise-cli.txt" 2>/dev/null
+check "$work/multithreaded-denise-cli.txt" '^amiberry.multithreaded_denise=false$'
+
+# PearPC was removed: a configuration that chose it resolves to the
+# automatic PPC implementation, and QEMU still round-trips. The option is
+# written only while PPC is on, and only by builds with PPC support: the
+# QEMU round trip tells whether this build has it.
+ppc='cpu_type=68060\nppc_model=automatic\n'
+printf "${ppc}ppc_implementation=qemu\n" > "$work/qemu.uae"
+"$bin" --dump-config -f "$work/qemu.uae" > "$work/qemu.txt" 2>/dev/null
+if grep -q '^ppc_implementation=' "$work/qemu.txt"; then
+	check "$work/qemu.txt" '^ppc_implementation=qemu$'
+	printf "${ppc}ppc_implementation=pearpc\n" > "$work/pearpc.uae"
+	"$bin" --dump-config -f "$work/pearpc.uae" > "$work/pearpc.txt" 2> "$work/pearpc_err.txt"
+	check "$work/pearpc.txt" '^ppc_implementation=auto$'
+	if grep -q 'Unknown value' "$work/pearpc_err.txt"; then
+		echo "ppc_implementation=pearpc was reported as an unknown value" >&2
+		exit 1
+	fi
+
+	# A PPC board always runs the PPC: without ppc_model, or with an empty one
+	# (Disabled), the PPC is set to manual, saved so, and reported.
+	printf 'cpu_type=68060\ncpuboard_type=CyberStormPPC\n' > "$work/ppc-board.uae"
+	"$bin" --dump-config -f "$work/ppc-board.uae" > "$work/ppc-board.txt" 2> "$work/ppc-board_err.txt"
+	check "$work/ppc-board.txt" '^ppc_model=manual$'
+	check "$work/ppc-board_err.txt" 'cannot be disabled while a PPC accelerator board is selected'
+	printf 'cpu_type=68060\ncpuboard_type=CyberStormPPC\nppc_model=\n' > "$work/ppc-board-off.uae"
+	"$bin" --dump-config -f "$work/ppc-board-off.uae" > "$work/ppc-board-off.txt" 2> "$work/ppc-board-off_err.txt"
+	check "$work/ppc-board-off.txt" '^ppc_model=manual$'
+	check "$work/ppc-board-off_err.txt" 'cannot be disabled while a PPC accelerator board is selected'
+fi
+
+# Deterministic: two runs of the same config are byte-identical, so dumps
+# from two machines can be compared with diff.
+"$bin" --dump-config -f "$work/probe.uae" > "$work/out2.txt" 2>/dev/null
+
+# No side effects: the early exit must not create any directory tree.
+dir_count="$(find "$work" -type d | wc -l | tr -d ' ')"
+[ "$dir_count" -eq 1 ] || { echo "dump-config created directories under \$HOME" >&2; exit 1; }
+
+# Vsync + soundcard probe: target_fixup_options reads the enumerated sound
+# device list under gfx_vsyncmode, and a non-default soundcard index must
+# survive resolution when devices are enumerated. Must not crash either way.
+printf 'gfx_fullscreen=fullscreen\ngfx_vsync=true\ngfx_vsyncmode=busywait\nsoundcard=1\n' > "$work/vsync.uae"
+"$bin" --dump-config -f "$work/vsync.uae" > "$work/vsync.txt" 2>/dev/null
+[ -s "$work/vsync.txt" ] || { echo "vsync probe produced no output" >&2; exit 1; }
+
+# WHDLoad autoload must resolve without touching the host: resolving an .lha
+# through whdload_auto_prefs must not build the booter temp tree or save-data
+# links in dump mode.
+printf 'not-really-an-archive' > "$work/game.lha"
+"$bin" --dump-config --autoload "$work/game.lha" > "$work/lha.txt" 2>/dev/null
+[ -s "$work/lha.txt" ] || { echo "lha autoload dump produced no output" >&2; exit 1; }
+dir_count="$(find "$work" -type d | wc -l | tr -d ' ')"
+[ "$dir_count" -eq 1 ] || { echo "dump-config created directories during WHDLoad autoload" >&2; exit 1; }
+
+# WHDBooter boots .lzh and .lzx archives the same way: the archive becomes
+# the game drive. --autoload must accept them rather than fail as unknown.
+for ext in lzh lzx; do
+	printf 'not-really-an-archive' > "$work/game.$ext"
+	"$bin" --dump-config --autoload "$work/game.$ext" > "$work/$ext.txt" 2>/dev/null \
+		|| { echo "$ext autoload dump failed" >&2; exit 1; }
+	check "$work/$ext.txt" "^filesystem2=rw,DH1:Games:.*game\\.$ext,0\$"
+done
+
+# A hardfile's filesystem name that needs quotes (here for its comma) is
+# written with minimal escaping and must be read back the same way: a
+# backslash in it stays, as it does in a Windows path, and a quote in it
+# is written as \". Only the name's own part is compared: a Windows build
+# writes the temporary directory in its native form.
+printf 'hardfile2=rw,DH1:%s/disk.hdf,32,1,2,512,0,"%s/fs,dir\\l\\Fast\\"FS",uae0\n' "$work" "$work" > "$work/hdf-filesys.uae"
+"$bin" --dump-config -f "$work/hdf-filesys.uae" > "$work/hdf-filesys.txt" 2>/dev/null
+grep '^hardfile2=' "$work/hdf-filesys.txt" | grep -qF 'fs,dir\l\Fast\"FS",uae0' || {
+	echo "hardfile2 filesystem name did not survive loading:" >&2
+	grep '^hardfile2=' "$work/hdf-filesys.txt" >&2
+	exit 1
+}
+
+# WHDBooter assigns the joystick ports; -s options after --autoload replace
+# its choice (front ends pass the user's port choices this way).
+check "$work/lha.txt" '^joyport0=mouse$'
+"$bin" --dump-config --autoload "$work/game.lha" -s joyport0=kbd2 -s joyport1=kbd3 > "$work/lha-ports.txt" 2>/dev/null
+check "$work/lha-ports.txt" '^joyport0=kbd2$'
+check "$work/lha-ports.txt" '^joyport1=kbd3$'
+
+# A CD32 title gets CD32 pads from WHDBooter; a port device chosen after
+# --autoload replaces the device but keeps the pad mode.
+printf 'not-really-an-archive' > "$work/game_CD32.lha"
+"$bin" --dump-config --autoload "$work/game_CD32.lha" -s joyport1=kbd3 > "$work/cd32-ports.txt" 2>/dev/null
+check "$work/cd32-ports.txt" '^joyport1=kbd3$'
+check "$work/cd32-ports.txt" '^joyport1mode=cd32joy$'
+
+# A config file that fails to load must fail the dump: exit non-zero, no
+# stdout, and a stderr explanation -- never a defaults dump masquerading as
+# the requested configuration.
+if "$bin" --dump-config -f "$work/missing.uae" > "$work/fail.txt" 2> "$work/fail_err.txt"; then
+	echo "dump of a missing config must exit non-zero" >&2
+	exit 1
+fi
+[ -s "$work/fail.txt" ] && { echo "failed dump must not write stdout" >&2; exit 1; }
+check "$work/fail_err.txt" 'failed to load'
+
+# The positional form of a missing configuration must fail the same way.
+if "$bin" --dump-config "$work/missing-positional.uae" > "$work/pfail.txt" 2>/dev/null; then
+	echo "dump of a missing positional config must exit non-zero" >&2
+	exit 1
+fi
+[ -s "$work/pfail.txt" ] && { echo "failed positional dump must not write stdout" >&2; exit 1; }
+
+# --log must not corrupt the dump: console logging writes to stdout, so it is
+# disabled in dump mode; the first stdout line stays the dump header.
+"$bin" --dump-config --log -f "$work/probe.uae" > "$work/log.txt" 2>/dev/null
+head -n 1 "$work/log.txt" | grep -q '^; --dump-config: resolved configuration' \
+	|| { echo "--log corrupted the dump stream" >&2; exit 1; }
+
+# A corrupt positional RP9 must fail the dump the same way (rp9_parse_file
+# rejects a non-ZIP payload, so target_cfgfile_load fails).
+printf 'not-a-zip' > "$work/bad.rp9"
+if "$bin" --dump-config "$work/bad.rp9" > "$work/rp9fail.txt" 2>/dev/null; then
+	echo "dump of a corrupt positional RP9 must exit non-zero" >&2
+	exit 1
+fi
+[ -s "$work/rp9fail.txt" ] && { echo "failed RP9 dump must not write stdout" >&2; exit 1; }
+
+# An --autoload media type that cannot provide preferences must fail the
+# dump rather than label defaults with its name.
+printf 'x' > "$work/media.adf"
+if "$bin" --dump-config --autoload "$work/media.adf" > "$work/afail.txt" 2>/dev/null; then
+	echo "dump with unsupported --autoload media must exit non-zero" >&2
+	exit 1
+fi
+[ -s "$work/afail.txt" ] && { echo "unsupported autoload dump must not write stdout" >&2; exit 1; }
+
+# A trailing option without its operand must fail the dump instead of
+# producing what looks like a valid defaults dump.
+if "$bin" --dump-config -f > "$work/operand.txt" 2> "$work/operand_err.txt"; then
+	echo "dump with a missing option operand must exit non-zero" >&2
+	exit 1
+fi
+[ -s "$work/operand.txt" ] && { echo "missing-operand dump must not write stdout" >&2; exit 1; }
+check "$work/operand_err.txt" 'incomplete command line'
+
+# A 68030 from the WHDLoad database must reach the emulated CPU, with 32-bit
+# addressing. cpu_type has no 68030 value, so WHDBooter used to drop it and
+# run AGA games on a 68020. Runs last: it creates the WHDBoot tree that the
+# side-effect checks above must not see. Portable mode ignores the environment
+# and keeps WHDBoot in the install tree, so the database cannot be isolated
+# there; the check is skipped rather than write into the install.
+host_path()
+{
+	if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+export AMIBERRY_HOME_DIR="$(host_path "$work/whd-home")" XDG_DATA_HOME="$work/whd-xdg"
+export LOCALAPPDATA="$(host_path "$work/whd-local-app-data")" APPDATA="$(host_path "$work/whd-app-data")"
+unset AMIBERRY_CONFIG_DIR XDG_CONFIG_HOME
+"$bin" --dump-paths | tr -d '\r' > "$work/whd-paths.txt"
+if grep -q '^portable_mode=1$' "$work/whd-paths.txt"; then
+	echo "68030 WHDLoad database check skipped: binary runs in portable mode"
+else
+	whdboot="$(host_path "$(sed -n 's/^whdboot_path=//p' "$work/whd-paths.txt")")"
+	case "$whdboot" in
+		"$(host_path "$work")"/*) ;;
+		*) echo "WHDBoot path escaped the scratch directory: $whdboot" >&2; exit 1 ;;
+	esac
+	mkdir -p "$whdboot/game-data"
+	printf '%s\n' '{"schema_version":2,"games":[{"filename":"Cpu030_v1.0_AGA","name":"Cpu030","subpath":"Cpu030",' \
+		'"slave_count":1,"slave_default":"Cpu030.slave","slave_libraries":false,' \
+		'"slaves":[{"filename":"Cpu030.slave","datapath":""}],"hardware":{"chipset":"aga","cpu":"68030"}}]}' \
+		> "$whdboot/game-data/whdload_db.json"
+	printf 'not-really-an-archive' > "$work/Cpu030_v1.0_AGA.lha"
+	"$bin" --dump-config --autoload "$work/Cpu030_v1.0_AGA.lha" > "$work/cpu030.txt" 2>/dev/null
+	check "$work/cpu030.txt" '^cpu_model=68030$'
+	check "$work/cpu030.txt" '^cpu_24bit_addressing=false$'
+fi
+
+echo "dump-config behavioral test passed"

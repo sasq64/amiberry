@@ -4,11 +4,15 @@
 #include "amiberry_gfx.h"
 #include "imgui_panels.h"
 #include "gui/gui_handling.h"
-#include "fsdb_host.h"
 #include "amiberry_update.h"
+#include "amiberry_update_asset_policy.h"
 #include "target.h"
-#include <SDL3_image/SDL_image.h>
+#ifdef USE_OPENGL
+#include "opengl_renderer.h"
+#include "gl_platform.h"
+#endif
 #include "gui/amiberry_logo_png_data.h"
+#include <SDL3_image/SDL_image.h>
 
 #include <string>
 #include <thread>
@@ -215,8 +219,16 @@ static void render_update_section()
 				else if (get_update_method() == UpdateMethod::NOTIFY_ONLY)
 				{
 					ImGui::SameLine();
-					if (AmigaButton("Open Download Page", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT)))
-						SDL_OpenURL(s_cached_update_info.release_url.c_str());
+					if (AmigaButton("Open Download", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT)))
+					{
+#if defined(__linux__)
+						const auto& url = select_linux_notification_url(s_cached_update_info.release_url,
+							s_cached_update_info.download_url, get_linux_installation_kind());
+#else
+						const auto& url = s_cached_update_info.release_url;
+#endif
+						SDL_OpenURL(url.c_str());
+					}
 				}
 			}
 		}
@@ -309,21 +321,59 @@ void render_panel_about()
 	ImGui::Spacing();
 
 	ImGui::Indent(10.0f);
-
 	ImGui::TextUnformatted(get_version_string().c_str());
 	ImGui::TextUnformatted(get_copyright_notice().c_str());
 	ImGui::TextUnformatted(get_sdl_version_string().c_str());
 	ImGui::Text("SDL video driver: %s", sdl_video_driver ? sdl_video_driver : "unknown");
 
+#ifdef USE_OPENGL
+	if (const auto* gl_renderer = get_opengl_renderer(); gl_renderer && gl_renderer->has_context()) {
+		const GLRuntimeInfo& info = gl_renderer->get_gl_runtime_info();
+		if (info.valid) {
+			const GlCapabilities& caps = get_gl_capabilities();
+			ImGui::Text("Graphics backend: %s %d.%d", caps.is_gles ? "OpenGL ES" : "OpenGL",
+				caps.major, caps.minor);
+			ImGui::Text("GPU: %s", info.renderer.c_str());
+			ImGui::Text("GL vendor: %s", info.vendor.c_str());
+			ImGui::Text("GLSL version: %s", info.glsl_version.c_str());
+			ImGui::Text("GL capabilities: border-clamp %s, sRGB write %s, float FBO %s",
+				caps.clamp_to_border ? "yes" : "no",
+				caps.framebuffer_srgb ? "yes" : "no",
+				caps.rgba16f_renderable ? "yes" : "no");
+		} else {
+			ImGui::TextUnformatted("Graphics backend: OpenGL (driver info unavailable)");
+		}
+	} else if (gl_renderer_demoted) {
+		ImGui::TextUnformatted("Graphics backend: SDL software renderer (GL unavailable - demoted)");
+	} else {
+		// USE_OPENGL build with no live GL context: either the GUI opened
+		// before emulation started (g_renderer not created yet) or the
+		// context is torn down between runs.
+		ImGui::TextUnformatted("Graphics backend: OpenGL (context not initialized)");
+	}
+#elif defined(USE_VULKAN)
+	ImGui::TextUnformatted("Graphics backend: Vulkan (experimental)");
+#else
+	ImGui::TextUnformatted("Graphics backend: SDL software renderer");
+#endif
+
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::Spacing();
 
-	render_update_section();
+#ifdef __ANDROID__
+	// The app store updates the Android app.
+	constexpr bool show_update_section = false;
+#else
+	constexpr bool show_update_section = true;
+#endif
+	if (show_update_section) {
+		render_update_section();
 
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::Spacing();
+		ImGui::Spacing();
+		ImGui::Separator();
+		ImGui::Spacing();
+	}
 
 	static auto about_long_text =
 		"This program is free software: you can redistribute it and/or modify\n"

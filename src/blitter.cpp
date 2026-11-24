@@ -980,12 +980,14 @@ static void actually_do_blit(void)
 
 static void blitter_doit(void)
 {
+	blt_info.blit_stuck = 0;
 	if (blt_info.vblitsize == 0) {
 		blitter_done_all(true);
 		return;
 	}
 	actually_do_blit();
 	blitter_done_all(true);
+	unset_special(SPCFLAG_BLTNASTY);
 }
 
 static int makebliteventtime(int delay)
@@ -998,25 +1000,31 @@ static int makebliteventtime(int delay)
 	return delay;
 }
 
+void blitter_hsync(void)
+{
+	/* "free" blitter in immediate mode if it has been "stuck"
+	 *  ~3 frames fixes some JIT game incompatibilities.
+	 */
+	if (blt_info.blit_stuck > 0) {
+		blt_info.blit_stuck--;
+		if (!blt_info.blit_stuck) {
+#ifdef DEBUGGER
+			debugtest(DEBUGTEST_BLITTER, _T("force-unstuck!\n"));
+#endif
+			blitter_doit();
+		}
+	}
+}
+
+// blitter_handler is not used in CE mode.
 static void blitter_handler(uae_u32 data)
 {
-	static int blitter_stuck;
-
-	if (!dmaen (DMA_BLITTER)) {
-		event2_newevent_x(-1, 10, 0, blitter_handler);
-		blitter_stuck++;
-		if (blitter_stuck < 20000 || !immediate_blits)
-			return; /* gotta come back later. */
-		/* "free" blitter in immediate mode if it has been "stuck" ~3 frames
-		* fixes some JIT game incompatibilities
-		*/
-#ifdef DEBUGGER
-		debugtest (DEBUGTEST_BLITTER, _T("force-unstuck!\n"));
-#endif
+	if (!dmaen(DMA_BLITTER)) {
+		blt_info.blit_stuck = immediate_blits ? 1000 : -1;
+		return;
 	}
-	blitter_stuck = 0;
 	if (blit_slowdown > 0 && !immediate_blits) {
-		event2_newevent_x(-1, makebliteventtime(blit_slowdown), 0, blitter_handler);
+		event2_newevent_xx(-1, makebliteventtime(blit_slowdown) * CYCLE_UNIT, 0, blitter_handler);
 		blit_slowdown = -1;
 		return;
 	}
@@ -1634,10 +1642,9 @@ void process_blitter(struct rgabuf *rga)
 
 			// copper conflict: after blitter dma transfer,
 			// copy new copper pointer to conflicting blitter address pointer.
-			if (rga->conflict) {
-				rga->p = rga->conflict;
-				*rga->p = rga->conflictaddr;
-				rga->pv = rga->conflictaddr;
+			if (rga->conflict && rga->conflict2) {
+				uaecptr addr = copper_blitter_conflict(rga);
+				*rga->conflict2 = addr;
 			}
 		} else {
 			markidlecycle();
@@ -1675,10 +1682,9 @@ void process_blitter(struct rgabuf *rga)
 
 		// copper conflict: after blitter dma transfer,
 		// copy new copper pointer to conflicting blitter address pointer OR used modulo (if any)
-		if (rga->conflict) {
-			rga->p = rga->conflict;
-			*rga->p = rga->conflictaddr | rga->bltmod;
-			rga->pv = rga->conflictaddr | rga->bltmod;
+		if (rga->conflict && rga->conflict2) {
+			uaecptr addr = copper_blitter_conflict(rga);
+			*rga->conflict2 = addr;
 		}
 
 	}
@@ -2055,6 +2061,7 @@ void do_blitter(int copper, uaecptr pc)
 	blt_info.blit_pending = 1;
 	blt_info.blit_count_done = 0;
 	blt_info.blit_queued = 0;
+	blt_info.blit_stuck = 0;
 
 	blitter_start_init();
 
@@ -2095,7 +2102,10 @@ void do_blitter(int copper, uaecptr pc)
 	blit_slowdown = 0;
 
 	unset_special (SPCFLAG_BLTNASTY);
-	if (dmaen(DMA_BLITPRI)) {
+	// Only do_specialties() waits for a nasty blit. The main thread holds the
+	// CPU thread instead (service_cpu_indirect_request()): the flag would end
+	// every JIT block for the length of the blit.
+	if (dmaen(DMA_BLITPRI) && !cpu_threaded_run) {
 		set_special(SPCFLAG_BLTNASTY);
 	}
 
@@ -2151,7 +2161,37 @@ void do_blitter(int copper, uaecptr pc)
 	}
 	
 	blit_cyclecounter = cycles * blit_cyclecount;
-	event2_newevent_x(-1, makebliteventtime(blit_cyclecounter), 0, blitter_handler);
+	event2_newevent_xx(-1, makebliteventtime(blit_cyclecounter) * CYCLE_UNIT, 0, blitter_handler);
+}
+
+/* After a CPU write to a custom register (custom_wput()): BLTPRI
+ * (blitter-nasty) holds the CPU off the chip bus until the blit ends, and
+ * loaders rely on it: they read the blit's output right after starting it,
+ * without testing BBUSY (Jim Power's disk loader). The interpreter waits in
+ * do_specialties() (SPCFLAG_BLTNASTY) before its next instruction, but the
+ * JIT reaches do_specialties() only at the end of the compiled block, so the
+ * instructions after the write in the same block ran on, and read the old
+ * destination. With the JIT the chipset now runs on until the blit has ended,
+ * in the write that started it or set BLTPRI, as waitingblits() does. */
+void blitter_cpu_write_nasty(void)
+{
+	static bool waiting;
+	if (!currprefs.cachesize || cpu_threaded_run || waiting || blitter_cycle_exact)
+		return;
+	if (!blt_info.blit_main || !dmaen(DMA_BLITTER) || !dmaen(DMA_BLITPRI))
+		return;
+	waiting = true;
+	int lines = 0, vpos_prev = vpos;
+	while (blt_info.blit_main && dmaen(DMA_BLITTER) && dmaen(DMA_BLITPRI)) {
+		x_do_cycles(4 * CYCLE_UNIT);
+		if (vpos_prev != vpos) {
+			vpos_prev = vpos;
+			// as waitingblits(): never hold the CPU forever
+			if (++lines > maxvpos * 5)
+				break;
+		}
+	}
+	waiting = false;
 }
 
 void blitter_check_start (void)
@@ -2163,6 +2203,9 @@ void blitter_check_start (void)
 		if (immediate_blits) {
 			blitter_doit();
 		}
+	}
+	if (blt_info.blit_stuck) {
+		blitter_doit();
 	}
 }
 
@@ -2311,6 +2354,7 @@ void blitter_reset(void)
 	blt_info.blit_pending = 0;
 	blt_info.blit_queued = 0;
 	blt_info.blit_count_done = 0;
+	blt_info.blit_stuck = 0;
 #if BLIT_TRACE == 1
 	bdp = blit_tracer;
 #endif

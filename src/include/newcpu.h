@@ -15,9 +15,27 @@
 #include "events.h"
 #include "thread.h"
 
-#ifdef WITH_SOFTFLOAT
+bool cpu_thread_pause();
+void cpu_thread_resume();
+bool cpu_thread_is_waiting_on_main();
+void cpu_thread_check_selection();
+void cpu_thread_charge_access(int cycles);
+// Counting banks (memory.cpp) while a request flood holds the CPU on the main
+// thread: the accesses that would have been requests to the main thread.
+extern uae_u32 cpu_thread_flood_requests;
+struct addrbank;
+void cpu_thread_count_read(const struct addrbank *ab, uaecptr addr, int size);
+
+class cpu_thread_guard {
+	bool held;
+public:
+	explicit cpu_thread_guard(bool acquire = true) : held(acquire && cpu_thread_pause()) {}
+	~cpu_thread_guard() { if (held) cpu_thread_resume(); }
+	cpu_thread_guard(const cpu_thread_guard&) = delete;
+	cpu_thread_guard& operator=(const cpu_thread_guard&) = delete;
+};
+
 #include <softfloat/softfloat.h>
-#endif
 
 #ifndef SET_CFLG
 
@@ -110,11 +128,9 @@ typedef uae_u8 flagtype;
 
 #ifdef FPUEMU
 
-#ifdef USE_LONG_DOUBLE
-typedef long double fptype;
-#else
+// The host core uses doubles: it is the fast one, and the exact (softfloat)
+// core gives the full 80-bit format.
 typedef double fptype;
-#endif
 #endif
 
 #define MAX68020CYCLES 4
@@ -161,27 +177,10 @@ struct mmufixup
 };
 extern struct mmufixup mmufixup[2];
 
-#ifdef MSVC_LONG_DOUBLE
-typedef struct {
-	uae_u64 m;
-	uae_u16 e;
-	uae_u16 dummy;
-} fprawtype;
-#endif
-
 typedef struct
 {
-#ifdef WITH_SOFTFLOAT
 	floatx80 fpx;
-#endif
-#ifdef MSVC_LONG_DOUBLE
-	union {
-		fptype fp;
-		fprawtype rfp;
-	};
-#else
 	fptype fp;
-#endif
 } fpdata;
 
 #ifdef CPU_AARCH64
@@ -204,8 +203,13 @@ struct regstruct
 	uae_u32 trace_pc;
 
 	uae_u16 irc, ir, ird;
-	volatile uae_atomic spcflags;
-	uae_u32 last_prefetch;
+	// A cache line of its own: with the threaded CPU the main thread reads
+	// and sets it all the time, and sharing a line with fields the CPU writes
+	// per instruction (opcode, instruction_pc) cost the threaded
+	// interpreter ~8 % host time; which fields shared it depended on where
+	// the linker happened to place regs.
+	alignas(64) volatile uae_atomic spcflags;
+	alignas(64) uae_u32 last_prefetch;
 	uae_u32 chipset_latch_rw;
 	uae_u32 chipset_latch_read;
 	uae_u32 chipset_latch_write;
@@ -297,6 +301,17 @@ struct regstruct
 	uae_u32* raw_cputbl_count;
 	uintptr mem_banks;
 	uintptr cache_tags;
+	// (last, so that the fields above keep their offsets)
+	// host FPSR exception bits (IOC..IXC) compiled host FPU code raised since
+	// they were last merged into the FPSR, collected whenever compiled code
+	// calls or returns to C code (whose flags must not count)
+	uae_u32 fpu_jit_host_fpsr;
+	// bit 0 (live): the host FPSR holds uncollected exceptions of compiled
+	// host FPU code; set when a block with host FPU code is entered, cleared
+	// when they are collected before C code runs. Bits 1-2: the FPU JIT mode
+	// of regs.fpcr (fpu_jit_fpcr_mode()), kept by fpu_jit_fpcr_changed(), so
+	// that one compare checks both at block entry.
+	uae_u32 fpu_jit_host_state;
 #endif
 #endif
 };
@@ -372,6 +387,7 @@ extern void safe_interrupt_set(int, int, bool);
 #define SPCFLAG_CHECK		0x008000
 #define SPCFLAG_MMURESTART	0x010000
 #define SPCFLAG_CALLBACK	0x020000
+#define SPCFLAG_CPU_THREAD_SYNC	0x040000 /* threaded CPU: park or debugger request pending */
 
 STATIC_INLINE void set_special_exter(uae_u32 x)
 {
@@ -386,6 +402,16 @@ STATIC_INLINE void set_special (uae_u32 x)
 STATIC_INLINE void unset_special (uae_u32 x)
 {
 	atomic_and(&regs.spcflags, ~x);
+}
+
+// Only for flags that just the CPU itself sets (SPCFLAG_TRACE/DOTRACE): skip
+// the locked RMW when no bit is set. With the threaded CPU the main thread
+// keeps the spcflags line shared, so an unneeded locked RMW on every
+// exception costs a cross-core line transfer.
+STATIC_INLINE void unset_special_cpu (uae_u32 x)
+{
+	if (regs.spcflags & x)
+		atomic_and(&regs.spcflags, ~x);
 }
 
 #define m68k_dreg(r,num) ((r).regs[(num)])
@@ -729,7 +755,7 @@ extern void REGPARAM3 put_bitfield (uae_u32 dst, uae_u32 bdata[2], uae_u32 val, 
 extern void m68k_disasm_ea (uaecptr addr, uaecptr *nextpc, int cnt, uae_u32 *seaddr, uae_u32 *deaddr, uaecptr lastpc);
 extern void m68k_disasm (uaecptr addr, uaecptr *nextpc, uaecptr lastpc, int cnt);
 extern uae_u32 m68k_disasm_2(TCHAR *buf, int bufsize, uaecptr pc, uae_u16 *bufpc, int bufpccount, uaecptr *nextpc, int cnt, uae_u32 *seaddr, uae_u32 *deaddr, uaecptr lastpc, int safemode);
-extern void sm68k_disasm (TCHAR*, TCHAR*, uaecptr addr, uaecptr *nextpc, uaecptr lastpc);
+extern void sm68k_disasm (TCHAR*, TCHAR*, int, uaecptr addr, uaecptr *nextpc, uaecptr lastpc);
 extern int m68k_asm(TCHAR *buf, uae_u16 *out, uaecptr pc);
 extern uaecptr ShowEA(void *f, uaecptr pc, uae_u16 opcode, int reg, amodes mode, wordsizes size, TCHAR *buf, uae_u32 *eaddr, int *actualea, int safemode);
 extern int get_cpu_model (void);
@@ -763,6 +789,13 @@ extern int m68k_mull (uae_u32, uae_u32, uae_u16);
 extern void init_m68k (void);
 extern void m68k_run(void);
 extern void m68k_go (int);
+#ifdef LIBRETRO
+/* True while m68k_go() executes the CPU (m68k_run() or its halt loop): the
+ * only code that unwinds on SPCFLAG_BRK to the reset/restore handling at the
+ * top of the m68k_go() loop. False during that handling, which can present
+ * frames (and so yield to the libretro frontend) mid-reset. */
+extern bool m68k_cpu_loop_active;
+#endif
 extern void m68k_dumpstate(uaecptr *, uaecptr);
 extern void m68k_dumpcache(bool);
 extern int getMulu68kCycles(uae_u16 src);
@@ -798,6 +831,49 @@ extern void mmu_op (uae_u32, uae_u32);
 extern bool mmu_op30 (uaecptr, uae_u32, uae_u16, uaecptr);
 
 extern void fpuop_arithmetic(uae_u32, uae_u16);
+// The JIT compiles FPU instructions (compfpu) and the FPU core keeps host
+// doubles for it; false while the exact FPU core is active.
+extern bool jit_fpu_enabled(void);
+// The FPU registers are softfloat extended values (fpx), not host doubles
+extern bool fpu_softfloat_core(void);
+// The settings select the exact FPU core. Known before the FPU reset picks
+// the core, so the JIT's opcode table (build_comp) can depend on it.
+extern bool fpu_exact_wanted(void);
+extern const TCHAR *fpu_core_name(void);
+extern void REGPARAM3 fpuop_arithmetic_jit(uae_u32 instruction, uaecptr ea);
+// compiled FPU arithmetic for a JIT without native FPU code (fpp.cpp)
+extern bool jit_fpu_arith_ok(uae_u16 opcode, uae_u16 extra);
+extern uae_u32 REGPARAM3 fpp_jit_arith(uae_u32 opext, uae_u64 value, uae_u8 *pc_p, uae_u32 pc);
+extern uae_u32 REGPARAM3 fpp_jit_arith_slow(uae_u32 opcode, uae_u8 *pc_p, uae_u32 pc);
+// its specialised versions for the common instructions, or nullptr (fpp_softfloat.cpp)
+extern void *fp_jit_fast_helper(uae_u16 opcode, uae_u16 extra);
+extern bool jit_fpu_generic_ok(uae_u16 opcode, uae_u16 extra);
+extern uae_u32 REGPARAM3 fpp_jit_generic(uae_u32 opext, uae_u64 ea, uae_u8 *next_p, uae_u64 lenpc);
+extern void *fp_jit_out_helper(uae_u16 opcode, uae_u16 extra);
+extern void REGPARAM3 fpp_jit_interp_leave(uae_u32 opcode, uae_u8 *pc_p, uae_u32 pc);
+extern uae_u32 fp_jit_inline_kind(uae_u16 opcode, uae_u16 extra);
+extern uae_u32 fp_jit_inexact_status(void);
+extern bool fp_jit_inline_verify(void);
+extern uae_u64 REGPARAM3 fp_jit_verify_save(uae_u64 value);
+extern void REGPARAM3 fp_jit_verify_check(uae_u32 opext, uae_u64 value, uae_u8 *pc_p, uae_u32 pc, void *fn);
+extern uae_u32 fp_jit_out_inline_kind(uae_u16 opcode, uae_u16 extra);
+#define FPJ_STATS_KEYS (1 << 16)
+enum { FPJ_ST_INLINE, FPJ_ST_INLINE_FAIL, FPJ_ST_HELPER, FPJ_ST_INTERP };
+extern uae_u64 *fp_jit_stats(void);
+extern uae_u64 *fp_jit_stats_table;
+extern uae_u32 fp_jit_stats_key(uae_u16 opcode, uae_u16 extra);
+extern void fp_jit_stats_count(uae_u16 opcode, uae_u16 extra, int path);
+struct fpj_fmovem {
+	int n, reg[8], off[8], final;
+	bool to_mem, reversed;
+};
+extern bool fp_jit_fmovem_plan(uae_u16 opcode, uae_u16 extra, struct fpj_fmovem *p);
+extern bool fp_jit_fmovecr(uae_u16 extra, uae_u16 *hi, uae_u64 *lo, uae_u32 *ccexc, uae_u32 *accr);
+#if defined(JIT) && (defined(CPU_x86_64) || defined(CPU_AARCH64))
+extern bool fp_jit_fmovecr_host(uae_u16 extra, double *val, uae_u32 *accr);
+#endif
+extern uae_u64 REGPARAM3 fp_jit_verify_out_save(uae_u64 ea, uae_u32 opext);
+extern void REGPARAM3 fp_jit_verify_out_check(uae_u32 opext, uae_u64 ea, uae_u8 *next_p, uae_u64 lenpc, void *fn);
 extern void fpuop_dbcc(uae_u32, uae_u16);
 extern void fpuop_scc(uae_u32, uae_u16);
 extern void fpuop_trapcc(uae_u32, uaecptr, uae_u16);
@@ -807,6 +883,40 @@ extern void fpuop_restore(uae_u32);
 extern uae_u32 fpp_get_fpsr (void);
 extern bool fpu_get_constant(fpdata *fp, int cr);
 extern int fpp_cond(int condition);
+extern uae_u32 fpp_get_cond_mask(int condition);
+extern bool fpu_fpsr_cc_written;
+#if defined(JIT) && (defined(CPU_x86_64) || defined(CPU_AARCH64))
+// FPCR bits the JITs' inline host FPU code cannot follow: the exception
+// enables; on x86-64 also the rounding mode where the x87 control word does not
+// follow the FPCR.
+#if defined(CPU_x86_64) && (defined(__MACH__) || defined(__ANDROID__))
+#define FPU_JIT_ROUNDING_MASK 0x0030
+#else
+#define FPU_JIT_ROUNDING_MASK 0
+#endif
+#define FPU_JIT_EXACT_FPCR_MASK (0xff00 | FPU_JIT_ROUNDING_MASK)
+// The FPU code of a compiled block, chosen by the FPCR the block is compiled
+// for and checked on every entry: inline code; inline code that rounds results
+// to single precision as the host core does; or calls into the FPU core (also
+// for the undefined rounding precision).
+enum { FPU_JIT_MODE_FAST, FPU_JIT_MODE_SINGLE, FPU_JIT_MODE_EXACT };
+static inline int fpu_jit_fpcr_mode(uae_u32 fpcr)
+{
+	if ((fpcr & FPU_JIT_EXACT_FPCR_MASK) || (fpcr & 0xc0) == 0xc0)
+		return FPU_JIT_MODE_EXACT;
+	return (fpcr & 0xc0) == 0x40 ? FPU_JIT_MODE_SINGLE : FPU_JIT_MODE_FAST;
+}
+// a block entered in another mode is recompiled for <mode> (FPU_JIT_MODE_*)
+extern void fpu_jit_log_recompile(uae_u32 pc, int mode, int trips);
+#endif
+#if defined(JIT) && defined(CPU_x86_64)
+// compiled inline x87 code ran since the x87 status was last merged into the FPSR
+extern uae_u8 fpu_jit_x87_dirty;
+// Merge the x87 status of compiled code into the FPSR. Only on the thread that
+// runs the compiled code: the CPU thread does it before it parks or sleeps, so
+// that a pause holder (save_state()) sees all accrued exceptions.
+extern void fpu_jit_x87_thread_sync(void);
+#endif
 
 extern void exception3_read(uae_u32 opcode, uaecptr addr, int size, int fc);
 extern void exception3_write(uae_u32 opcode, uaecptr addr, int size, uae_u32 val, int fc);
@@ -827,6 +937,7 @@ extern void m68k_reset(void);
 extern bool cpureset(void);
 extern void cpu_halt(int id);
 extern void cpu_inreset(void);
+extern void cpu_keyboard_reset(bool hardreset, bool hold);
 extern int cpu_sleep_millis(int ms);
 extern void cpu_change(int newmodel);
 extern void cpu_fallback(int mode);
@@ -886,6 +997,9 @@ extern cpuop_func *cpufunctbl[65536] ASM_SYM_FOR_FUNC("cpufunctbl");
 #ifdef JIT
 extern void (*flush_icache)(int);
 extern void compemu_reset(void);
+// End the running compiled code at its next block end (after a handled fault).
+extern void jit_end_dispatch(void);
+extern void set_cache_state(int enabled);
 #else
 #define flush_icache(int) do {} while (0)
 #define flush_icache_hard(int) do {} while (0)
@@ -926,5 +1040,17 @@ void process_cpu_indirect_memory_write(uae_u32 addr, uae_u32 data, int size);
 
 const struct cputbl *uaegetjitcputbl(void);
 const struct cputbl *getjitcputbl(int cpulvl, int direct);
+
+
+#if defined(DEBUGGER) && defined(GDBSERVER)
+// Read-only fault metadata, captured before exception-frame construction.
+struct cpu_debug_fault {
+	bool memory = false;
+	uae_u32 address = 0, status = 0;
+	int access = 0; // 1 read, 2 write, 3 read-modify-write, 0 unknown
+	int size = 0, function_code = -1;
+};
+extern cpu_debug_fault cpu_get_debug_fault(int vector);
+#endif
 
 #endif /* UAE_NEWCPU_H */

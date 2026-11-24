@@ -1,0 +1,727 @@
+package com.blitterstudio.amiberry.ui.screens.appsettings
+
+import android.os.Build
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.annotation.StringRes
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.VerticalDivider
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusRestorer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.blitterstudio.amiberry.R
+import com.blitterstudio.amiberry.data.AppPreferences
+import com.blitterstudio.amiberry.data.model.SettingsSchema
+import com.blitterstudio.amiberry.ui.components.WhdbootDownloadProgress
+import com.blitterstudio.amiberry.ui.components.whdbootResultString
+import com.blitterstudio.amiberry.ui.components.SidePaneEntry
+import com.blitterstudio.amiberry.ui.components.PickedFolder
+import com.blitterstudio.amiberry.ui.components.rememberImportPicker
+import java.io.File
+import com.blitterstudio.amiberry.ui.components.SidePaneList
+import com.blitterstudio.amiberry.ui.components.settings.CollapsibleSettingsSection
+import com.blitterstudio.amiberry.ui.components.settings.SettingSwitchRow
+import com.blitterstudio.amiberry.ui.components.settings.dpadMenuItemInitialFocus
+import com.blitterstudio.amiberry.ui.components.settings.SettingsSection
+import com.blitterstudio.amiberry.ui.contentEntryFocus
+import com.blitterstudio.amiberry.ui.dpadArrowsMoveFocus
+import com.blitterstudio.amiberry.ui.dpadFieldFocusIndicator
+import com.blitterstudio.amiberry.ui.dpadFocusIndicator
+import com.blitterstudio.amiberry.ui.dpadVerticalMovesFocus
+import com.blitterstudio.amiberry.ui.hasFullStorageAccess
+import com.blitterstudio.amiberry.ui.isTvDevice
+import com.blitterstudio.amiberry.ui.rememberDpadTypingGate
+import com.blitterstudio.amiberry.ui.windowWidthClass
+import com.blitterstudio.amiberry.ui.findActivity
+import com.blitterstudio.amiberry.ui.viewmodel.WhdbootViewModel
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+
+/** The pages, as the Apple apps' settings group them (AppSettingsSections). */
+private val PAGES = AppSettingsSections.pages
+
+/** The page About & Licences is, after the sections' pages. */
+private const val ABOUT_PAGE = "about"
+
+/**
+ * The file settings the emulator reads, so their picker chooses a file;
+ * every other file setting names a file the emulator writes (the log), so
+ * the picker chooses the folder to keep the file's name in.
+ */
+private val FILE_PICKER_SETTINGS = setOf("retroarch_config")
+
+/**
+ * App Settings, under the Library's gear: the emulator's own settings
+ * (amiberry.conf) as the schema's host settings describe them, the
+ * launcher's app-level settings among them, and About & Licences. Changes
+ * apply at once. A phone lists the pages and opens one; a wide window (and
+ * a TV) list them beside the page, and the search covers every host
+ * setting across the pages.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AppSettingsScreen(
+	navController: NavController,
+	viewModel: AppSettingsViewModel = viewModel()
+) {
+	val context = LocalContext.current
+	val whdbootViewModel: WhdbootViewModel = viewModel(context.findActivity() as ComponentActivity)
+	val snackbarHostState = remember { SnackbarHostState() }
+	val scope = rememberCoroutineScope()
+	val wide = windowWidthClass().showsSideList
+	var selectedPage by rememberSaveable { mutableStateOf(PAGES.first().id) }
+	// On a phone, whether a page is open over the list of pages; Back returns to the list.
+	var pageOpen by rememberSaveable { mutableStateOf(false) }
+	var searchOpen by rememberSaveable { mutableStateOf(false) }
+	var query by rememberSaveable { mutableStateOf("") }
+	val searching = query.isNotBlank()
+
+	// The values as the emulator's own Advanced settings window may have left them: the
+	// file is read again on entry (once per viewModel, not per recomposition — a search
+	// keystroke must not scan the shader and bezel folders) and every time the launcher
+	// comes back to the front.
+	LaunchedEffect(viewModel, whdbootViewModel) {
+		viewModel.reload()
+		whdbootViewModel.reload()
+	}
+	val lifecycleOwner = LocalLifecycleOwner.current
+	DisposableEffect(lifecycleOwner) {
+		val observer = LifecycleEventObserver { _, event ->
+			if (event == Lifecycle.Event.ON_RESUME) {
+				viewModel.reload()
+				whdbootViewModel.reload()
+			}
+		}
+		lifecycleOwner.lifecycle.addObserver(observer)
+		onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+	}
+
+	viewModel.notice?.let { notice ->
+		LaunchedEffect(notice) {
+			snackbarHostState.showSnackbar(context.getString(notice))
+			viewModel.clearNotice()
+		}
+	}
+	// The folder settings pick real paths from the device's storage (the
+	// emulator opens files by path; there is no SAF bridge), so the in-app
+	// browser is the picker: its folders are real paths, and the document
+	// tree is never offered.
+	var choosingFolder by rememberSaveable { mutableStateOf<String?>(null) }
+	val folderPicker = rememberImportPicker(
+		mimeTypes = arrayOf("*/*"),
+		extensions = emptySet(),
+		onFolder = { picked ->
+			val id = choosingFolder
+			choosingFolder = null
+			val dir = (picked as? PickedFolder.Local)?.dir ?: return@rememberImportPicker
+			// A file setting picks the folder to keep its file name in
+			// (the log); a folder setting takes the folder itself.
+			if (id != null && viewModel.schema?.hostSetting(id)?.type == SettingsSchema.TYPE_FILE) {
+				val name = viewModel.values[id]?.takeIf { it.isNotEmpty() }?.substringAfterLast('/')
+					?: "Amiberry.log"
+				viewModel.set(id, File(dir, name).path)
+			} else {
+				id?.let { viewModel.set(it, dir.path) }
+			}
+		},
+		folderLabelRes = R.string.appsettings_folder_use,
+		onFiles = { uris ->
+			val id = choosingFolder
+			choosingFolder = null
+			// Only a read-side file setting's Choose opens the file browser.
+			if (id != null && id in FILE_PICKER_SETTINGS) {
+				uris.firstOrNull()?.path?.let { viewModel.set(id, it) }
+			}
+		}
+	)
+
+	fun chooseFolder(id: String) {
+		choosingFolder = id
+		// An input file the emulator reads is picked as a file; a file the
+		// emulator writes (the log) is created in the folder picked, keeping
+		// its name — picking an existing file there would truncate it.
+		if (id in FILE_PICKER_SETTINGS) {
+			folderPicker.browseDevice()
+		} else {
+			folderPicker.browseFolders()
+		}
+	}
+
+	fun showMessage(message: String) {
+		scope.launch { snackbarHostState.showSnackbar(message) }
+	}
+
+	val titles = PAGES.associate { it.id to stringResource(it.titleRes) }
+	val aboutTitle = stringResource(R.string.nav_about_licences)
+	val entries = PAGES.map { SidePaneEntry(label = titles.getValue(it.id), testTag = "appsettings-page-${it.id}") } +
+		SidePaneEntry(label = aboutTitle, testTag = "appsettings-page-about")
+	val pageIndex = entries.indexOfFirst { it.testTag == "appsettings-page-$selectedPage" }.coerceAtLeast(0)
+
+	fun pageTitle(): String = when (selectedPage) {
+		ABOUT_PAGE -> aboutTitle
+		else -> titles[selectedPage] ?: titles.values.first()
+	}
+
+	// A page open on a phone: Back returns to the list of pages (search closes first).
+	BackHandler(enabled = !wide && pageOpen && !searchOpen) { pageOpen = false }
+	BackHandler(enabled = searchOpen) { searchOpen = false; query = "" }
+
+	// Where D-pad focus enters the screen: the page list (phone) or the side list.
+	val categoryFocus = remember { FocusRequester() }
+	// Where D-pad Right from the list enters the page, restored to the control last focused there.
+	val pageContentFocus = remember { FocusRequester() }
+
+	Scaffold(
+		snackbarHost = { SnackbarHost(snackbarHostState) },
+		topBar = {
+			TopAppBar(
+				navigationIcon = {
+					IconButton(
+						// On a phone with a page open, the arrow returns to the list of pages.
+						onClick = { if (!wide && pageOpen) pageOpen = false else navController.popBackStack() },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
+						Icon(
+							Icons.AutoMirrored.Filled.ArrowBack,
+							contentDescription = stringResource(R.string.action_back)
+						)
+					}
+				},
+				// The phone's list of pages has no page selected yet: it shows the screen's title.
+				title = { Text(if (!wide && !pageOpen) stringResource(R.string.appsettings_title) else pageTitle()) },
+				actions = {
+					IconButton(
+						onClick = {
+							searchOpen = !searchOpen
+							if (!searchOpen) query = ""
+						},
+						modifier = Modifier.dpadFocusIndicator()
+					) {
+						Icon(Icons.Default.Search, contentDescription = stringResource(R.string.library_search))
+					}
+				}
+			)
+		}
+	) { innerPadding ->
+		Column(
+			modifier = Modifier
+				.fillMaxSize()
+				.padding(innerPadding)
+		) {
+			if (searchOpen) {
+				AppSettingsSearchRow(
+					query = query,
+					onQueryChange = { query = it },
+					onClose = {
+						searchOpen = false
+						query = ""
+					}
+				)
+			}
+			if (wide) {
+				Row(modifier = Modifier.fillMaxSize()) {
+					SidePaneList(
+						entries = entries,
+						selectedIndex = pageIndex,
+						onSelect = { index -> selectedPage = pageIdAt(index) },
+						modifier = Modifier.focusRequester(categoryFocus).contentEntryFocus(),
+						contentFocus = pageContentFocus,
+						selectOnFocus = isTvDevice()
+					)
+					VerticalDivider()
+					AppSettingsContent(
+						viewModel = viewModel,
+						whdbootViewModel = whdbootViewModel,
+						// Searching covers every page on both layouts; the
+						// phone branch below passes the same.
+						pageId = if (searching) null else selectedPage,
+						query = query,
+						showMessage = ::showMessage,
+						onChooseFolder = ::chooseFolder,
+						modifier = Modifier
+							.weight(1f)
+							.fillMaxSize()
+							.focusRequester(pageContentFocus)
+							.focusRestorer()
+					)
+				}
+			} else if (!pageOpen && !searching) {
+				AppSettingsPageList(
+					entries = entries,
+					onOpen = { index ->
+						selectedPage = pageIdAt(index)
+						pageOpen = true
+					},
+					modifier = Modifier
+						.fillMaxSize()
+						.focusRequester(categoryFocus)
+						.contentEntryFocus()
+				)
+			} else {
+				// A page, or the search results over the whole of the settings.
+				AppSettingsContent(
+					viewModel = viewModel,
+					whdbootViewModel = whdbootViewModel,
+					pageId = if (searching) null else selectedPage,
+					query = query,
+					showMessage = ::showMessage,
+					onChooseFolder = ::chooseFolder,
+					modifier = Modifier
+						.fillMaxSize()
+						.focusRequester(pageContentFocus)
+						.focusRestorer()
+				)
+			}
+		}
+	}
+}
+
+private fun pageIdAt(index: Int): String =
+	if (index == PAGES.size) ABOUT_PAGE else PAGES[index].id
+
+/** The phone's list of the pages and About & Licences; tapping (or OK on) a row opens it. */
+@Composable
+private fun AppSettingsPageList(
+	entries: List<SidePaneEntry>,
+	onOpen: (Int) -> Unit,
+	modifier: Modifier = Modifier
+) {
+	val firstRowFocus = remember { FocusRequester() }
+	Column(
+		modifier = modifier
+			.verticalScroll(rememberScrollState())
+			.focusRestorer(firstRowFocus)
+			.padding(horizontal = 16.dp, vertical = 8.dp),
+		verticalArrangement = Arrangement.spacedBy(4.dp)
+	) {
+		entries.forEachIndexed { index, entry ->
+			Row(
+				verticalAlignment = Alignment.CenterVertically,
+				modifier = Modifier
+					.fillMaxWidth()
+					.then(if (index == 0) Modifier.focusRequester(firstRowFocus) else Modifier)
+					.dpadFocusIndicator()
+					.clickable(role = Role.Button) { onOpen(index) }
+					.padding(vertical = 12.dp)
+					.testTag(entry.testTag.orEmpty())
+			) {
+				Text(entry.label, style = MaterialTheme.typography.titleMedium)
+			}
+		}
+	}
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppSettingsSearchRow(
+	query: String,
+	onQueryChange: (String) -> Unit,
+	onClose: () -> Unit
+) {
+	val typingGate = rememberDpadTypingGate()
+	Surface(color = MaterialTheme.colorScheme.surface) {
+		Row(
+			modifier = Modifier
+				.fillMaxWidth()
+				.padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+			verticalAlignment = Alignment.CenterVertically
+		) {
+			OutlinedTextField(
+				value = query,
+				onValueChange = onQueryChange,
+				placeholder = { Text(stringResource(R.string.appsettings_search_prompt)) },
+				singleLine = true,
+				readOnly = typingGate.readOnly,
+				modifier = Modifier
+					.weight(1f)
+					.dpadVerticalMovesFocus()
+					.then(typingGate.modifier),
+				trailingIcon = {
+					if (query.isNotEmpty()) {
+						IconButton(
+							onClick = { onQueryChange("") },
+							modifier = Modifier.dpadFocusIndicator()
+						) {
+							Icon(Icons.Default.Close, contentDescription = stringResource(R.string.action_clear_search))
+						}
+					}
+				}
+			)
+			IconButton(onClick = onClose, modifier = Modifier.dpadFocusIndicator()) {
+				Icon(Icons.Default.Close, contentDescription = stringResource(R.string.action_cancel))
+			}
+		}
+	}
+}
+
+/**
+ * One page's settings — its sections' rows, the launcher's own settings in
+ * their cards — or, with a query, every host setting that matches across
+ * the pages, a heading per page. A match inside a collapsed section shows
+ * it: a search never leaves a setting hidden behind its disclosure.
+ */
+@Composable
+private fun AppSettingsContent(
+	viewModel: AppSettingsViewModel,
+	whdbootViewModel: WhdbootViewModel,
+	pageId: String?,
+	query: String,
+	showMessage: (String) -> Unit,
+	onChooseFolder: (String) -> Unit,
+	modifier: Modifier = Modifier
+) {
+	val context = LocalContext.current
+	val preferences = remember { AppPreferences.getInstance(context) }
+	val schema = viewModel.schema
+	Column(
+		modifier = modifier
+			.verticalScroll(rememberScrollState())
+			.padding(horizontal = 16.dp, vertical = 16.dp),
+		verticalArrangement = Arrangement.spacedBy(16.dp)
+	) {
+		if (schema == null) {
+			Text(stringResource(R.string.appsettings_unavailable), color = MaterialTheme.colorScheme.onSurfaceVariant)
+			return@Column
+		}
+		if (pageId == ABOUT_PAGE) {
+			AboutPage(showMessage = showMessage)
+			return@Column
+		}
+		val pages = when (pageId) {
+			null -> PAGES.filter { page ->
+				page.sections.any { section -> AppSettingsSections.settingsOf(schema, section) { it.matches(query) }.isNotEmpty() }
+			}
+			else -> PAGES.filter { it.id == pageId }
+		}
+		pages.forEach { page ->
+			if (pageId == null) {
+				Text(stringResource(page.titleRes), style = MaterialTheme.typography.titleMedium)
+			}
+			page.sections.forEach { section ->
+				HostSection(section, viewModel, whdbootViewModel, query, onChooseFolder)
+			}
+			// The launcher's own cards are not host settings: they show on the page,
+			// never among a search's matches.
+			if (query.isBlank()) {
+				LauncherSettings(page = page.id, preferences = preferences, viewModel = viewModel)
+			}
+		}
+		if (pageId == null && pages.isEmpty()) {
+			Text(stringResource(R.string.appsettings_search_none), color = MaterialTheme.colorScheme.onSurfaceVariant)
+		}
+	}
+}
+
+/**
+ * One section's settings, in the layer's order, narrowed by [query]. A
+ * collapsed section opens for the search and stays as the user left it
+ * otherwise (AppSettingsViewModel remembers).
+ */
+@Composable
+private fun HostSection(
+	section: AppSettingsSection,
+	viewModel: AppSettingsViewModel,
+	whdbootViewModel: WhdbootViewModel,
+	query: String,
+	onChooseFolder: (String) -> Unit
+) {
+	val options = viewModel.schema?.let { AppSettingsSections.settingsOf(it, section) { it.matches(query) } }.orEmpty()
+	if (options.isEmpty() && section.group != "global_whdload") return
+	val content: @Composable ColumnScope.() -> Unit = {
+		options.forEach { option ->
+			HostSettingRow(
+				option = option,
+				value = viewModel.values[option.id] ?: option.defaultOnAndroid,
+				onSet = { value -> viewModel.set(option.id, value) },
+				shaderCatalog = viewModel.shaderCatalogEntries,
+				bezels = viewModel.bezelEntries,
+				folder = viewModel.folderStates[option.id],
+				onResetFolder = { viewModel.resetFolder(option.id) },
+				onChooseFolder = { onChooseFolder(option.id) }
+			)
+		}
+		if (section.group == "global_whdload") {
+			WhdbootFilesRow(whdbootViewModel)
+		}
+	}
+	if (section.collapsed && query.isBlank()) {
+		CollapsibleSettingsSection(
+			title = stringResource(section.titleRes),
+			expanded = section.key in viewModel.expandedSections,
+			onExpandedChange = { expanded -> viewModel.setSectionExpanded(section.key, expanded) },
+			content = content
+		)
+	} else {
+		SettingsSection(title = stringResource(section.titleRes), content = content)
+	}
+}
+
+@Composable
+private fun WhdbootFilesRow(viewModel: WhdbootViewModel) {
+	val status = viewModel.status ?: return
+	val installed = status.readyForSelectedTool && status.rtbFilesInstalled && status.librariesInstalled
+	val download = viewModel.download
+	OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+		Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+			Text(stringResource(R.string.whdboot_files_title), style = MaterialTheme.typography.titleSmall)
+			Text(
+				stringResource(if (installed) R.string.whdboot_files_installed else R.string.whdboot_files_missing),
+				style = MaterialTheme.typography.bodyMedium
+			)
+			val yes = stringResource(R.string.whdboot_yes)
+			val no = stringResource(R.string.whdboot_no)
+			Text(
+				stringResource(
+					R.string.whdboot_files_detail,
+					if (status.whdloadInstalled) yes else no,
+					if (status.jstInstalled) yes else no,
+					if (status.rtbFilesInstalled) yes else no,
+					if (status.librariesInstalled) yes else no
+				),
+				style = MaterialTheme.typography.bodySmall,
+				color = MaterialTheme.colorScheme.onSurfaceVariant
+			)
+			if (download.downloading) {
+				WhdbootDownloadProgress(download, Modifier.testTag("whdboot-cancel"))
+			} else {
+				TextButton(
+					onClick = viewModel::downloadForSettings,
+					enabled = status.downloadsAvailable,
+					modifier = Modifier.testTag("whdboot-download")
+				) {
+					Text(stringResource(if (installed) R.string.whdboot_update else R.string.whdboot_download))
+				}
+			}
+			download.result?.let { result ->
+				Text(
+					stringResource(whdbootResultString(result)),
+					style = MaterialTheme.typography.bodySmall,
+					color = MaterialTheme.colorScheme.onSurfaceVariant
+				)
+			}
+		}
+	}
+}
+
+/**
+ * The launcher's own app-level settings, in the page they belong: the app
+ * theme under Appearance, the remembered controls under Defaults, the
+ * storage location and the Library's state under Advanced. Everything a
+ * machine of its own sets stays in the machine editor.
+ */
+@Composable
+private fun LauncherSettings(page: String, preferences: AppPreferences, viewModel: AppSettingsViewModel) {
+	when (page) {
+		"appearance" -> AppThemeCard(preferences)
+		"defaults" -> RememberedControlsSetting(preferences)
+		"advanced" -> {
+			StorageLocationSetting()
+			LibraryCard(preferences)
+		}
+	}
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppThemeCard(preferences: AppPreferences) {
+	val context = LocalContext.current
+
+	OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+		Column(modifier = Modifier.padding(16.dp)) {
+			Text(stringResource(R.string.settings_display_app_theme), style = MaterialTheme.typography.titleMedium)
+			Spacer(modifier = Modifier.height(8.dp))
+
+			val themeMode by preferences.themeMode
+			val themeModeOptions = listOf(
+				"system" to stringResource(R.string.settings_display_theme_system),
+				"light" to stringResource(R.string.settings_display_theme_light),
+				"dark" to stringResource(R.string.settings_display_theme_dark)
+			)
+			var themeExpanded by remember { mutableStateOf(false) }
+			ExposedDropdownMenuBox(
+				expanded = themeExpanded,
+				onExpandedChange = { themeExpanded = it }
+			) {
+				OutlinedTextField(
+					value = themeModeOptions.firstOrNull { it.first == themeMode }?.second ?: themeMode,
+					onValueChange = {},
+					readOnly = true,
+					label = { Text(stringResource(R.string.settings_display_theme_label)) },
+					trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = themeExpanded) },
+					modifier = Modifier
+						.dpadFieldFocusIndicator()
+						.dpadArrowsMoveFocus()
+						.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+						.fillMaxWidth()
+				)
+				ExposedDropdownMenu(
+					expanded = themeExpanded,
+					onDismissRequest = { themeExpanded = false }
+				) {
+					themeModeOptions.forEach { (value, label) ->
+						DropdownMenuItem(
+							text = { Text(label) },
+							modifier = Modifier.dpadMenuItemInitialFocus(value == themeMode),
+							onClick = {
+								preferences.setThemeMode(value)
+								themeExpanded = false
+							}
+						)
+					}
+				}
+			}
+
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+				Spacer(modifier = Modifier.height(8.dp))
+				val useDynamicColor by preferences.useDynamicColor
+				SettingSwitchRow(
+					label = stringResource(R.string.settings_display_dynamic_color),
+					checked = useDynamicColor,
+					onCheckedChange = { preferences.setDynamicColor(it) }
+				)
+			}
+		}
+	}
+}
+
+/** The Library's own state: the ROM advice it shows, and the launches it remembers. */
+@Composable
+private fun LibraryCard(preferences: AppPreferences) {
+	OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+		Column(modifier = Modifier.padding(16.dp)) {
+			Text(stringResource(R.string.appsettings_library_title), style = MaterialTheme.typography.titleMedium)
+			Spacer(modifier = Modifier.height(8.dp))
+			val romAdviceDismissed by preferences.romAdviceDismissed
+			SettingSwitchRow(
+				label = stringResource(R.string.appsettings_show_rom_advice),
+				checked = !romAdviceDismissed,
+				onCheckedChange = { show ->
+					if (show) preferences.showRomAdviceAgain() else preferences.dismissRomAdvice()
+				},
+				help = stringResource(R.string.appsettings_show_rom_advice_help)
+			)
+			Spacer(modifier = Modifier.height(8.dp))
+			TextButton(
+				onClick = {
+					preferences.clearRecentLaunches()
+				},
+				modifier = Modifier.fillMaxWidth().dpadFocusIndicator()
+			) {
+				Text(stringResource(R.string.appsettings_clear_recent))
+			}
+		}
+	}
+}
+
+/** The controls machines leave behind, which the next new machine starts from: one reset. */
+@Composable
+private fun RememberedControlsSetting(preferences: AppPreferences) {
+	OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+		Column(modifier = Modifier.padding(16.dp)) {
+			Text(stringResource(R.string.appsettings_remembered_controls_title), style = MaterialTheme.typography.titleMedium)
+			Spacer(modifier = Modifier.height(8.dp))
+			Text(
+				stringResource(R.string.appsettings_remembered_controls_help),
+				style = MaterialTheme.typography.bodyMedium,
+				color = MaterialTheme.colorScheme.onSurfaceVariant
+			)
+			Spacer(modifier = Modifier.height(8.dp))
+			TextButton(
+				onClick = { preferences.resetRememberedControls() },
+				modifier = Modifier.fillMaxWidth().dpadFocusIndicator()
+			) {
+				Text(stringResource(R.string.appsettings_reset_remembered_controls))
+			}
+		}
+	}
+}
+
+/** Where the launcher's content lives, and whether it may reach all of it; the Folders section above changes each folder. */
+@Composable
+private fun StorageLocationSetting() {
+	val context = LocalContext.current
+	OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+		Column(modifier = Modifier.padding(16.dp)) {
+			Text(stringResource(R.string.appsettings_storage_title), style = MaterialTheme.typography.titleMedium)
+			Spacer(modifier = Modifier.height(8.dp))
+			val fullAccess = hasFullStorageAccess(context)
+			Text(
+				stringResource(
+					if (fullAccess) R.string.appsettings_storage_full_access else R.string.appsettings_storage_limited_access
+				),
+				style = MaterialTheme.typography.bodyMedium
+			)
+			context.getExternalFilesDir(null)?.let { external ->
+				Spacer(modifier = Modifier.height(8.dp))
+				Text(
+					text = external.absolutePath,
+					style = MaterialTheme.typography.bodySmall,
+					color = MaterialTheme.colorScheme.onSurfaceVariant
+				)
+			}
+			Spacer(modifier = Modifier.height(8.dp))
+			Text(
+				stringResource(R.string.appsettings_storage_folders_footer),
+				style = MaterialTheme.typography.bodySmall,
+				color = MaterialTheme.colorScheme.onSurfaceVariant
+			)
+		}
+	}
+}

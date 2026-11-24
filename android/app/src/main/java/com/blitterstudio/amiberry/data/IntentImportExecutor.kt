@@ -6,8 +6,6 @@ import android.util.Log
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
 import com.blitterstudio.amiberry.data.model.FileCategory
-import com.blitterstudio.amiberry.data.model.StoragePaths
-import java.io.File
 
 object IntentImportExecutor {
 
@@ -17,9 +15,10 @@ object IntentImportExecutor {
 	)
 
 	sealed interface Launch {
+		/** [rememberedControls] only fills the control groups the file lacks. */
 		data class SavedConfig(
 			val configPath: String,
-			val controlSettings: EmulatorSettings
+			val rememberedControls: EmulatorSettings
 		) : Launch
 
 		data class QuickStart(
@@ -33,7 +32,8 @@ object IntentImportExecutor {
 		data class WhdLoad(
 			val lhaPath: String,
 			val configPath: String,
-			val shaderOverride: String? = null
+			val shaderOverride: String? = null,
+			val controlOverrides: LaunchRequest.AndroidControlOverrides? = null
 		) : Launch
 
 		data class Rp9(
@@ -60,13 +60,15 @@ object IntentImportExecutor {
 		category: FileCategory,
 		importedPath: String,
 		configPath: String,
-		shaderOverride: String? = null
+		shaderOverride: String? = null,
+		controlOverrides: LaunchRequest.AndroidControlOverrides? = null
 	): Launch? =
 		when (category) {
 			FileCategory.WHDLOAD_GAMES -> Launch.WhdLoad(
 				lhaPath = importedPath,
 				configPath = configPath,
-				shaderOverride = shaderOverride
+				shaderOverride = shaderOverride,
+				controlOverrides = controlOverrides
 			)
 			FileCategory.FLOPPIES -> Launch.QuickStart(
 				model = AmigaModel.A500,
@@ -87,9 +89,7 @@ object IntentImportExecutor {
 		}
 
 	private fun importConfig(context: Context, uri: Uri, safeName: String): PreparedImport {
-		val baseDir = context.getExternalFilesDir(null)
-			?: return PreparedImport(ImportFeedback.importFailed(safeName))
-		val confDir = File(baseDir, StoragePaths.CONFIGURATIONS)
+		val confDir = ContentFolders.configurationsDir(context)
 		if (!confDir.exists() && !confDir.mkdirs()) {
 			Log.e(TAG, "Failed to create config directory: ${confDir.absolutePath}")
 			return PreparedImport(ImportFeedback.importFailed(safeName))
@@ -109,7 +109,7 @@ object IntentImportExecutor {
 				feedback = ImportFeedback.configImported(targetFile.name),
 				launch = Launch.SavedConfig(
 					configPath = targetFile.absolutePath,
-					controlSettings = AndroidLaunchConfig.loadLastSessionSettings(context)
+					rememberedControls = AppPreferences.getInstance(context).rememberedAndroidControls()
 				)
 			)
 		} catch (e: Exception) {
@@ -119,9 +119,11 @@ object IntentImportExecutor {
 	}
 
 	private fun importRp9(context: Context, uri: Uri, safeName: String): PreparedImport {
-		val baseDir = context.getExternalFilesDir(null)
-			?: return PreparedImport(ImportFeedback.importFailed(safeName))
-		val rp9Dir = File(baseDir, StoragePaths.RP9)
+		val rp9Dir = ContentFolders.effective(
+			"rp9_path",
+			ShaderCatalog.findSettingsFile(context.filesDir, context.getExternalFilesDir(null)),
+			context.getExternalFilesDir(null)
+		) ?: return PreparedImport(ImportFeedback.importFailed(safeName))
 		if (!rp9Dir.exists() && !rp9Dir.mkdirs())
 			return PreparedImport(ImportFeedback.importFailed(safeName))
 		val targetFile = FileManager.uniqueImportTarget(rp9Dir, safeName)
@@ -148,7 +150,13 @@ object IntentImportExecutor {
 		import: IntentImport.Classification.Media
 	): PreparedImport {
 		return when (val result = FileManager.importFileWithResult(context, uri, import.category)) {
-			is FileManager.ImportResult.Imported -> prepareImportedMedia(context, result.path, result.safeName, import.category)
+			is FileManager.ImportResult.Imported -> prepareImportedMedia(
+				context,
+				result.path,
+				result.safeName,
+				import.category,
+				ImportFeedback.fromImportResult(result)
+			)
 			is FileManager.ImportResult.Unsupported -> PreparedImport(
 				ImportFeedback.unsupportedFileType(result.extension)
 			)
@@ -162,11 +170,11 @@ object IntentImportExecutor {
 		context: Context,
 		importedPath: String,
 		importedName: String,
-		category: FileCategory
+		category: FileCategory,
+		feedback: ImportFeedback.Message
 	): PreparedImport {
 		return try {
 			FileRepository.getInstance(context).rescanCategory(category)
-			val feedback = ImportFeedback.fileImported(importedName)
 			val currentSettings = AndroidLaunchConfig.loadLastSessionSettings(context)
 			val launch = when (category) {
 				FileCategory.WHDLOAD_GAMES -> {
@@ -175,7 +183,8 @@ object IntentImportExecutor {
 						category = category,
 						importedPath = importedPath,
 						configPath = prepared.configFile.absolutePath,
-						shaderOverride = prepared.shaderOverride
+						shaderOverride = prepared.shaderOverride,
+						controlOverrides = prepared.controlOverrides
 					)
 				}
 				FileCategory.FLOPPIES -> writeIntentQuickStartConfig(
@@ -185,7 +194,7 @@ object IntentImportExecutor {
 					floppy0 = importedPath,
 					floppy1 = "",
 					cdImage = ""
-				).let { mediaLaunchFor(category, importedPath, it) }
+				).let { configPath -> mediaLaunchFor(category, importedPath, configPath) }
 				FileCategory.CD_IMAGES -> writeIntentQuickStartConfig(
 					context = context,
 					model = AmigaModel.CD32,
@@ -193,7 +202,7 @@ object IntentImportExecutor {
 					floppy0 = "",
 					floppy1 = "",
 					cdImage = importedPath
-				).let { mediaLaunchFor(category, importedPath, it) }
+				).let { configPath -> mediaLaunchFor(category, importedPath, configPath) }
 				FileCategory.ROMS,
 				FileCategory.HARD_DRIVES -> null
 			}

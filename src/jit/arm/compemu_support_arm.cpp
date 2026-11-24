@@ -60,6 +60,7 @@
 #include "newcpu.h"
 #include "comptbl_arm.h"
 #include "compemu_arm.h"
+#include "jit/jit_trap_policy.h"
 #include <SDL3/SDL.h>
 
 /* ARM64 JIT is PIE-compatible: it uses register-indirect addressing
@@ -85,10 +86,8 @@ static inline void *vm_acquire(uae_u32 size, int options = VM_MAP_DEFAULT)
 {
 	assert(options == (VM_MAP_DEFAULT | VM_MAP_32BIT));
 	int flags = UAE_VM_32BIT;
-#if defined(CPU_AARCH64)
 	/* ARM64 JIT is 64-bit clean: metadata pools don't need low 4GB. */
 	flags = 0;
-#endif
 	return uae_vm_alloc(size, flags, UAE_VM_READ_WRITE);
 }
 
@@ -97,7 +96,6 @@ static inline void* vm_acquire_code(uae_u32 size, int options = VM_MAP_DEFAULT)
 	assert(options == (VM_MAP_DEFAULT | VM_MAP_32BIT));
 	int flags = UAE_VM_32BIT;
 	int protect = UAE_VM_READ_WRITE;
-#if defined(CPU_AARCH64)
 #if defined(__APPLE__)
 	/* On macOS ARM64, MAP_JIT mappings may not be placeable below 4GB.
 	 * Allow normal placement and rely on ARM64 codegen's 64-bit pointers. */
@@ -111,27 +109,18 @@ static inline void* vm_acquire_code(uae_u32 size, int options = VM_MAP_DEFAULT)
 	/* All ARM64: code memory must be executable from allocation time.
 	 * On Android, SELinux may deny mprotect(PROT_EXEC) on non-exec pages. */
 	protect = UAE_VM_READ_WRITE_EXECUTE;
-#endif
 	return uae_vm_alloc(size, flags, protect);
 }
 
 #define UNUSED(x)
-#if defined(CPU_AARCH64)
 #define PRINT_PTR "%016llx"
-#else
-#define PRINT_PTR "%08x"
-#endif
 
 #define jit_log(format, ...) \
   write_log("JIT: " format "\n", ##__VA_ARGS__);
 #define jit_log2(format, ...)
 
-#if defined(CPU_AARCH64)
 /* Not used on ARM64; R_MEMSTART (x27) holds full 64-bit natmem_offset */
 #define MEMBaseDiff ((uae_u32)0)
-#else
-#define MEMBaseDiff uae_p32(NATMEM_OFFSET)
-#endif
 
 #ifdef NATMEM_OFFSET
 #define FIXED_ADDRESSING 1
@@ -185,7 +174,6 @@ static inline int distrust_addr(void)
     return distrust_check(currprefs.comptrustnaddr);
 }
 
-#if defined(CPU_AARCH64)
 static inline bool jit_use_memory_helpers(void)
 {
     return jit_n_addr_bank_unsafe || (jit_n_addr_unsafe && !canbang);
@@ -207,7 +195,6 @@ static inline bool jit_opcode_needs_compile_fallback(uae_u32 opcode)
             return false;
     }
 }
-#endif
 
 //#if DEBUG
 //#define PROFILE_COMPILE_TIME        1
@@ -271,7 +258,11 @@ uae_u8* comp_pc_p;
 static uae_u32 cache_size = 0;            // Size of total cache allocated for compiled blocks
 static uae_u32 current_cache_size   = 0;  // Cache grows upwards: how much has been consumed already
 #ifdef USE_JIT_FPU
-#define avoid_fpu (!currprefs.compfpu)
+/* build_comp() runs before the FPU reset selects the core: from the settings,
+ * not jit_fpu_enabled(). The exact core's FPU instructions compile to calls
+ * into it whether the JIT FPU is on or not; comp_fpp_opp() picks native or
+ * calls when it compiles, after the core is selected. */
+#define avoid_fpu (!currprefs.fpu_model || (!currprefs.compfpu && !fpu_exact_wanted()))
 #define lazy_flush (!currprefs.comp_hardflush)
 #else
 #define avoid_fpu (true)
@@ -345,7 +336,6 @@ static uae_s32 reg_alloc_run;
 const int POPALLSPACE_SIZE = 2048; /* That should be enough space */
 uae_u8* popallspace = NULL;
 
-#if defined(CPU_AARCH64)
 /* On ARM64, popallspace and JIT cache are allocated as one contiguous
  * block to guarantee the cache is within ARM64 B/BL branch range
  * (+-128 MB) of popallspace. Separate allocations may be scattered
@@ -353,7 +343,6 @@ uae_u8* popallspace = NULL;
 static size_t popall_combined_alloc_size = 0;
 static uint8 *popall_combined_cache_start = NULL;
 static uint32 popall_combined_cache_kb = 0;
-#endif
 
 void* pushall_call_handler = NULL;
 static void* popall_do_nothing = NULL;
@@ -368,6 +357,15 @@ static void* popall_exec_nostats_setpc = NULL;
 static void* popall_execute_normal_setpc = NULL;
 static void* popall_check_checksum_setpc = NULL;
 static void* popall_execute_exception = NULL;
+static void* popall_fpu_mode_recompile = NULL;
+bool jit_fpu_exact_block;
+bool jit_fpu_single_block;
+bool jit_fpu_host_flags;
+bool jit_fpu_host_settle;
+bool jit_fpu_loop_ok;
+/* the FPU JIT mode of the block being compiled (fpu_chain), -2: not an FPU
+   block */
+static int jit_fpu_chain_mode;
 #endif
 
 /* The 68k only ever executes from even addresses. So right now, we
@@ -675,6 +673,13 @@ static void jit_dbg_vec2_sigsegv_handler(int sig, siginfo_t *si, void *ctx_raw)
     // Return — store executes, then BRK fires SIGTRAP → handler re-protects page
 }
 
+// The page guard's SIGSEGV handler chains to Amiberry's own; signal-handler
+// reclaim (install_fault_signal_handlers) must leave it installed.
+bool jit_dbg_is_sigsegv_handler(void (*handler)(int, siginfo_t*, void*))
+{
+    return handler == jit_dbg_vec2_sigsegv_handler;
+}
+
 // v34: Vec2 check function callable from ALL C dispatch functions.
 // This covers the "dark zone" where compiled blocks chain via hash table
 // dispatch without any vec2 monitoring. Called from:
@@ -957,6 +962,17 @@ static inline void adjust_jmpdep(dependency* d, cpuop_func* a)
  * Soft flush handling support functions                            *
  ********************************************************************/
 
+/* Where a jump from a block that leaves the host FPSR live in FPU JIT mode
+   <chain> (blockinfo::fpu_chain) enters block <bi> while its direct handler
+   is <dh>: past the FPU block entry when the entry would pass anyway. */
+static inline cpuop_func* fpu_chain_target(int chain, blockinfo* bi, cpuop_func* dh)
+{
+    if (chain >= -1 && bi->fpu_resume && dh == bi->direct_handler
+        && (bi->fpu_mode < 0 || bi->fpu_mode == chain))
+        return (cpuop_func*)bi->fpu_resume;
+    return dh;
+}
+
 static inline void set_dhtu(blockinfo* bi, cpuop_func* dh)
 {
     jit_log2("bi is %p", bi);
@@ -969,12 +985,19 @@ static inline void set_dhtu(blockinfo* bi, cpuop_func* dh)
             jit_log2("x->prev_p is %p", x->prev_p);
 
             if (x->jmp_off) {
-                adjust_jmpdep(x, dh);
+                adjust_jmpdep(x, fpu_chain_target(x->source->fpu_chain, bi, dh));
             }
             x = x->next;
         }
         bi->direct_handler_to_use = (cpuop_func*)dh;
     }
+}
+
+static inline void clear_fpu_chain(blockinfo* bi)
+{
+    bi->fpu_mode = -1;
+    bi->fpu_chain = -2;
+    bi->fpu_resume = NULL;
 }
 
 void invalidate_block(blockinfo* bi)
@@ -986,9 +1009,11 @@ void invalidate_block(blockinfo* bi)
     bi->handler = NULL;
     bi->handler_to_use = (cpuop_func*)popall_execute_normal;
     bi->direct_handler = NULL;
+    clear_fpu_chain(bi);
     set_dhtu(bi, bi->direct_pen);
     bi->needed_flags = 0xff;
     bi->status = BI_INVALID;
+    bi->fpu_trips = 0;
     for (i = 0; i < 2; i++) {
         bi->dep[i].jmp_off = NULL;
         bi->dep[i].target = NULL;
@@ -1017,6 +1042,7 @@ static inline void block_need_recompile(blockinfo* bi)
 {
     uae_u32 cl = cacheline(bi->pc_p);
 
+    clear_fpu_chain(bi);
     set_dhtu(bi, bi->direct_pen);
     bi->direct_handler = bi->direct_pen;
 
@@ -1362,11 +1388,7 @@ STATIC_INLINE void reset_data_buffer(void)
 STATIC_INLINE void clobber_flags(void);
 #endif
 
-#if defined(CPU_AARCH64) 
 #include "codegen_arm64.cpp"
-#elif defined(CPU_arm) 
-#include "codegen_arm.cpp"
-#endif
 
 /********************************************************************
  * Flags status handling. EMIT TIME!                                *
@@ -1651,14 +1673,12 @@ static inline void disassociate(int r)
 static inline void set_const(int r, uintptr val)
 {
     disassociate(r);
-#ifdef CPU_AARCH64
     // On ARM64, guest registers (Dn, An, flags) are 32-bit values.
     // Only PC_P holds a 64-bit host pointer.  Mask val to 32-bit for
     // all other registers to prevent 64-bit arithmetic leaking into
     // constant-propagation paths (sub_l_ri underflow, etc.).
     if (r != PC_P)
         val = (uae_u32)val;
-#endif
     live.state[r].val = val;
     set_status(r, ISCONST);
 }
@@ -2056,7 +2076,6 @@ static inline int isinrom(uintptr addr)
 #endif
 }
 
-#if defined(CPU_AARCH64)
 static inline int isinrtarea(uintptr addr)
 {
 #ifdef UAE
@@ -2067,7 +2086,6 @@ static inline int isinrtarea(uintptr addr)
     return 0;
 #endif
 }
-#endif
 
 #if defined(UAE) || defined(FLIGHT_RECORDER)
 static void flush_all(void)
@@ -2088,6 +2106,17 @@ static void flush_all(void)
         f_evict(FS1);
 }
 
+/* Constant 68k registers (moveq, lea) live only in the compiler's state:
+ * store them, as flush() does, before a helper that reads or writes the 68k
+ * registers in memory. Uses REG_WORK1/2 only. */
+static void writeback_consts(void)
+{
+    for (int i = 0; i <= FLAGTMP; i++) {
+        if (i != PC_P && isconst(i))
+            writeback_const(i);
+    }
+}
+
 
 /* Make sure all registers that will get clobbered by a call are
    save and sound in memory */
@@ -2103,11 +2132,7 @@ static void prepare_for_call_2(void)
 {
     int i;
     for (i = 0; i < N_REGS; i++) {
-#if defined(CPU_AARCH64)
         if (live.nat[i].nholds > 0) // in aarch64: first 18 regs not call saved
-#else
-        if (!call_saved[i] && live.nat[i].nholds > 0)
-#endif
             free_nreg(i);
     }
 
@@ -2121,13 +2146,8 @@ static void prepare_for_call_2(void)
 }
 #endif
 
-#if defined(CPU_AARCH64) 
 #include "compemu_midfunc_arm64.cpp"
 #include "compemu_midfunc_arm64_2.cpp"
-#elif defined(CPU_arm)
-#include "compemu_midfunc_arm.cpp"
-#include "compemu_midfunc_arm2.cpp"
-#endif
 
 /********************************************************************
  * Support functions exposed to gencomp. CREATE time                *
@@ -2215,14 +2235,10 @@ void compiler_exit(void)
      * both here is also safe if this instance is used again.
      */
     if (compiled_code) {
-#if defined(CPU_AARCH64)
         /* Don't free separately if part of the combined popallspace block */
         if (compiled_code != popall_combined_cache_start) {
             vm_release(compiled_code, cache_size * 1024);
         }
-#else
-        vm_release(compiled_code, cache_size * 1024);
-#endif
         compiled_code = 0;
         max_compile_start = 0;
         current_compile_p = 0;
@@ -2230,14 +2246,10 @@ void compiler_exit(void)
     }
 
     if (popallspace) {
-#if defined(CPU_AARCH64)
         vm_release(popallspace, popall_combined_alloc_size ? popall_combined_alloc_size : POPALLSPACE_SIZE);
         popall_combined_alloc_size = 0;
         popall_combined_cache_start = NULL;
         popall_combined_cache_kb = 0;
-#else
-        vm_release(popallspace, POPALLSPACE_SIZE);
-#endif
         popallspace = 0;
     }
 
@@ -2411,6 +2423,46 @@ static void flush(int save_regs)
     }
 }
 
+/* After a compiled instruction that may raise an exception (DIV by zero,
+ * CHK, TRAPcc, ...): if regs.jit_exception is set, leave for
+ * execute_exception(). Exception_cpu() reads the 68k state from regs: the
+ * PC (regs.pc_p), the address of the instruction (regs.instruction_pc, the
+ * format $2 frame's instruction address) and the registers. Compiled code
+ * holds those in host registers and in m68k_pc_offset, so write them back
+ * on the exception path first: without that the frame carried the PC of an
+ * earlier instruction and a stale instruction address, and register values
+ * the block had changed were lost. The normal path continues with the
+ * allocator state from before the write-back. */
+static void compemu_handle_except_sync(uae_u32 cycles, uae_u32 insn_pc)
+{
+    clobber_flags();
+    uintptr idx = (uintptr)(&regs.jit_exception) - (uintptr)(&regs);
+    LDR_wXi(REG_WORK1, R_REGSTRUCT, idx);
+    uae_u32* branch_none = (uae_u32*)get_target();
+    CBZ_wi(REG_WORK1, 0);                   // no exception: next instruction
+
+    bigstate saved = live;
+    const uae_u32 saved_pc_offset = m68k_pc_offset;
+    uae_u8* const saved_comp_pc_p = comp_pc_p;
+    const bool saved_carry_inverted = flags_carry_inverted;
+
+    flush(1);                               // registers, flags, PC_P = next instruction
+    if (isconst(PC_P))
+        compemu_raw_mov_l_mi((uintptr)&regs.pc_p, live.state[PC_P].val);
+    compemu_raw_mov_l_mi((uintptr)&regs.instruction_pc, insn_pc);
+    LOAD_U32(REG_PAR1, cycles);
+    uae_u32* branch_exc = (uae_u32*)get_target();
+    B_i(0);
+    write_jmp_target(branch_exc, (uintptr)popall_execute_exception);
+
+    live = saved;
+    m68k_pc_offset = saved_pc_offset;
+    comp_pc_p = saved_comp_pc_p;
+    flags_carry_inverted = saved_carry_inverted;
+
+    write_jmp_target(branch_none, (uintptr)get_target());
+}
+
 int alloc_scratch(void)
 {
     for (int i = 0; i < SCRATCH_REGS; ++i) {
@@ -2440,13 +2492,7 @@ static void freescratch(void)
 {
     int i;
     for (i = 0; i < N_REGS; i++) {
-#if defined(CPU_AARCH64) 
         if (live.nat[i].locked && i > 5 && i < 18) {
-#elif defined(CPU_arm)
-        if (live.nat[i].locked && i != 2 && i != 3 && i != 10 && i != 11 && i != 12) {
-#else
-        if (live.nat[i].locked && i != 4 && i != 12) {
-#endif
             jit_log("Warning! %d is locked", i);
         }
     }
@@ -2484,6 +2530,14 @@ static uintptr get_handler(uintptr addr)
 {
     blockinfo* bi = get_blockinfo_addr_new((void*)(uintptr)addr);
     return (uintptr)bi->direct_handler_to_use;
+}
+
+/* the jump target of the block being compiled to the block at <pc> */
+static uintptr block_jump_target(uintptr pc)
+{
+    blockinfo* tbi = get_blockinfo_addr_new((void*)pc);
+    int chain = jit_fpu_loop_ok ? jit_fpu_chain_mode : -2;
+    return (uintptr)fpu_chain_target(chain, tbi, tbi->direct_handler_to_use);
 }
 
 /* This version assumes that it is writing *real* memory, and *will* fail
@@ -2729,8 +2783,6 @@ static inline uint8 *alloc_code(uint32 size)
 {
     uint8 *ptr = do_alloc_code(size, 0);
 	/* allocated code must fit in 32-bit boundaries */
-#ifdef CPU_64_BIT
-#if defined(CPU_AARCH64)
 	/* ARM64 JIT is 64-bit pointer clean — tolerate high addresses. */
 	if (ptr && (uintptr)ptr + size > (uintptr)0xffffffff) {
 		static bool arm64_high_jit_logged = false;
@@ -2739,18 +2791,9 @@ static inline uint8 *alloc_code(uint32 size)
 			arm64_high_jit_logged = true;
 		}
 	}
-#else
-	if (ptr && (uintptr)ptr + size > (uintptr)0xffffffff) {
-		jit_log("WARNING: JIT code allocated above 32-bit boundary at %p (size %u)", ptr, size);
-		vm_release(ptr, size);
-		return NULL;
-	}
-#endif
-#endif
 	return ptr;
 }
 
-#if defined(CPU_AARCH64)
 static inline bool arm64_uncond_branch_reachable(uintptr from, uintptr to)
 {
 	/* AArch64 B immediate range: signed 26-bit immediate, shifted left by 2. */
@@ -2810,20 +2853,44 @@ static uint8 *alloc_code_near_popall(uint32 size)
 	return alloc_code(size);
 }
 #endif /* __APPLE__ */
-#endif /* CPU_AARCH64 */
+STATIC_INLINE void create_popalls(void);
+
+/* popallspace was allocated without room for a cache of this size, because
+ * JIT was off at startup or the cache has grown since. A separately
+ * allocated cache can land out of B/BL range of popallspace, so allocate
+ * both again as one block and regenerate the stubs. Generated code leaves
+ * popallspace through tail jumps only, so nothing runs from it here. */
+static void realloc_popallspace_with_cache(void)
+{
+	if (popallspace) {
+		vm_release(popallspace, popall_combined_alloc_size ? popall_combined_alloc_size : POPALLSPACE_SIZE);
+		popallspace = NULL;
+	}
+	popall_combined_alloc_size = 0;
+	popall_combined_cache_start = NULL;
+	popall_combined_cache_kb = 0;
+	pushall_call_handler = NULL;
+	popall_execute_normal = NULL;
+	popall_check_checksum = NULL;
+	create_popalls();
+	if (!pushall_call_handler || !popall_execute_normal) {
+		return;
+	}
+	for (int i = 0; i < TAGSIZE; i += 2) {
+		cache_tags[i].handler = (cpuop_func*)popall_execute_normal;
+		cache_tags[i + 1].bi = NULL;
+	}
+}
+
 
 void alloc_cache(void)
 {
     if (compiled_code) {
         flush_icache_hard(3);
-#if defined(CPU_AARCH64)
         /* Don't free if it's part of the combined popallspace block */
         if (compiled_code != popall_combined_cache_start) {
             vm_release(compiled_code, cache_size * 1024);
         }
-#else
-		vm_release(compiled_code, cache_size * 1024);
-#endif
         compiled_code = 0;
     }
 
@@ -2831,7 +2898,9 @@ void alloc_cache(void)
     if (cache_size == 0)
         return;
 
-#if defined(CPU_AARCH64)
+	if (!popall_combined_cache_start || (uint32)cache_size > popall_combined_cache_kb) {
+		realloc_popallspace_with_cache();
+	}
 	/* Use pre-allocated cache from the combined popallspace block if available */
 	if (popall_combined_cache_start && (uint32)cache_size <= popall_combined_cache_kb) {
 		compiled_code = popall_combined_cache_start;
@@ -2856,24 +2925,8 @@ void alloc_cache(void)
 			}
 		}
 	}
-#else
-	while (!compiled_code && cache_size) {
-		const uint32 cache_bytes = cache_size * 1024;
-		compiled_code = alloc_code(cache_bytes);
-		if (compiled_code == NULL) {
-			compiled_code = 0;
-			cache_size /= 2;
-		}
-	}
-	if (compiled_code) {
-		if (!vm_protect(compiled_code, cache_size * 1024, VM_PAGE_READ | VM_PAGE_WRITE | VM_PAGE_EXECUTE)) {
-			jit_log("WARNING: Failed to set JIT cache to RWX — JIT may crash");
-		}
-	}
-#endif
 
     if (compiled_code) {
-#if defined(CPU_AARCH64)
 		static bool arm64_jit_mode_logged = false;
 		if (!arm64_jit_mode_logged) {
 #if defined(__APPLE__)
@@ -2885,7 +2938,6 @@ void alloc_cache(void)
 #endif
 			arm64_jit_mode_logged = true;
 		}
-#endif
         jit_log("<JIT compiler> : actual translation cache size : %d KB at %p-%p\n", cache_size, compiled_code, compiled_code + cache_size * 1024);
 #ifdef USE_DATA_BUFFER
         max_compile_start = compiled_code + cache_size * 1024 - BYTES_PER_INST - DATA_BUFFER_SIZE;
@@ -2959,6 +3011,23 @@ static void recompile_block(void)
 
     Dif(!bi)
         jit_abort("recompile_block");
+    raise_in_cl_list(bi);
+    execute_normal();
+}
+
+/* A block was entered with an FPCR whose mode (fpu_jit_fpcr_mode()) is not the
+   one its FPU code was compiled for. Recompile it for the current FPCR. */
+static void fpu_mode_recompile(void)
+{
+    blockinfo* bi = get_blockinfo_addr(regs.pc_p);
+
+    Dif(!bi)
+        jit_abort("fpu_mode_recompile");
+    if (bi->fpu_trips < FPU_JIT_FPCR_TRIPS)
+        bi->fpu_trips++;
+    fpu_jit_log_recompile(m68k_getpc(), bi->fpu_trips >= FPU_JIT_FPCR_TRIPS ?
+        FPU_JIT_MODE_EXACT : fpu_jit_fpcr_mode(regs.fpcr), bi->fpu_trips);
+    bi->status = BI_NEED_RECOMP;
     raise_in_cl_list(bi);
     execute_normal();
 }
@@ -3074,7 +3143,6 @@ STATIC_INLINE void create_popalls(void)
     int i, r;
 
     if (popallspace == NULL) {
-#if defined(CPU_AARCH64)
         /* On ARM64, allocate popallspace + JIT cache as one contiguous block
          * to guarantee the cache is within B/BL branch range (+-128 MB). */
         if (currprefs.cachesize > 0) {
@@ -3106,9 +3174,6 @@ STATIC_INLINE void create_popalls(void)
             popallspace = alloc_code(POPALLSPACE_SIZE);
         }
         if (popallspace == NULL) {
-#else
-        if ((popallspace = alloc_code(POPALLSPACE_SIZE)) == NULL) {
-#endif
             jit_log("WARNING: Could not allocate popallspace!");
             if (currprefs.cachesize > 0)
             {
@@ -3130,20 +3195,11 @@ STATIC_INLINE void create_popalls(void)
             return;
         }
     }
-#if !defined(CPU_AARCH64)
-    /* On non-ARM64, code memory was allocated RW-only; this is a no-op there.
-     * On ARM64, code memory is already RWX from allocation — skip. */
-    vm_protect(popallspace, POPALLSPACE_SIZE, VM_PAGE_READ | VM_PAGE_WRITE);
-#endif
 	jit_begin_write_window();
 
     current_compile_p = popallspace;
     set_target(current_compile_p);
 
-#if defined(CPU_arm) && !defined(ARMV6T2) && !defined(CPU_AARCH64)
-    reset_data_buffer();
-    data_long(0, 0); // Make sure we emit the branch over the first buffer outside pushall_call_handler
-#endif
 
   /* We need to guarantee 16-byte stack alignment on x86 at any point
      within the JIT generated code. We have multiple exit points
@@ -3168,33 +3224,45 @@ STATIC_INLINE void create_popalls(void)
     popall_execute_normal_setpc = get_target();
     compemu_raw_store_pc_state_from_work1();
     popall_execute_normal = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)execute_normal);
 
     popall_check_checksum_setpc = get_target();
     compemu_raw_store_pc_state_from_work1();
     popall_check_checksum = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)check_checksum);
 
     popall_exec_nostats_setpc = get_target();
     compemu_raw_store_pc_state_from_work1();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)exec_nostats);
 
     popall_recompile_block = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)recompile_block);
 
+    popall_fpu_mode_recompile = get_target();
+    compemu_raw_fpsr_settle();
+    raw_pop_preserved_regs();
+    compemu_raw_jmp((uintptr)fpu_mode_recompile);
+
     popall_do_nothing = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)do_nothing);
 
     popall_cache_miss = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)cache_miss);
 
     popall_execute_exception = get_target();
+    compemu_raw_fpsr_settle();
     raw_pop_preserved_regs();
     compemu_raw_jmp((uintptr)execute_exception);
 
@@ -3203,15 +3271,10 @@ STATIC_INLINE void create_popalls(void)
 #endif
 
     // no need to further write into popallspace
-#if defined(CPU_AARCH64)
     // ARM64 has separate I-cache and D-cache: we MUST flush the I-cache
     // after writing code before making it executable, or we'll execute
     // stale/random data from the I-cache.
     flush_cpu_icache((void *)popallspace, (void *)get_target());
-#endif
-#if !defined(CPU_AARCH64)
-	vm_protect(popallspace, POPALLSPACE_SIZE, VM_PAGE_READ | VM_PAGE_EXECUTE);
-#endif
 	jit_end_write_window();
 }
 
@@ -3509,6 +3572,17 @@ static inline unsigned int get_opcode_cft_map(unsigned int f)
 }
 #define DO_GET_OPCODE(a) (get_opcode_cft_map((uae_u16)*(a)))
 
+/* Which fl_trap opcodes force whole-block interpretation. The policy itself
+ * lives in src/jit/jit_trap_policy.h, where tests/jit_trap_policy_test.cpp can
+ * assert it without building the emulator; that header documents why each
+ * group demotes or does not. */
+static bool jit_trap_demote_opcode(uae_u32 op)
+{
+    /* op is already the true opcode (DO_GET_OPCODE mapped it once); a
+     * second get_opcode_cft_map() would index junk. See #2315. */
+    return jit_trap_demote_mnemo(table68k[op].mnemo);
+}
+
 void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 {
     if (cache_enabled && compiled_code && currprefs.cpu_model >= 68020) {
@@ -3524,9 +3598,8 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         int was_comp = 0;
         uae_u8 liveflags[MAXRUN + 1];
         bool trace_in_rom = isinrom((uintptr)pc_hist[0].location) != 0;
-#if defined(CPU_AARCH64)
         bool ram_trap_block = false;
-#endif
+        bool ram_trap_any = false;
         uintptr max_pcp = (uintptr)pc_hist[blocklen - 1].location;
         uintptr min_pcp = max_pcp;
         uae_u32 cl = cacheline(pc_hist[0].location);
@@ -3534,13 +3607,11 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         blockinfo* bi = NULL;
         blockinfo* bi2;
 		int extra_len=0;
-#if defined(CPU_AARCH64)
         const bool indirect_rtarea_block =
             currprefs.uaeboard > 2 && isinrtarea((uintptr)pc_hist[0].location) != 0;
         bool unsafe_special_mem_block = indirect_rtarea_block;
         const bool unsafe_memory_helpers = jit_use_memory_helpers();
         const bool unsafe_compile_fallbacks = jit_use_compile_fallbacks();
-#endif
 
         redo_current_block = 0;
         if (current_compile_p >= MAX_COMPILE_PTR)
@@ -3552,12 +3623,10 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         bi2 = get_blockinfo(cl);
 
         optlev = bi->optlevel;
-#if defined(CPU_AARCH64)
         /* When cpu_compatible is set, force blocks to interpreter mode */
         if (currprefs.cpu_compatible) {
             optlev = 0;
         }
-#endif
         if (bi->status != BI_INVALID) {
             Dif(bi != bi2) {
                 /* I don't think it can happen anymore. Shouldn't, in
@@ -3571,11 +3640,9 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
             }
         }
         if (bi->count == -1) {
-#if defined(CPU_AARCH64)
             if (currprefs.cpu_compatible) {
                 optlev = 0;
             } else
-#endif
             {
             optlev++;
             while (!optcount[optlev])
@@ -3611,20 +3678,23 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         bi->csi = NULL;
 
         liveflags[blocklen] = successor_flags; /* Use successor info if available, else FLAG_ALL */
+        bool has_fpu_gen = false;
         i = blocklen;
         while (i--) {
             uae_u16* currpcp = pc_hist[i].location;
             uae_u32 op = DO_GET_OPCODE(currpcp);
 
-#if defined(CPU_AARCH64)
+            if ((op & 0xff00) == 0xf200)	/* arithmetic, FScc, FBcc */
+                has_fpu_gen = true;
+
             if ((unsafe_compile_fallbacks || unsafe_memory_helpers) && pc_hist[i].specmem)
                 unsafe_special_mem_block = true;
-#endif
             trace_in_rom = trace_in_rom && isinrom((uintptr)currpcp);
-#if defined(CPU_AARCH64)
-            if ((prop[op].cflow & fl_trap) && !isinrom((uintptr)currpcp))
-                ram_trap_block = true;
-#endif
+            if ((prop[op].cflow & fl_trap) && !isinrom((uintptr)currpcp)) {
+                ram_trap_any = true;
+                if (jit_trap_demote_opcode(op))
+                    ram_trap_block = true;
+            }
             if (follow_const_jumps && is_const_jump(op)) {
                 checksum_info* csi = alloc_checksum_info();
                 csi->start_p = (uae_u8*)min_pcp;
@@ -3654,24 +3724,43 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 
         bi->needed_flags = liveflags[0];
 
-#if defined(CPU_AARCH64)
-        if (ram_trap_block) {
-            /* RAM test code can rewrite branch targets around fallback/trap opcodes
-             * before active compiled blocks are invalidated. Interpret these blocks
-             * so exception frames use the current instruction PC. */
+        if (ram_trap_block || (currprefs.cputester && ram_trap_any)) {
+            /* RAM test code can rewrite branch targets around fallback/trap
+             * opcodes before active compiled blocks are invalidated; and
+             * mixing interpreted trap/fallback opcodes with compiled flag
+             * readers inside one block can expose stale lazy-flag state.
+             * Interpret blocks carrying structural/supervisor trap opcodes
+             * (and, under the CPU tester, every trap-bearing block) so
+             * exception frames and flag capture use current state.
+             *
+             * Blocks whose only trap opcodes are hot user-mode arithmetic
+             * ones (DIVU/DIVS/DIVL, CHK) stay compiled: the opcode runs via
+             * the per-opcode fallback, which syncs the 68k PC before the
+             * interpreter handler call (#2299). */
             optlev = 0;
             bi->optlevel = optlev;
             bi->count = -1;
         }
-#endif
 
         /* This is the non-direct handler */
         was_comp = 0;
 
+        /* Start each block on a cache line. The padding is never executed. */
+        while ((uintptr)get_target() & 63)
+            _W(0xd503201f); /* NOP */
+
         bi->direct_handler = (cpuop_func*)get_target();
+        clear_fpu_chain(bi);
         set_dhtu(bi, bi->direct_handler);
         bi->status = BI_COMPILING;
         current_block_start_target = (uintptr)get_target();
+        uae_u32* fpu_enter_branch = NULL;
+        uae_u32* fpu_enter_resume = NULL;
+        int fpu_enter_mode = -1;
+        jit_fpu_host_flags = false;
+        jit_fpu_host_settle = jit_fpu_enabled() && currprefs.fpu_model;
+        jit_fpu_chain_mode = -2;
+        jit_fpu_loop_ok = true;
 
         if (bi->count >= 0) { /* Need to generate countdown code */
             compemu_raw_set_pc_i((uintptr)pc_hist[0].location);
@@ -3679,9 +3768,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
             compemu_raw_maybe_recompile();
         }
         if (optlev == 0
-#if defined(CPU_AARCH64)
             || unsafe_special_mem_block
-#endif
             ) { /* No need to actually translate */
           /* Execute normally without keeping stats */
             compemu_raw_exec_nostats((uintptr)pc_hist[0].location);
@@ -3695,6 +3782,28 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
             init_comp();
             was_comp = 1;
 
+            /* compile for the mode of the current FPCR, and recompile when
+               the block is entered in another (fpu_mode_recompile()) */
+            const bool fpu_gen = has_fpu_gen && jit_fpu_enabled() && currprefs.fpu_model;
+            int fpcr_mode = fpu_jit_fpcr_mode(regs.fpcr);
+            if (bi->fpu_trips >= FPU_JIT_FPCR_TRIPS)
+                fpcr_mode = FPU_JIT_MODE_EXACT;
+            jit_fpu_exact_block = fpcr_mode == FPU_JIT_MODE_EXACT;
+            jit_fpu_single_block = fpcr_mode == FPU_JIT_MODE_SINGLE;
+            if (fpu_gen) {
+                fpu_enter_mode = bi->fpu_trips < FPU_JIT_FPCR_TRIPS ? fpcr_mode : -1;
+                fpu_enter_branch = compemu_raw_fpu_enter(fpu_enter_mode);
+                fpu_enter_resume = (uae_u32*)get_target();
+                jit_fpu_host_flags = true;
+                jit_fpu_host_settle = false;
+                jit_fpu_chain_mode = fpu_enter_mode;
+                /* no countdown code above the entry */
+                if (bi->count < 0) {
+                    bi->fpu_mode = fpu_enter_mode;
+                    bi->fpu_resume = fpu_enter_resume;
+                }
+            }
+
             for (i = 0; i < blocklen && get_target() < MAX_COMPILE_PTR; i++) {
                 may_raise_exception = false;
                 cpuop_func** cputbl;
@@ -3702,14 +3811,12 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                 uae_u32 opcode = DO_GET_OPCODE(pc_hist[i].location);
                 needed_flags = (liveflags[i + 1] & prop[opcode].set_flags);
                 special_mem = pc_hist[i].specmem;
-#if defined(CPU_AARCH64)
                 /* Runtime data addresses can enter an indirect bank even when
                  * instruction history has no special-memory marker. Keep native
                  * multi-access operations on bounded per-access helpers without
                  * disabling unrelated opcode compilers such as the FPU JIT. */
                 if (unsafe_compile_fallbacks && jit_opcode_needs_compile_fallback(opcode))
                     special_mem |= S_READ | S_WRITE | S_N_ADDR;
-#endif
                 if (!needed_flags && currprefs.compnf) {
 #ifdef NOFLAGS_SUPPORT_GENCOMP
                     cputbl = nfcpufunctbl;
@@ -3746,6 +3853,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                         flush(1);
                         was_comp = 0;
                     }
+                    jit_fpu_loop_ok = false;
                     compemu_raw_mov_l_ri(REG_PAR1, (uae_u32)opcode);
                     compemu_raw_mov_l_rr(REG_PAR2, R_REGSTRUCT);
                     compemu_raw_set_pc_i((uintptr)pc_hist[i].location);
@@ -3767,9 +3875,10 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                     }
                 } else if (may_raise_exception) {
 #if defined(USE_DATA_BUFFER)
-                    data_check_end(8, 64);
+                    data_check_end(8, 256);
 #endif
-                    compemu_raw_handle_except(scaled_cycles(totcycles));
+                    compemu_handle_except_sync(scaled_cycles(totcycles),
+                        start_pc + (uae_u32)((uae_u8*)pc_hist[i].location - start_pc_p));
                     may_raise_exception = false;
                 }
             }
@@ -3837,7 +3946,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                 match_states(tbi);
 
                 tba = compemu_raw_endblock_pc_isconst(scaled_cycles(totcycles), t1);
-                write_jmp_target(tba, get_handler(t1));
+                write_jmp_target(tba, block_jump_target(t1));
                 create_jmpdep(bi, 0, tba, t1);
 
                 /* not-predicted outcome */
@@ -3846,7 +3955,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                 match_states(tbi);
 
                 tba = compemu_raw_endblock_pc_isconst(scaled_cycles(totcycles), t2);
-                write_jmp_target(tba, get_handler(t2));
+                write_jmp_target(tba, block_jump_target(t2));
                 create_jmpdep(bi, 1, tba, t2);
             } else {
                 if (was_comp) {
@@ -3873,7 +3982,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
                     data_check_end(4, 64);
 #endif
                     tba = compemu_raw_endblock_pc_isconst(scaled_cycles(totcycles), v);
-                    write_jmp_target(tba, get_handler(v));
+                    write_jmp_target(tba, block_jump_target(v));
                     create_jmpdep(bi, 0, tba, v);
                 } else {
                     r = REG_PC_TMP;
@@ -3883,6 +3992,21 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 #endif
                     compemu_raw_endblock_pc_inreg(r, scaled_cycles(totcycles));
                 }
+            }
+        }
+
+        /* the slow path of the FPU block entry, out of line */
+        if (fpu_enter_branch)
+            compemu_raw_fpu_enter_stub(fpu_enter_branch, fpu_enter_resume,
+                fpu_enter_mode, (uintptr)pc_hist[0].location);
+
+        /* blocks compiled earlier that jump here with the host FPSR live in
+           this block's mode may now enter past the FPU block entry */
+        bi->fpu_chain = jit_fpu_loop_ok ? jit_fpu_chain_mode : -2;
+        if (bi->fpu_resume) {
+            for (dependency* x = bi->deplist; x; x = x->next) {
+                if (x->jmp_off && x->source != bi)
+                    adjust_jmpdep(x, fpu_chain_target(x->source->fpu_chain, bi, bi->direct_handler_to_use));
             }
         }
 

@@ -93,6 +93,19 @@ class ConfigRepositoryTest {
 		assertEquals(-1, parsed.settings.floppy2Type)
 	}
 
+	@Test
+	fun `config category round trips and clears`() {
+		val file = tempDir.newFile("Workbench.uae")
+		file.writeText(ConfigGenerator.generate(EmulatorSettings()))
+		file.appendText("config_category=Games\n")
+
+		assertEquals("Games", ConfigParser.parse(file).category)
+
+		file.writeText(ConfigGenerator.generate(EmulatorSettings()))
+		assertEquals("", ConfigParser.parse(file).category)
+		assertFalse(file.readText().contains("config_category="))
+	}
+
 	// --- Duplicate config ---
 
 	@Test
@@ -133,8 +146,8 @@ class ConfigRepositoryTest {
 		val source = File("src/main/java/com/blitterstudio/amiberry/data/ConfigRepository.kt").readText()
 
 		assertTrue(
-			"ConfigRepository should expose saveResolved(...) with currentConfigName and allowOverwrite.",
-			Regex("""fun saveResolved\([\s\S]*currentConfigName[\s\S]*allowOverwrite""")
+			"ConfigRepository should expose saveResolved(...) with currentConfigPath and allowOverwrite.",
+			Regex("""fun saveResolved\([\s\S]*currentConfigPath[\s\S]*allowOverwrite""")
 				.containsMatchIn(source)
 		)
 		assertTrue(

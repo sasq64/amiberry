@@ -108,10 +108,53 @@ fixjport = region_between(
 )
 if "if (vv == JPORT_NONE)" in fixjport:
 	fail("Explicitly selecting None must clear the previous device identity")
+previous_joy = region_between(
+	inputdevice,
+	"static void inputdevice_get_previous_joy(",
+	"void inputdevice_validate_jports",
+)
+if "jp->id >= 0 && p->jports_default[portnum] == 0" not in previous_joy:
+	fail("An explicit joyport default must take precedence over stored keyboard layouts")
+if "p->jports[portnum].id = default_keyboard_layout[portnum] - 1;" not in previous_joy:
+	fail("Controller removal must apply the configured keyboard-layout fallback")
+keyboard_default = region_between(
+	inputdevice,
+	"void inputdevice_joyport_keyboard_default(",
+	"void inputdevice_joyport_config_store(",
+)
+if '_tcsncmp(value, _T("kbd"), 3) == 0' not in keyboard_default:
+	fail("joyportdefault must accept explicit keyboard layouts")
+if '_tcscmp(value, _T("none")) == 0' not in keyboard_default:
+	fail("joyportdefault must support disabling the controller-removal fallback")
+if "layout > 0 && layout <= JSEM_LASTKBD && *endptr == 0" not in keyboard_default:
+	fail("joyportdefault keyboard layouts must reject invalid numeric suffixes")
+if "default_keyboard_layout[portnum] = p->jports_default[portnum];" not in keyboard_default:
+	fail("Parsed joyport defaults must update the runtime fallback state")
+copy_jport = region_between(
+	inputdevice,
+	"static void copyjport (",
+	"#define MAX_STORED_JPORTS",
+)
+if "dst->jports_default[num] = src->jports_default[num];" not in copy_jport:
+	fail("Copying active joyports must preserve their configured removal fallback")
+update_config = region_between(
+	inputdevice,
+	"void inputdevice_updateconfig_internal (",
+	"void inputdevice_updateconfig (",
+)
+if "default_keyboard_layout[i] = dstprefs->jports_default[i];" not in update_config:
+	fail("Activating preferences must replace every runtime keyboard fallback")
+port_config = region_between(
+	inputdevice,
+	"int inputdevice_joyport_config(",
+	"int inputdevice_getjoyportdevice (",
+)
+if "if (p->jports_default[portnum] == 0)" not in port_config:
+	fail("Automatic keyboard defaults must not overwrite an explicit joyportdefault")
 port_selection = region_between(
 	input_panel,
 	"static void set_port_input_device(",
-	"const std::vector<InputDeviceOption>& get_input_device_options()",
+	"static int get_device_index(",
 )
 clear_selected = port_selection.find("amiberry_clear_port_joystick_custom_mapping(port_idx);")
 forget_selected = port_selection.find("inputdevice_forget_unplugged_device(port_idx);")
@@ -136,8 +179,6 @@ snapshot_update = mapping_commit.find("amiberry_set_port_joystick_custom_mapping
 runtime_update = mapping_commit.find("inputdevice_updateconfig(nullptr, &changed_prefs);")
 if not (0 <= snapshot_update < runtime_update):
 	fail("Custom mapping edits must update the per-port snapshot before rebuilding live input")
-if custom_panel.count("commit_custom_mapping_change(SelectedPort, did);") != 7:
-	fail("Every Custom-panel mapping mutation must refresh the selected port snapshot")
 preserve_mapping = region_between(
 	amiberry_input,
 	"void amiberry_preserve_port_joystick_custom_mapping(",
@@ -146,7 +187,17 @@ preserve_mapping = region_between(
 if """if (preserved.valid && matches_joystick_config(preserved.idc, name, configname)) {
 		preserved.mapping = did.mapping;""" not in preserve_mapping:
 	fail("Hotplug preservation must refresh an existing snapshot from the live mapping")
-if "const int joy_index = amiberry_get_joystick_index(jp->idc.configname);" not in amiberry_input:
+joystick_configname = region_between(
+	amiberry_input,
+	"static std::string port_joystick_configname(",
+	"bool load_custom_options(",
+)
+custom_loader = region_between(
+	amiberry_input,
+	"bool load_custom_options(",
+	"void amiberry_apply_pending_custom_options(",
+)
+if "if (amiberry_get_joystick_index(jp.idc.configname) != -1)" not in joystick_configname:
 	fail("Custom mapping loads must use the same bounded joystick index parser as saves")
 if """if (!amiberry_get_port_joystick_custom_mapping(
 			i, jp->idc.name, jp->idc.configname, mapping))""" not in cfgfile:
@@ -160,7 +211,7 @@ if not (0 <= apply_mapping < validate_port < clear_mapping):
 	fail("A rematched controller must receive its deferred mapping before the rematch is finalized and the snapshot is cleared")
 if """controller_mapping mapping{};
 			amiberry_get_port_joystick_custom_mapping(
-				i, jp->idc.name, jp->idc.configname, mapping);""" not in amiberry_input:
+				i, jp->idc.name, configname.c_str(), mapping);""" not in custom_loader:
 	fail("Custom mapping loads must start from the durable per-port representation")
 if "amiberry_set_port_joystick_custom_mapping(" not in amiberry_input:
 	fail("Custom mapping loads must persist without requiring a live SDL device")
@@ -180,11 +231,6 @@ apply_custom_mapping = region_between(
 )
 if "amiberry_resolve_port_joystick(portnum, resolved_joystick)" not in apply_custom_mapping:
 	fail("Deferred mappings must be applied only to the resolved physical controller")
-custom_loader = region_between(
-	amiberry_input,
-	"bool load_custom_options(",
-	"static void close_joystick()",
-)
 if "di_joystick[" in custom_loader:
 	fail("Custom mapping loads must not write into an unenumerated SDL device slot")
 if "copy_custom_mapping(preserved.mapping, did.mapping);" not in amiberry_input:

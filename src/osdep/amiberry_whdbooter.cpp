@@ -14,8 +14,6 @@
 #include <cstring>
 #include <sstream>
 #include <system_error>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include "sysdeps.h"
 #include "uae.h"
 #include "options.h"
@@ -27,11 +25,16 @@
 #include "xwin.h"
 #include "drawing.h"
 #include "midiemu.h"
-#include "registry.h"
 #include "zfile.h"
 #include "zarchive.h"
+#include "amiberry_whdload_icon.h"
 
 extern void set_last_active_config_from_media(const char* filename);
+extern void forget_loaded_config();
+#ifdef LIBRETRO
+// libretro.cpp: shows a message in the frontend (RETRO_ENVIRONMENT_SET_MESSAGE).
+extern void libretro_show_whdboot_message(const char* text);
+#endif
 extern std::string current_dir;
 
 // Use configs with 8MB Fast RAM, to make it likely
@@ -113,6 +116,26 @@ static int safe_stoi(const std::string& s, const int default_val = 0)
 {
 	try { return std::stoi(s); }
 	catch (...) { return default_val; }
+}
+
+// The Amiga sees a host file without the owner execute bit as not
+// executable, and Android and Windows copy the tools instead of linking
+// them (a symlink's own permissions allow execution). Tools that were
+// downloaded, seeded or copied in without the bit must still run.
+static void ensure_executable(const std::filesystem::path& path)
+{
+#ifndef _WIN32
+	std::error_code ec;
+	if (!std::filesystem::is_regular_file(path, ec))
+		return;
+	std::filesystem::permissions(path,
+		std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec,
+		std::filesystem::perm_options::add, ec);
+	if (ec)
+		write_log("WHDBooter - Could not make %s executable: %s\n", path.string().c_str(), ec.message().c_str());
+#else
+	(void)path;
+#endif
 }
 
 static void create_link_or_copy(const std::filesystem::path& source, const std::filesystem::path& link_path, const char* name)
@@ -339,8 +362,10 @@ void symlink_roms(struct uae_prefs* prefs)
 	}
 	write_log("WHDBoot - using kickstarts from %s\n", kickstart_path.c_str());
 
-	// These are all the kickstart rom files found in skick346.lha
-	//   http://aminet.net/package/util/boot/skick346
+	// The kickstart images WHDLoad's kickstart emulation may want, linked
+	// under the names WHDLoad expects. The matching .RTB relocation files
+	// come from skick346.lha (http://aminet.net/package/util/boot/skick346)
+	// and are downloaded on demand.
 
 	make_rom_symlink("kick31034.A1000", 2, prefs);
 	make_rom_symlink("kick33180.A500", 5, prefs);
@@ -427,6 +452,9 @@ void cd_auto_prefs(uae_prefs* prefs, char* filepath)
 	TCHAR tmp[MAX_DPATH];
 
 	write_log("\nCD Autoload: %s  \n\n", filepath);
+	// The CD builds a new machine: the configuration loaded before must not
+	// keep naming it (title, save name, Reload) (#2719).
+	forget_loaded_config();
 	set_last_active_config_from_media(filepath);
 
 	conf_path = get_configuration_path();
@@ -700,11 +728,24 @@ void set_gfx_settings(uae_prefs* prefs, const game_hardware_options& game_detail
 void set_compatibility_settings(uae_prefs* prefs, const game_hardware_options& game_detail, const bool a600_available, const bool use_aga)
 {
 	std::string line_string;
-	// CPU 68020/040 or no A600 ROM available
-	if (strcmpi(game_detail.cpu.c_str(), "68020") == 0 || strcmpi(game_detail.cpu.c_str(), "68040") == 0 || use_aga)
+	// CPU 68020/030/040, or AGA/CD32 (A1200 preset): those need at least a 68020,
+	// so a requested 68020, 68030 or 68040 is kept and anything else becomes 68020
+	const bool cpu_030 = strcmpi(game_detail.cpu.c_str(), "68030") == 0;
+	const bool cpu_020_or_040 = strcmpi(game_detail.cpu.c_str(), "68020") == 0 || strcmpi(game_detail.cpu.c_str(), "68040") == 0;
+	if (cpu_030)
+	{
+		// cpu_type has no 68030 value. cpu_model has, but unlike cpu_type it
+		// keeps the preset's 24-bit addressing, which a 68030 does not have.
+		line_string = "cpu_model=68030";
+		parse_cfg_line(prefs, line_string);
+
+		line_string = "cpu_24bit_addressing=false";
+		parse_cfg_line(prefs, line_string);
+	}
+	else if (cpu_020_or_040 || use_aga)
 	{
 		line_string = "cpu_type=";
-		line_string.append(use_aga ? "68020" : game_detail.cpu);
+		line_string.append(cpu_020_or_040 ? game_detail.cpu : "68020");
 		parse_cfg_line(prefs, line_string);
 	}
 
@@ -776,9 +817,23 @@ void set_compatibility_settings(uae_prefs* prefs, const game_hardware_options& g
 	}
 
 	// CYCLE-EXACT CPU
+	// The A600/A1200 presets whdload_auto_prefs() starts from are already fully
+	// cycle-exact. Cycle-exact needs the compatible CPU (fixup_prefs turns it
+	// back on), so turning compatible mode off has to turn cycle-exact off too.
+	// Without cycle-exact, wait for the blitter as built_in_prefs() does for
+	// presets that are not cycle-exact; fixup_prefs drops it again if the
+	// immediate blitter is selected below.
 	if (strcmpi(game_detail.cpu_exact.c_str(), "true") == 0)
 	{
 		line_string = "cpu_cycle_exact=true";
+		parse_cfg_line(prefs, line_string);
+	}
+	else if (strcmpi(game_detail.cpu_exact.c_str(), "false") == 0 || strcmpi(game_detail.cpu_comp.c_str(), "false") == 0)
+	{
+		line_string = "cycle_exact=false";
+		parse_cfg_line(prefs, line_string);
+
+		line_string = "waiting_blits=automatic";
 		parse_cfg_line(prefs, line_string);
 	}
 
@@ -1025,65 +1080,96 @@ game_hardware_options parse_settings_from_json(uae_prefs* prefs, const char* fil
 	auto sha1 = my_get_sha1_of_file(filepath);
 	std::transform(sha1.begin(), sha1.end(), sha1.begin(),
 		[](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+	if (!sha1.empty())
+		write_log("WHDBooter - Archive SHA1: %s\n", sha1.c_str());
+
+	const nlohmann::json* selected_game = nullptr;
+	bool matched_by_sha1 = false;
 
 	for (const auto& game : doc["games"])
 	{
-		std::string entry_filename = game.value("filename", "");
 		std::string entry_sha1 = game.value("sha1", "");
+		std::transform(entry_sha1.begin(), entry_sha1.end(), entry_sha1.begin(),
+			[](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
 
-		if (entry_filename != whdload_prefs.filename && entry_sha1 != sha1)
-			continue;
-
-		whdload_prefs.game_name = game.value("name", "");
-		whdload_prefs.sub_path = game.value("subpath", "");
-		whdload_prefs.variant_uuid = game.value("variant_uuid", "");
-		whdload_prefs.slave_count = game.value("slave_count", 0);
-		whdload_prefs.slave_default = game.value("slave_default", "");
-		whdload_prefs.slave_libraries = game.value("slave_libraries", false);
-
-		write_log("WHDBooter - Selected Slave: %s \n", whdload_prefs.slave_default.c_str());
-
-		whdload_prefs.slaves.clear();
-		if (game.contains("slaves") && game["slaves"].is_array())
+		if (!sha1.empty() && entry_sha1 == sha1)
 		{
-			for (const auto& slave_json : game["slaves"])
+			selected_game = &game;
+			matched_by_sha1 = true;
+			break;
+		}
+
+		std::string entry_filename = game.value("filename", "");
+		if (entry_filename == whdload_prefs.filename)
+		{
+			selected_game = &game;
+		}
+	}
+
+	if (!selected_game)
+	{
+		write_log("WHDBooter - No matching entry found in whdload_db.json\n");
+		return game_detail;
+	}
+
+	if (matched_by_sha1)
+	{
+		write_log("WHDBooter - Matched entry by SHA1 (%s)\n", sha1.c_str());
+	}
+	else
+	{
+		write_log("WHDBooter - Matched entry by filename (%s)\n", whdload_prefs.filename.c_str());
+	}
+
+	const auto& game = *selected_game;
+	whdload_prefs.game_name = game.value("name", "");
+	whdload_prefs.sub_path = game.value("subpath", "");
+	whdload_prefs.variant_uuid = game.value("variant_uuid", "");
+	whdload_prefs.slave_count = game.value("slave_count", 0);
+	whdload_prefs.slave_default = game.value("slave_default", "");
+	whdload_prefs.slave_libraries = game.value("slave_libraries", false);
+	whdload_prefs.exp_chip = game.value("exp_chip", false);
+
+	write_log("WHDBooter - Selected Slave: %s \n", whdload_prefs.slave_default.c_str());
+
+	whdload_prefs.slaves.clear();
+	if (game.contains("slaves") && game["slaves"].is_array())
+	{
+		for (const auto& slave_json : game["slaves"])
+		{
+			whdload_slave slave;
+			slave.filename = slave_json.value("filename", "");
+			slave.data_path = slave_json.value("datapath", "");
+
+			if (slave_json.contains("custom_fields") && slave_json["custom_fields"].is_array())
 			{
-				whdload_slave slave;
-				slave.filename = slave_json.value("filename", "");
-				slave.data_path = slave_json.value("datapath", "");
+				parse_slave_custom_fields_from_json(slave, slave_json["custom_fields"]);
+			}
 
-				if (slave_json.contains("custom_fields") && slave_json["custom_fields"].is_array())
-				{
-					parse_slave_custom_fields_from_json(slave, slave_json["custom_fields"]);
-				}
+			whdload_prefs.slaves.emplace_back(slave);
 
-				whdload_prefs.slaves.emplace_back(slave);
+			if (slave.filename == whdload_prefs.slave_default)
+				whdload_prefs.selected_slave = slave;
+		}
+	}
 
-				if (slave.filename == whdload_prefs.slave_default)
-					whdload_prefs.selected_slave = slave;
+	if (game.contains("hardware") && game["hardware"].is_object())
+	{
+		game_detail = get_game_hardware_from_json(game["hardware"]);
+		write_log("WHDBooter - Game H/W Settings loaded from JSON\n");
+	}
+
+	if (game.contains("custom_controls") && game["custom_controls"].is_array())
+	{
+		for (const auto& line : game["custom_controls"])
+		{
+			std::string cfg_line = line.get<std::string>();
+			if (!cfg_line.empty())
+			{
+				parse_cfg_line(prefs, cfg_line);
 			}
 		}
-
-		if (game.contains("hardware") && game["hardware"].is_object())
-		{
-			game_detail = get_game_hardware_from_json(game["hardware"]);
-			write_log("WHDBooter - Game H/W Settings loaded from JSON\n");
-		}
-
-		if (game.contains("custom_controls") && game["custom_controls"].is_array())
-		{
-			for (const auto& line : game["custom_controls"])
-			{
-				std::string cfg_line = line.get<std::string>();
-				if (!cfg_line.empty())
-				{
-					parse_cfg_line(prefs, cfg_line);
-				}
-			}
-			write_log("WHDBooter - Game Custom Settings loaded from JSON\n");
-		}
-
-		break;
+		write_log("WHDBooter - Game Custom Settings loaded from JSON\n");
 	}
 
 	return game_detail;
@@ -1113,6 +1199,8 @@ game_hardware_options parse_settings_from_xml(uae_prefs* prefs, const char* file
 	auto sha1 = my_get_sha1_of_file(filepath);
 	std::transform(sha1.begin(), sha1.end(), sha1.begin(),
 		[](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+	if (!sha1.empty())
+		write_log("WHDBooter - Archive SHA1: %s\n", sha1.c_str());
 
 	auto* root_element = doc.FirstChildElement("whdbooter");
 	if (!root_element)
@@ -1120,110 +1208,140 @@ game_hardware_options parse_settings_from_xml(uae_prefs* prefs, const char* file
 		write_log(_T("WHDBooter - whdload_db.xml has no <whdbooter> root element\n"));
 		return {};
 	}
-	tinyxml2::XMLElement* game_node = root_element->FirstChildElement("game");
-	while (game_node != nullptr)
+	tinyxml2::XMLElement* selected_game = nullptr;
+	bool matched_by_sha1 = false;
+
+	for (tinyxml2::XMLElement* game_node = root_element->FirstChildElement("game");
+		game_node != nullptr;
+		game_node = game_node->NextSiblingElement())
 	{
-		// Ideally we'd just match by sha1, but filename has worked up until now, so try that first
-		// then fall back to sha1 if a user has renamed the file!
-		//
-		if (game_node->Attribute("filename", whdload_prefs.filename.c_str()) || 
-			game_node->Attribute("sha1", sha1.c_str()))
+		const char* entry_sha1_attr = game_node->Attribute("sha1");
+		if (!sha1.empty() && entry_sha1_attr != nullptr)
 		{
-			auto xml_element = game_node->FirstChildElement("name");
-			if (xml_element && xml_element->GetText())
+			std::string entry_sha1 = entry_sha1_attr;
+			std::transform(entry_sha1.begin(), entry_sha1.end(), entry_sha1.begin(),
+				[](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+			if (entry_sha1 == sha1)
 			{
-				whdload_prefs.game_name.assign(xml_element->GetText());
+				selected_game = game_node;
+				matched_by_sha1 = true;
+				break;
 			}
-
-			xml_element = game_node->FirstChildElement("subpath");
-			if (xml_element && xml_element->GetText())
-			{
-				whdload_prefs.sub_path.assign(xml_element->GetText());
-			}
-
-			xml_element = game_node->FirstChildElement("variant_uuid");
-			if (xml_element && xml_element->GetText())
-			{
-				whdload_prefs.variant_uuid.assign(xml_element->GetText());
-			}
-
-			xml_element = game_node->FirstChildElement("slave_count");
-			if (xml_element)
-			{
-				whdload_prefs.slave_count = xml_element->IntText(0);
-			}
-
-			xml_element = game_node->FirstChildElement("slave_default");
-			if (xml_element && xml_element->GetText())
-			{
-				whdload_prefs.slave_default.assign(xml_element->GetText());
-				write_log("WHDBooter - Selected Slave: %s \n", whdload_prefs.slave_default.c_str());
-			}
-
-			xml_element = game_node->FirstChildElement("slave_libraries");
-			if (xml_element && xml_element->GetText() != nullptr)
-			{
-				if (strcmpi(xml_element->GetText(), "true") == 0)
-					whdload_prefs.slave_libraries = true;
-			}
-
-			xml_element = game_node->FirstChildElement("slave");
-			whdload_prefs.slaves.clear();
-
-			for (int i = 0; i < whdload_prefs.slave_count && xml_element; ++i)
-			{
-				whdload_slave slave;
-				const char* slave_text = nullptr;
-
-				auto* filename_elem = xml_element->FirstChildElement("filename");
-				if (filename_elem && (slave_text = filename_elem->GetText()))
-					slave.filename.assign(slave_text);
-
-				auto* datapath_elem = xml_element->FirstChildElement("datapath");
-				if (datapath_elem && (slave_text = datapath_elem->GetText()))
-					slave.data_path.assign(slave_text);
-
-				auto customElement = xml_element->FirstChildElement("custom");
-				if (customElement && ((slave_text = customElement->GetText())))
-				{
-					auto custom = std::string(slave_text);
-					parse_slave_custom_fields(slave, custom);
-				}
-
-				whdload_prefs.slaves.emplace_back(slave);
-
-				// Set the default slave as the selected one
-				if (slave.filename == whdload_prefs.slave_default)
-					whdload_prefs.selected_slave = slave;
-
-				xml_element = xml_element->NextSiblingElement("slave");
-			}
-
-			xml_element = game_node->FirstChildElement("hardware");
-			if (xml_element && xml_element->GetText())
-			{
-				std::string hardware(xml_element->GetText());
-				if (!hardware.empty())
-				{
-					game_detail = get_game_hardware_settings(hardware);
-					write_log("WHDBooter - Game H/W Settings: \n%s\n", hardware.c_str());
-				}
-			}
-
-			xml_element = game_node->FirstChildElement("custom_controls");
-			if (xml_element && xml_element->GetText())
-			{
-				std::string custom_settings(xml_element->GetText());
-				if (!custom_settings.empty())
-				{
-					parse_custom_settings(prefs, custom_settings);
-					write_log("WHDBooter - Game Custom Settings: \n%s\n", custom_settings.c_str());
-				}
-			}
-
-			break;
 		}
-		game_node = game_node->NextSiblingElement();
+
+		const char* entry_filename_attr = game_node->Attribute("filename");
+		if (entry_filename_attr != nullptr && whdload_prefs.filename == entry_filename_attr)
+		{
+			selected_game = game_node;
+		}
+	}
+
+	if (!selected_game)
+	{
+		write_log(_T("WHDBooter - No matching entry found in whdload_db.xml\n"));
+		return game_detail;
+	}
+
+	if (matched_by_sha1)
+	{
+		write_log("WHDBooter - Matched entry by SHA1 (%s)\n", sha1.c_str());
+	}
+	else
+	{
+		write_log("WHDBooter - Matched entry by filename (%s)\n", whdload_prefs.filename.c_str());
+	}
+
+	tinyxml2::XMLElement* game_node = selected_game;
+	auto xml_element = game_node->FirstChildElement("name");
+	if (xml_element && xml_element->GetText())
+	{
+		whdload_prefs.game_name.assign(xml_element->GetText());
+	}
+
+	xml_element = game_node->FirstChildElement("subpath");
+	if (xml_element && xml_element->GetText())
+	{
+		whdload_prefs.sub_path.assign(xml_element->GetText());
+	}
+
+	xml_element = game_node->FirstChildElement("variant_uuid");
+	if (xml_element && xml_element->GetText())
+	{
+		whdload_prefs.variant_uuid.assign(xml_element->GetText());
+	}
+
+	xml_element = game_node->FirstChildElement("slave_count");
+	if (xml_element)
+	{
+		whdload_prefs.slave_count = xml_element->IntText(0);
+	}
+
+	xml_element = game_node->FirstChildElement("slave_default");
+	if (xml_element && xml_element->GetText())
+	{
+		whdload_prefs.slave_default.assign(xml_element->GetText());
+		write_log("WHDBooter - Selected Slave: %s \n", whdload_prefs.slave_default.c_str());
+	}
+
+	xml_element = game_node->FirstChildElement("slave_libraries");
+	if (xml_element && xml_element->GetText() != nullptr)
+	{
+		if (strcmpi(xml_element->GetText(), "true") == 0)
+			whdload_prefs.slave_libraries = true;
+	}
+
+	xml_element = game_node->FirstChildElement("slave");
+	whdload_prefs.slaves.clear();
+
+	for (int i = 0; i < whdload_prefs.slave_count && xml_element; ++i)
+	{
+		whdload_slave slave;
+		const char* slave_text = nullptr;
+
+		auto* filename_elem = xml_element->FirstChildElement("filename");
+		if (filename_elem && (slave_text = filename_elem->GetText()))
+			slave.filename.assign(slave_text);
+
+		auto* datapath_elem = xml_element->FirstChildElement("datapath");
+		if (datapath_elem && (slave_text = datapath_elem->GetText()))
+			slave.data_path.assign(slave_text);
+
+		auto customElement = xml_element->FirstChildElement("custom");
+		if (customElement && ((slave_text = customElement->GetText())))
+		{
+			auto custom = std::string(slave_text);
+			parse_slave_custom_fields(slave, custom);
+		}
+
+		whdload_prefs.slaves.emplace_back(slave);
+
+		// Set the default slave as the selected one
+		if (slave.filename == whdload_prefs.slave_default)
+			whdload_prefs.selected_slave = slave;
+
+		xml_element = xml_element->NextSiblingElement("slave");
+	}
+
+	xml_element = game_node->FirstChildElement("hardware");
+	if (xml_element && xml_element->GetText())
+	{
+		std::string hardware(xml_element->GetText());
+		if (!hardware.empty())
+		{
+			game_detail = get_game_hardware_settings(hardware);
+			write_log("WHDBooter - Game H/W Settings: \n%s\n", hardware.c_str());
+		}
+	}
+
+	xml_element = game_node->FirstChildElement("custom_controls");
+	if (xml_element && xml_element->GetText())
+	{
+		std::string custom_settings(xml_element->GetText());
+		if (!custom_settings.empty())
+		{
+			parse_custom_settings(prefs, custom_settings);
+			write_log("WHDBooter - Game Custom Settings: \n%s\n", custom_settings.c_str());
+		}
 	}
 
 	return game_detail;
@@ -1441,6 +1559,177 @@ static std::string selected_slave_sub_path()
 	return whdload_prefs.sub_path;
 }
 
+// The icons in the game drawer `drawer` of an archive or a directory.
+static std::vector<WhdloadIcon> read_drawer_icons(const char* filepath, const std::string& drawer)
+{
+	// Icons with pictures stay far below this; anything bigger is not one.
+	constexpr uae_s64 max_icon_size = 1024 * 1024;
+	const auto is_icon_name = [](const std::string& name) {
+		const auto lower_name = lowercase_string(name);
+		return lower_name.length() > 5 &&
+			lower_name.compare(lower_name.length() - 5, 5, ".info") == 0;
+	};
+
+	std::vector<WhdloadIcon> icons;
+	const auto add_icon = [&](const std::string& name, const std::vector<uae_u8>& data) {
+		std::vector<std::string> tooltypes;
+		if (whdload_icon_tooltypes(data.data(), data.size(), tooltypes))
+			icons.push_back({ name.substr(0, name.length() - 5), whdload_icon_args(tooltypes) });
+	};
+
+	std::error_code ec;
+	if (std::filesystem::is_directory(filepath, ec))
+	{
+		const std::filesystem::path dir = drawer.empty()
+			? std::filesystem::path(filepath)
+			: std::filesystem::path(filepath) / drawer;
+		std::filesystem::directory_iterator it(dir, ec);
+		const std::filesystem::directory_iterator end;
+		for (; !ec && it != end; it.increment(ec))
+		{
+			std::error_code entry_ec;
+			const auto name = it->path().filename().string();
+			if (!it->is_regular_file(entry_ec) || entry_ec || !is_icon_name(name))
+				continue;
+			const auto size = it->file_size(entry_ec);
+			if (entry_ec || size == 0 || size > static_cast<uintmax_t>(max_icon_size))
+				continue;
+			std::vector<uae_u8> data(static_cast<size_t>(size));
+			std::ifstream file(it->path(), std::ios::binary);
+			if (file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size())))
+				add_icon(name, data);
+		}
+		return icons;
+	}
+
+	// Archive members are opened by their node's full name: a path built with
+	// '/' does not match a member on Windows, where the names use '\'.
+	std::lock_guard<std::recursive_mutex> archive_guard(zarchive_access_mutex);
+	struct zvolume* zv = zfile_fopen_archive(filepath);
+	if (!zv)
+		return icons;
+	struct znode* node = zv->root.child;
+	std::istringstream components(drawer);
+	std::string component;
+	while (node && std::getline(components, component, '/'))
+	{
+		while (node && !(node->name && strcmpi(node->name, component.c_str()) == 0 && node->child))
+			node = node->sibling;
+		node = node ? node->child : nullptr;
+	}
+	for (; node; node = node->sibling)
+	{
+		if (node->type != ZNODE_FILE || !node->name || !node->fullname || !is_icon_name(node->name))
+			continue;
+		if (node->size <= 0 || node->size > max_icon_size)
+			continue;
+		struct zfile* f = zfile_open_archive(node->fullname, 0);
+		if (!f)
+			continue;
+		std::vector<uae_u8> data(static_cast<size_t>(node->size));
+		if (zfile_fread(data.data(), 1, data.size(), f) == data.size())
+			add_icon(node->name, data);
+	}
+	zfile_fclose_archive(zv); // closes the members' zfiles as well
+	return icons;
+}
+
+// WHDLoad options that the game's icon sets in its tool types: the CUSTOM1-5
+// values and the CUSTOM text. Applied before a per-game config, which keeps
+// the user's own choices.
+static void apply_icon_tooltypes(const char* filepath)
+{
+	auto& selected = whdload_prefs.selected_slave;
+	if (selected.filename.empty())
+		return;
+
+	const std::string drawer = selected_slave_sub_path();
+	const auto icons = read_drawer_icons(filepath, drawer);
+	const std::string drawer_name = drawer.substr(drawer.find_last_of('/') + 1);
+	const auto* icon = whdload_pick_icon(icons, drawer_name, selected.filename);
+	if (!icon)
+	{
+		if (!icons.empty())
+			write_log("WHDBooter - No single icon in \"%s\" starts %s; tool types not used\n",
+				drawer.c_str(), selected.filename.c_str());
+		return;
+	}
+
+	std::string applied;
+	for (int i = 1; i <= 5; ++i)
+	{
+		const auto& value = icon->args.custom[i - 1];
+		if (!value)
+			continue;
+		selected.get_custom(i).value = *value;
+		for (auto& slave : whdload_prefs.slaves)
+		{
+			if (strcmpi(slave.filename.c_str(), selected.filename.c_str()) == 0 && slave.sub_path == selected.sub_path)
+				slave.get_custom(i).value = *value;
+		}
+		applied += " CUSTOM" + std::to_string(i) + "=" + std::to_string(*value);
+	}
+	if (icon->args.custom_text)
+	{
+		whdload_prefs.custom = *icon->args.custom_text;
+		applied += " CUSTOM=\"" + whdload_prefs.custom + "\"";
+	}
+	if (!applied.empty())
+		write_log("WHDBooter - Tool types from icon %s.info:%s\n", icon->name.c_str(), applied.c_str());
+}
+
+// A per-game config restores only the selected slave's filename (and, from
+// configs saved since, its whdload_slave_sub_path). Re-pair it with the
+// auto-detected slave it names, so a slave from a drawer other than the
+// default doesn't boot from the default's drawer: keep an exact
+// filename + drawer match, else take the first slave with that filename.
+static void reconcile_auto_detected_slave()
+{
+	auto& selected = whdload_prefs.selected_slave;
+	if (!selected.has_sub_path || selected.filename.empty())
+		return;
+	const whdload_slave* by_name = nullptr;
+	for (const auto& slave : whdload_prefs.slaves)
+	{
+		if (strcmpi(slave.filename.c_str(), selected.filename.c_str()) != 0)
+			continue;
+		if (slave.sub_path == selected.sub_path)
+			return;
+		if (!by_name)
+			by_name = &slave;
+	}
+	if (by_name)
+		selected.sub_path = by_name->sub_path;
+}
+
+// True when the WHDBoot folder's Libs drawer holds one of the optional
+// Amiga libraries the download installs (the XPK stack with its
+// Compressors drawer, MMULib's 68040.library, explode.library,
+// medplayer.library). Those cannot ship inside boot-data.zip, which is
+// read-only in the bundle, so the download puts them in a real directory
+// the booter mounts as an extra volume and appends to LIBS:.
+static bool whdboot_downloaded_libraries_present()
+{
+	std::error_code ec;
+	const std::filesystem::path libraries_path = whdbooter_path / "Libs";
+	if (!std::filesystem::is_directory(libraries_path, ec))
+		return false;
+	try
+	{
+		for (const auto& entry : std::filesystem::directory_iterator(libraries_path))
+		{
+			if (entry.is_regular_file())
+				return true;
+		}
+	}
+	catch (const std::filesystem::filesystem_error& e)
+	{
+		write_log("WHDBooter - could not scan %s: %s\n",
+			libraries_path.string().c_str(), e.what());
+	}
+	return false;
+}
+
 void create_startup_sequence()
 {
 	std::ostringstream whd_bootscript;
@@ -1448,6 +1737,19 @@ void create_startup_sequence()
 
 	if (whdload_prefs.slave_libraries)
 		whd_bootscript << "DH3:C/Assign LIBS: DH3:LIBS/ ADD\n";
+
+	// The libraries downloaded on demand are mounted as DH4:; appending
+	// the volume to LIBS: also puts its Compressors drawer within reach of
+	// xpkmaster.library as LIBS:Compressors. The assign is guarded:
+	// DH4: is only mounted by set_booter_drives(), and a per-game config
+	// (or a script regenerated from the WHDLoad panel) may not have it, so
+	// a bare assign would stop the boot with an "insert volume" requester.
+	// "Assign DH4: EXISTS" only sets WARN when it is absent.
+	if (whdboot_downloaded_libraries_present())
+		whd_bootscript << "DH3:C/Assign >NIL: DH4: EXISTS\n"
+			"IF NOT WARN\n"
+			"DH3:C/Assign LIBS: DH4: ADD\n"
+			"ENDIF\n";
 
 	if (amiberry_options.use_jst_instead_of_whd)
 		whd_bootscript << "IF NOT EXISTS JST\n";
@@ -1479,6 +1781,11 @@ void create_startup_sequence()
 		else
 			whd_bootscript << " NOWRITECACHE";
 	}
+
+	// EXPCHIP: the slave's expansion memory must come from Chip RAM. JST
+	// has no such option.
+	if (whdload_prefs.exp_chip && !amiberry_options.use_jst_instead_of_whd)
+		whd_bootscript << " EXPCHIP";
 
 	// CUSTOM options
 	for (int i = 1; i <= 5; ++i) {
@@ -1523,7 +1830,7 @@ void create_startup_sequence()
 	// Launches utility program to quit the emulator (via a UAE trap in RTAREA)
 	if (whdload_prefs.quit_on_exit)
 	{
-		whd_bootscript << "DH0:C/AmiQuit\n";
+		whd_bootscript << "DH0:C/host-quit\n";
 	}
 
 	write_log("WHDBooter - Created Startup-Sequence  \n\n%s\n", whd_bootscript.str().c_str());
@@ -1574,6 +1881,23 @@ void set_booter_drives(uae_prefs* prefs, const char* filepath)
 	cfgfile_parse_line(prefs, parsed, 0);
 	xfree(parsed);
 
+	// The optional Amiga libraries (downloaded on demand) get their own
+	// read-write volume, so nothing ever writes into the bundled
+	// boot-data.zip.
+	if (whdboot_downloaded_libraries_present())
+	{
+		boot_path = whdbooter_path / "Libs";
+		tmp = "filesystem2=rw,DH4:Libs:" + boot_path.string() + ",-10";
+		parsed = parse_text(tmp.c_str());
+		cfgfile_parse_line(prefs, parsed, 0);
+		xfree(parsed);
+
+		tmp = "uaehf4=dir,rw,DH4:Libs::" + boot_path.string() + ",-10";
+		parsed = parse_text(tmp.c_str());
+		cfgfile_parse_line(prefs, parsed, 0);
+		xfree(parsed);
+	}
+
 	tmp = "filesystem2=rw,DH1:Games:\"" + std::string(filepath) + "\",0";
 	parsed = parse_text(tmp.c_str());
 	cfgfile_parse_line(prefs, parsed, 0);
@@ -1598,15 +1922,47 @@ void set_booter_drives(uae_prefs* prefs, const char* filepath)
 	}
 }
 
+#ifdef __ANDROID__
+// True when the configuration file loaded into prefs carries an explicit option
+// line. Mirrors cfgfile's all_lines lookup: every parsed (known or unknown)
+// option of the loaded file is listed there.
+static bool loaded_config_has_option(const uae_prefs* prefs, const TCHAR* option)
+{
+	for (auto* sl = prefs->all_lines; sl != nullptr; sl = sl->next) {
+		if (sl->option != nullptr && _tcsicmp(sl->option, option) == 0)
+			return true;
+	}
+	return false;
+}
+#endif
+
+// Diagnostic early-exit modes (--dump-config) resolve WHDLoad preferences
+// through whdload_auto_prefs() without preparing the host for a real boot:
+// the booter temp tree, the startup-sequence and the save-data Kickstart
+// links are transient launch state, not part of the resolved configuration.
+static bool whdload_host_writes_suppressed = false;
+
+void whdload_set_host_writes_enabled(const bool enabled)
+{
+	whdload_host_writes_suppressed = !enabled;
+}
+
 void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool preserve_quickstart_hardware)
 {
 #ifdef __ANDROID__
 	const bool android_onscreen_joystick = prefs->onscreen_joystick;
 	const bool android_vkbd_enabled = prefs->vkbd_enabled;
+	const bool android_vkbd_touch_button = prefs->vkbd_touch_button;
 	const bool android_vkbd_numpad = prefs->vkbd_numpad;
 	const bool android_input_default_osk = prefs->input_default_onscreen_keyboard;
+	TCHAR android_vkbd_toggle[256];
+	_tcscpy(android_vkbd_toggle, prefs->vkbd_toggle);
 #endif
 
+	// A WHDLoad game builds a new machine, or loads the game's own
+	// configuration below: the configuration loaded before must not keep
+	// naming it (title, save name, Reload) (#2719).
+	forget_loaded_config();
 	set_last_active_config_from_media(filepath);
 
 	config_loaded = false;
@@ -1617,8 +1973,10 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	whdload_prefs.slave_count = 0;
 	whdload_prefs.slave_default.clear();
 	whdload_prefs.slave_libraries = false;
+	whdload_prefs.exp_chip = false;
 	whdload_prefs.slaves.clear();
 	whdload_prefs.selected_slave = whdload_slave{};
+	whdload_prefs.custom.clear();
 
 	write_log("WHDBooter Launched\n");
 	if (amiberry_options.use_jst_instead_of_whd)
@@ -1628,7 +1986,8 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	whdbooter_path = get_whdbootpath();
 	save_path = get_savedatapath(false);
 
-	symlink_roms(prefs);
+	if (!whdload_host_writes_suppressed)
+		symlink_roms(prefs);
 
 	// this allows A600HD to be used to slow games down
 	const auto a600_available = is_a600_available(prefs);
@@ -1645,35 +2004,38 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	const auto* filename = my_getfilepart(filepath);
 	const std::string filename_no_extension = get_game_filename(filepath);
 	whdload_prefs.filename = filename_no_extension;
-
 	// setup for tmp folder.
 	std::filesystem::path temp_base = get_whdboot_temp_path();
-	// Clean up any stale files from previous runs to ensure a fresh tmp
-	// This helps avoid stale/broken symlinks causing WHDLoad not found
-	try {
-		if (std::filesystem::exists(temp_base)) {
-			write_log("WHDBooter - Cleaning existing tmp directory %s\n", temp_base.string().c_str());
-			std::filesystem::remove_all(temp_base);
+	if (!whdload_host_writes_suppressed) {
+		// Clean up any stale files from previous runs to ensure a fresh tmp
+		// This helps avoid stale/broken symlinks causing WHDLoad not found
+		try {
+			if (std::filesystem::exists(temp_base)) {
+				write_log("WHDBooter - Cleaning existing tmp directory %s\n", temp_base.string().c_str());
+				std::filesystem::remove_all(temp_base);
+			}
+		}
+		catch (std::filesystem::filesystem_error &e) {
+			write_log("WHDBooter - Failed to clean tmp directory %s: %s\n", temp_base.string().c_str(), e.what());
+		}
+
+		try {
+			std::filesystem::create_directories(temp_base / "s");
+			std::filesystem::create_directories(temp_base / "c");
+			std::filesystem::create_directories(temp_base / "devs");
+		}
+		catch (std::filesystem::filesystem_error& e) {
+			write_log("WHDBooter - Failed to create tmp directories: %s\n", e.what());
 		}
 	}
-	catch (std::filesystem::filesystem_error &e) {
-		write_log("WHDBooter - Failed to clean tmp directory %s: %s\n", temp_base.string().c_str(), e.what());
-	}
-
-	try {
-		std::filesystem::create_directories(temp_base / "s");
-		std::filesystem::create_directories(temp_base / "c");
-		std::filesystem::create_directories(temp_base / "devs");
-	}
-	catch (std::filesystem::filesystem_error& e) {
-		write_log("WHDBooter - Failed to create tmp directories: %s\n", e.what());
-	}
 	whd_startup = (temp_base / "s" / "startup-sequence").string();
-	try {
-		std::filesystem::remove(whd_startup);
-	}
-	catch (std::filesystem::filesystem_error& e) {
-		write_log("WHDBooter - Failed to remove old startup-sequence: %s\n", e.what());
+	if (!whdload_host_writes_suppressed) {
+		try {
+			std::filesystem::remove(whd_startup);
+		}
+		catch (std::filesystem::filesystem_error& e) {
+			write_log("WHDBooter - Failed to remove old startup-sequence: %s\n", e.what());
+		}
 	}
 
 	// are we using save-data/ ?
@@ -1717,12 +2079,15 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 		}
 	}
 
+	apply_icon_tooltypes(filepath);
+
 	build_uae_config_filename(whdload_prefs.filename);
 	if (!preserve_quickstart_hardware && std::filesystem::exists(uae_config))
 	{
 		write_log("WHDBooter - %s found. Loading Config for WHDLoad options.\n", uae_config.c_str());
 		target_cfgfile_load(prefs, uae_config.c_str(), CONFIG_TYPE_DEFAULT, 0);
 		config_loaded = true;
+		reconcile_auto_detected_slave();
 	}
 	else if (preserve_quickstart_hardware && std::filesystem::exists(uae_config))
 	{
@@ -1731,7 +2096,8 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 
 	if (!whdload_prefs.selected_slave.filename.empty())
 	{
-		create_startup_sequence();
+		if (!whdload_host_writes_suppressed)
+			create_startup_sequence();
 	}
 	else
 	{
@@ -1739,18 +2105,67 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 		write_log("WHDBooter - The game may not boot correctly\n");
 	}
 
-	if (std::filesystem::exists(whd_startup))
+	if (!whdload_host_writes_suppressed && std::filesystem::exists(whd_startup))
 	{
+		const char* boot_tool = amiberry_options.use_jst_instead_of_whd ? "JST" : "WHDLoad";
+		if (!std::filesystem::exists(whdbooter_path / boot_tool))
+		{
+			// WHDLoad (Bert Jahn, whdload.de), JST (freeware, Aminet) and the
+			// skick346 kickstart RTB files are not bundled with Amiberry: their
+			// licences forbid redistribution. They are downloaded only on
+			// request, so say what is missing, where it comes from and how to
+			// get it - worded for the front end in use - instead of fetching
+			// anything silently.
+			const char* boot_tool_source = amiberry_options.use_jst_instead_of_whd
+				? "JST (freeware) comes from Aminet (aminet.net/game/patch/jst.lha)"
+				: "WHDLoad by Bert Jahn comes from whdload.de";
+			char message[512];
+#if defined(LIBRETRO)
+			// The core cannot download anything: tell the user where the
+			// missing tool belongs.
+			snprintf(message, sizeof message, "%s is not installed. %s. Put it in '%s'.",
+				boot_tool, boot_tool_source, (whdbooter_path / boot_tool).string().c_str());
+			write_log("WHDBooter - %s\n", message);
+			libretro_show_whdboot_message(message);
+#elif defined(AMIBERRY_NATIVE_HOST)
+			snprintf(message, sizeof message,
+				"%s is not installed.\n%s.\nDownload it with App Settings \u2192 WHDLoad, "
+				"or the Paths panel's 'Update WHDBooter files' button.",
+				boot_tool, boot_tool_source);
+			write_log("WHDBooter - %s\n", message);
+			// Immediate where the main thread runs this (quick play, a
+			// drop); otherwise it waits for the next settings window.
+			if (is_mainthread())
+				native_host_message(boot_tool, message);
+			else
+				native_host_message_deferred(message);
+#elif defined(__ANDROID__)
+			snprintf(message, sizeof message,
+				"%s is not installed.\n%s.\nDownload it from App Settings \u2192 WHDLoad.",
+				boot_tool, boot_tool_source);
+			write_log("WHDBooter - %s\n", message);
+			gui_message("%s", message);
+#else
+			snprintf(message, sizeof message,
+				"%s is not installed.\n%s.\nUse the Paths panel's 'Update WHDBooter files' button "
+				"or --download-whdboot to download it.", boot_tool, boot_tool_source);
+			write_log("WHDBooter - %s\n", message);
+			gui_message("%s", message);
+#endif
+		}
 		if (amiberry_options.use_jst_instead_of_whd)
 		{
+			ensure_executable(whdbooter_path / "JST");
 			create_link_or_copy(whdbooter_path / "JST", temp_base / "c" / "JST", "JST");
 		}
 		else
 		{
+			ensure_executable(whdbooter_path / "WHDLoad");
 			create_link_or_copy(whdbooter_path / "WHDLoad", temp_base / "c" / "WHDLoad", "WHDLoad");
 		}
 
-		create_link_or_copy(whdbooter_path / "AmiQuit", temp_base / "c" / "AmiQuit", "AmiQuit");
+		ensure_executable(whdbooter_path / "host-quit");
+		create_link_or_copy(whdbooter_path / "host-quit", temp_base / "c" / "host-quit", "host-quit");
 		create_link_or_copy(kickstart_path, temp_base / "devs" / "Kickstarts", "Kickstarts");
 	}
 #if DEBUG
@@ -1789,6 +2204,22 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	if (config_loaded)
 	{
 		write_log("WHDBooter - %s found; ignoring WHD Quickstart setup.\n", uae_config.c_str());
+#ifdef __ANDROID__
+		// target_cfgfile_load() above reset the preferences before applying the
+		// sidecar, dropping the launcher's on-screen keyboard selection. Explicit
+		// sidecar lines win (for vkbd_toggle: button name, empty = disabled, or
+		// the "default" sentinel); absent keys restore the captured launcher
+		// values so the selected keyboard access still applies.
+		if (!loaded_config_has_option(prefs, _T("amiberry.vkbd_toggle")))
+		{
+			write_log("WHDBooter - Sidecar has no vkbd_toggle; restoring Android toggle '%s'\n", android_vkbd_toggle);
+			_tcscpy(prefs->vkbd_toggle, android_vkbd_toggle);
+		}
+		if (!loaded_config_has_option(prefs, _T("amiberry.vkbd_enabled")))
+			prefs->vkbd_enabled = android_vkbd_enabled;
+		if (!loaded_config_has_option(prefs, _T("amiberry.vkbd_touch_button")))
+			prefs->vkbd_touch_button = android_vkbd_touch_button;
+#endif
 		return;
 	}
 
@@ -1829,7 +2260,9 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	// Android fallback that disables touch controls when SDL reports a joystick.
 	// Preserve the launcher's explicit choice across the WHDLoad hardware preset.
 	prefs->onscreen_joystick = android_onscreen_joystick;
+	_tcscpy(prefs->vkbd_toggle, android_vkbd_toggle);
 	prefs->vkbd_enabled = android_vkbd_enabled;
+	prefs->vkbd_touch_button = android_vkbd_touch_button;
 	prefs->vkbd_numpad = android_vkbd_numpad;
 	prefs->input_default_onscreen_keyboard = android_input_default_osk;
 #endif

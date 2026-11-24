@@ -54,11 +54,21 @@ set(SOURCE_FILES
         src/softfloat/softfloat.cpp
         src/softfloat/softfloat_decimal.cpp
         src/softfloat/softfloat_fpsp.cpp
+        src/softfloat/softfloat_dd.cpp
         src/framebufferboards.cpp
         src/zz9000.cpp
+        src/zz9000_sdk.cpp
+        src/zz9000_sdk_audio_codec.cpp
+        src/zz9000_sdk_webp.cpp
+        src/zz9000_sdk_media_av.cpp
+        src/zz9000_sdk_console.cpp
         src/fsdb.cpp
         src/fsusage.cpp
         src/gayle.cpp
+        src/gdb_monitor.cpp
+        src/gdb_protocol.cpp
+        src/gdb_server.cpp
+        src/gdb_target.cpp
         src/gfxboard.cpp
         src/gfxlib.cpp
         src/gfxutil.cpp
@@ -182,18 +192,8 @@ set(SOURCE_FILES
         src/archivers/dms/u_medium.cpp
         src/archivers/dms/u_quick.cpp
         src/archivers/dms/u_rle.cpp
-        src/archivers/lha/crcio.cpp
-        src/archivers/lha/dhuf.cpp
-        src/archivers/lha/header.cpp
-        src/archivers/lha/huf.cpp
-        src/archivers/lha/larc.cpp
-        src/archivers/lha/lhamaketbl.cpp
-        src/archivers/lha/lharc.cpp
-        src/archivers/lha/shuf.cpp
-        src/archivers/lha/slide.cpp
         src/archivers/lha/uae_lha.cpp
-        src/archivers/lha/util.cpp
-        src/archivers/lzx/unlzx.cpp
+        src/archivers/lzx/lzx.cpp
         src/archivers/mp2/kjmp2.cpp
         src/archivers/wrp/warp.cpp
         src/archivers/zip/unzip.cpp
@@ -216,20 +216,30 @@ set(SOURCE_FILES
         src/osdep/dpi_handler.cpp
         src/osdep/fsdb_host.cpp
         src/osdep/clipboard.cpp
+        src/osdep/clipboard_common.cpp
+        src/osdep/clipboard_image.cpp
+        src/osdep/clipboard_host.cpp
         src/osdep/amiberry_hardfile.cpp
         src/osdep/keyboard.cpp
         src/osdep/host_detect.cpp
         src/osdep/midi.cpp
+        src/osdep/midi_parser.cpp
         src/osdep/perf_monitor.cpp
         src/osdep/amiberry_adpf.cpp
         src/osdep/mhi_host.cpp
+        src/osdep/service_transport.cpp
+        src/osdep/minigl_display.cpp
+        src/osdep/dmabuf_surface.cpp
         src/osdep/mp3decoder.cpp
         src/osdep/picasso96.cpp
         src/osdep/writelog.cpp
         src/osdep/amiberry.cpp
         src/osdep/main.cpp
-        src/osdep/amiberry_dbus.cpp
         src/osdep/amiberry_ipc_socket.cpp
+        src/osdep/amiberry_actions.cpp
+        src/osdep/amiberry_media.cpp
+        src/osdep/amiberry_whdboot.cpp
+        src/osdep/amiberry_settings_schema.cpp
         src/osdep/amiberry_filesys.cpp
         src/osdep/amiberry_input.cpp
         src/osdep/input_platform.cpp
@@ -237,6 +247,7 @@ set(SOURCE_FILES
         src/osdep/display_modes.cpp
         src/osdep/gfx_colors.cpp
         src/osdep/gfx_prefs_check.cpp
+        src/osdep/display_catalog.cpp
         src/osdep/gl_overlays.cpp
         src/osdep/gfx_window.cpp
         src/osdep/renderer_factory.cpp
@@ -247,10 +258,15 @@ set(SOURCE_FILES
         src/osdep/gl_platform.cpp
         src/osdep/external_shader.cpp
         src/osdep/shader_preset.cpp
+        src/osdep/gl_capability_classify.cpp
+        src/osdep/gl_context_ladder.cpp
+        src/osdep/crt_gpu_allowlist.cpp
         src/osdep/amiberry_gui.cpp
         src/osdep/amiberry_mem.cpp
         src/osdep/amiberry_serial.cpp
         src/osdep/amiberry_update.cpp
+        src/osdep/amiberry_curl.cpp
+        src/osdep/amiberry_update_asset_policy.cpp
         src/osdep/amiberry_uaenet.cpp
         src/osdep/amiberry_whdbooter.cpp
         src/osdep/amiberry_rp9.cpp
@@ -262,8 +278,6 @@ set(SOURCE_FILES
         src/osdep/registry.cpp
         src/osdep/retroarch.cpp
         src/osdep/vpar.cpp
-        src/ppc/ppc.cpp
-        src/ppc/ppcd.cpp
         src/qemuvga/cirrus_vga.cpp
         src/qemuvga/es1370.cpp
         src/qemuvga/esp.cpp
@@ -275,10 +289,30 @@ set(SOURCE_FILES
         src/qemuvga/vga.cpp
         src/sounddep/sound.cpp
         src/threaddep/threading.cpp
-        src/osdep/file_dialog.cpp
-        src/osdep/gui/main_window.cpp
-        src/osdep/imgui_overlay.cpp
-        src/osdep/imgui_osk.cpp
+        src/osdep/settings/settings_chipset.cpp
+        src/osdep/settings/settings_memory.cpp
+        src/osdep/settings/settings_rom.cpp
+        src/osdep/settings/settings_presets.cpp
+        src/osdep/settings/settings_cpu.cpp
+        src/osdep/settings/settings_display.cpp
+        src/osdep/settings/settings_floppy.cpp
+        src/osdep/settings/settings_input.cpp
+        src/osdep/settings/settings_onscreen.cpp
+        src/osdep/settings/settings_misc.cpp
+        src/osdep/settings/settings_rtg.cpp
+        src/osdep/settings/settings_boards.cpp
+        src/osdep/settings/settings_custom_controls.cpp
+        src/osdep/settings/settings_hotkeys.cpp
+        src/osdep/settings/settings_host.cpp
+        src/osdep/settings/settings_expansions.cpp
+        src/osdep/settings/settings_filter.cpp
+        src/osdep/settings/settings_io.cpp
+        src/osdep/settings/settings_registry.cpp
+        src/osdep/settings/settings_session.cpp
+        src/osdep/settings/settings_mounts.cpp
+        src/osdep/settings/settings_sound.cpp
+        src/osdep/settings/settings_storage.cpp
+        src/osdep/gui/gui_shared.cpp
         src/osdep/on_screen_joystick.cpp
         src/osdep/on_screen_joystick_gl.cpp
         src/newcpu.cpp
@@ -339,6 +373,17 @@ endif()
  
 list(APPEND SOURCE_FILES ${SLIRP_SOURCES})
 
+if(USE_VIDEOGRAB)
+	list(APPEND SOURCE_FILES src/osdep/videograb.cpp)
+endif()
+
+if(USE_PPC)
+	list(APPEND SOURCE_FILES
+		src/ppc/ppc.cpp
+		src/ppc/ppcd.cpp
+	)
+endif()
+
 set(IMGUI_GUI_FILES
 		src/osdep/imgui/about.cpp
 		src/osdep/imgui/chipset.cpp
@@ -357,7 +402,9 @@ set(IMGUI_GUI_FILES
 		src/osdep/imgui/hwinfo.cpp
 		src/osdep/imgui/input.cpp
 		src/osdep/imgui/io.cpp
+		src/osdep/imgui/media_request.cpp
 		src/osdep/imgui/misc.cpp
+		src/osdep/imgui/onscreen.cpp
 		src/osdep/imgui/paths.cpp
 		src/osdep/imgui/play.cpp
 		src/osdep/imgui/play_content_detection.cpp
@@ -368,89 +415,36 @@ set(IMGUI_GUI_FILES
 		src/osdep/imgui/rom.cpp
 		src/osdep/imgui/rtg.cpp
 		src/osdep/imgui/savestates.cpp
-		src/osdep/imgui/shader_catalog.cpp
 		src/osdep/imgui/sound.cpp
 		src/osdep/imgui/themes.cpp
-		src/osdep/imgui/virtualkeyboard.cpp
 		src/osdep/imgui/whdload.cpp
 )
 
-set(PCEM_SOURCE_FILES
-        src/pcem/386.cpp
-        src/pcem/386_common.cpp
-        src/pcem/386_dynarec.cpp
-        src/pcem/808x.cpp
-        src/pcem/cpu.cpp
-        src/pcem/dosbox/dbopl.cpp
-        src/pcem/dma.cpp
-        src/pcem/keyboard.cpp
-        src/pcem/keyboard_at.cpp
-        src/pcem/keyboard_at_draco.cpp
-        src/pcem/mem.cpp
-        src/pcem/mouse_ps2.cpp
-        src/pcem/mouse_serial.cpp
-        src/pcem/dosbox/nukedopl.cpp
-        src/pcem/nvr.cpp
-        src/pcem/pcemglue.cpp
-        src/pcem/pcemrtc.cpp
-        src/pcem/pic.cpp
-        src/pcem/pit.cpp
-        src/pcem/serial.cpp
-        src/pcem/sound_cms.cpp
-        src/pcem/sound_dbopl.cpp
-        src/pcem/sound_mpu401_uart.cpp
-        src/pcem/sound_opl.cpp
-        src/pcem/sound_sb.cpp
-        src/pcem/sound_sb_dsp.cpp
-        src/pcem/sound_speaker.cpp
-        src/pcem/timer.cpp
-        src/pcem/vid_bt482_ramdac.cpp
-        src/pcem/vid_cl5429.cpp
-        src/pcem/vid_et4000.cpp
-        src/pcem/vid_et4000w32.cpp
-        src/pcem/vid_inmos.cpp
-        src/pcem/vid_mga.cpp
-        src/pcem/vid_ncr.cpp
-        src/pcem/vid_permedia2.cpp
-        src/pcem/vid_s3.cpp
-        src/pcem/vid_s3_virge.cpp
-        src/pcem/vid_sc1502x_ramdac.cpp
-        src/pcem/vid_sdac_ramdac.cpp
-        src/pcem/vid_svga.cpp
-        src/pcem/vid_svga_render.cpp
-        src/pcem/vid_tvp3026_ramdac.cpp
-        src/pcem/vid_voodoo.cpp
-        src/pcem/vid_voodoo_banshee.cpp
-        src/pcem/vid_voodoo_banshee_blitter.cpp
-        src/pcem/vid_voodoo_blitter.cpp
-        src/pcem/vid_voodoo_display.cpp
-        src/pcem/vid_voodoo_fb.cpp
-        src/pcem/vid_voodoo_fifo.cpp
-        src/pcem/vid_voodoo_reg.cpp
-        src/pcem/vid_voodoo_render.cpp
-        src/pcem/vid_voodoo_setup.cpp
-        src/pcem/vid_voodoo_texture.cpp
-        src/pcem/x86seg.cpp
-        src/pcem/x87.cpp
-        src/pcem/x87_timings.cpp
-)
-
-# ImGui GUI (always enabled)
-message(STATUS "Using ImGui for GUI")
-list(APPEND SOURCE_FILES external/ImGuiFileDialog/ImGuiFileDialog.cpp)
-list(APPEND SOURCE_FILES ${IMGUI_GUI_FILES})
-
-if (USE_PCEM)
-    message(STATUS "PCem support enabled")
-    list(APPEND SOURCE_FILES ${PCEM_SOURCE_FILES})
-else ()
-    message(STATUS "PCem support disabled")
+# The ImGui GUI and overlays: native front ends replace them.
+if(AMIBERRY_IMGUI)
+    message(STATUS "Using ImGui for GUI")
+    list(APPEND SOURCE_FILES
+            src/osdep/gui/main_window.cpp
+            src/osdep/imgui_overlay.cpp
+            src/osdep/imgui_osk.cpp
+            src/osdep/file_dialog.cpp
+            external/ImGuiFileDialog/ImGuiFileDialog.cpp
+            ${IMGUI_GUI_FILES})
+else()
+    message(STATUS "Built without ImGui: the platform's own UI replaces it")
 endif()
 
-# FloppyBridge plugin source (serial port — not available on iOS)
-if(NOT IOS)
-    list(APPEND SOURCE_FILES external/floppybridge/src/floppybridge_lib.cpp)
-endif()
+# 86Box: the x86 bridgeboards, ATonce, DraCo and the RTG video cards. The
+# source lists, object libraries and glue wiring live in cmake/86Box.cmake,
+# which is included here so its glue sources land in SOURCE_FILES before
+# the target below is created.
+include(cmake/86Box.cmake)
+
+# FloppyBridge: the loader (floppybridge_lib.cpp, which talks to the plugin
+# dylib via dlopen) is always compiled in — disk.cpp and the floppy panel
+# reference FloppyBridgeAPI. On iOS the plugin itself is not built (no serial
+# ports); the loader reports no bridges available at runtime.
+list(APPEND SOURCE_FILES external/floppybridge/src/floppybridge_lib.cpp)
 
 # On Windows, swap POSIX-specific CHD files for Windows equivalents
 if(WIN32)
@@ -471,6 +465,11 @@ if(WIN32)
 endif()
 
 if(ANDROID)
+    # The in-emulation menu and the launcher's WHDBoot downloader JNI.
+    list(APPEND SOURCE_FILES
+        src/osdep/android_overlay.cpp
+        src/osdep/android_whdboot.cpp
+    )
     add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 elseif(IOS)
     add_executable(${PROJECT_NAME} MACOSX_BUNDLE ${SOURCE_FILES})
@@ -511,12 +510,20 @@ else()
 endif()
 
 if(WIN32)
+    if(AMIBERRY_NATIVE_WINDOWS_UI)
+        set(AMIBERRY_WINDOWS_MANIFEST "${CMAKE_SOURCE_DIR}/src/osdep/windows/amiberry.manifest")
+    else()
+        set(AMIBERRY_WINDOWS_MANIFEST "${CMAKE_SOURCE_DIR}/src/osdep/amiberry.manifest")
+    endif()
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
     set(AMIBERRY_WINDOWS_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/amiberry.rc")
     configure_file(
             "${CMAKE_SOURCE_DIR}/src/osdep/amiberry.rc.in"
             "${AMIBERRY_WINDOWS_RESOURCE}"
             @ONLY
+    )
+    set_source_files_properties("${AMIBERRY_WINDOWS_RESOURCE}" PROPERTIES
+            OBJECT_DEPENDS "${AMIBERRY_WINDOWS_MANIFEST}"
     )
     target_sources(${PROJECT_NAME} PRIVATE "${AMIBERRY_WINDOWS_RESOURCE}")
 endif()
@@ -533,27 +540,41 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
         MACOSX_BUNDLE_BUNDLE_NAME "Amiberry"
         MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
         MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
-        MACOSX_BUNDLE_COPYRIGHT "(c) ${AMIBERRY_BUILD_YEAR} Dimitris Panokostas"
+        MACOSX_BUNDLE_COPYRIGHT "© ${AMIBERRY_BUILD_YEAR} Dimitris Panokostas"
 )
 
 # Platform-specific bundle overrides
 if(IOS)
+    # The app icon: an asset catalog Xcode compiles (actool), which adds the
+    # icon entries to the Info.plist.
+    target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/packaging/ios/Assets.xcassets")
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/packaging/ios/Assets.xcassets" PROPERTIES
+            MACOSX_PACKAGE_LOCATION Resources)
     set_target_properties(${PROJECT_NAME} PROPERTIES
-            MACOSX_BUNDLE_ICON_FILE "AppIcon"
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/packaging/ios/iOSBundleInfo.plist.in"
             XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
-            XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "16.0"
+            XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "${AMIBERRY_IOS_DEPLOYMENT_TARGET}"
             XCODE_ATTRIBUTE_SUPPORTS_MACCATALYST "NO"
     )
 else()
+    # The icon sits at the top of Resources: App Store validation looks for
+    # CFBundleIconFile there and does not follow a subfolder path.
+    if(APPLE)
+        target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/data/icon.icns")
+        set_source_files_properties("${CMAKE_SOURCE_DIR}/data/icon.icns" PROPERTIES
+                MACOSX_PACKAGE_LOCATION Resources)
+    endif()
     set_target_properties(${PROJECT_NAME} PROPERTIES
-            MACOSX_BUNDLE_ICON_FILE "data/icon"
+            MACOSX_BUNDLE_ICON_FILE "icon"
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/packaging/MacOSXBundleInfo.plist.in"
     )
 endif()
 
 # Select entitlements file based on build target
 if(IOS)
+    # iOS has no libcurl: download_file() comes from NSURLSession here.
+    target_sources(${PROJECT_NAME} PRIVATE src/osdep/amiberry_download_ios.mm)
     set(AMIBERRY_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/packaging/ios/Amiberry.entitlements")
     set_target_properties(${PROJECT_NAME} PROPERTIES
         XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${AMIBERRY_ENTITLEMENTS}"
@@ -580,11 +601,26 @@ if(CMAKE_SYSTEM_NAME MATCHES "Darwin" AND NOT IOS)
             src/osdep/macos_debugger_console.mm
             src/osdep/macos_window.mm
     )
-elseif(NOT IOS)
+elseif(NOT IOS AND AMIBERRY_IMGUI)
     target_sources(${PROJECT_NAME} PRIVATE
             src/osdep/imgui_debugger_console.cpp
     )
 endif()
+
+foreach(AMIBERRY_INSTALL_DIR IN ITEMS BINDIR DATADIR LIBDIR)
+    set(AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE "${CMAKE_INSTALL_${AMIBERRY_INSTALL_DIR}}")
+    if(IS_ABSOLUTE "${AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE}")
+        file(RELATIVE_PATH AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE
+                "${CMAKE_INSTALL_PREFIX}"
+                "${AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE}")
+    endif()
+    file(TO_CMAKE_PATH "${AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE}"
+            AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE)
+    if(AMIBERRY_INSTALL_${AMIBERRY_INSTALL_DIR}_RELATIVE MATCHES "(^|/)\\.\\.(/|$)")
+        message(FATAL_ERROR
+                "CMAKE_INSTALL_${AMIBERRY_INSTALL_DIR} must stay inside CMAKE_INSTALL_PREFIX")
+    endif()
+endforeach()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
         _FILE_OFFSET_BITS=64
@@ -600,6 +636,9 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
         AMIBERRY_BUILD_DATE="${AMIBERRY_BUILD_YEAR}-${AMIBERRY_BUILD_MONTH}-${AMIBERRY_BUILD_DAY}"
         AMIBERRY_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}"
         AMIBERRY_LIBDIR="${CMAKE_INSTALL_FULL_LIBDIR}/${PROJECT_NAME}"
+        AMIBERRY_INSTALL_BINDIR="${AMIBERRY_INSTALL_BINDIR_RELATIVE}"
+        AMIBERRY_INSTALL_DATADIR="${AMIBERRY_INSTALL_DATADIR_RELATIVE}"
+        AMIBERRY_INSTALL_LIBDIR="${AMIBERRY_INSTALL_LIBDIR_RELATIVE}"
         OSDEP_GFX_PLATFORM_HEADER="gfx_platform_internal_host.h"
         OSDEP_AMIBERRY_PLATFORM_HEADER="amiberry_platform_internal_host.h"
         OSDEP_INPUT_PLATFORM_HEADER="input_platform_internal_host.h"
@@ -608,24 +647,33 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
         SOUND_PLATFORM_HEADER="sound_platform_internal_host.h"
 )
 
+# Haiku: <arch/x86_64/signal.h> declares `struct fpu_state` with members
+# named cs and ss. 86Box's cpu.h #defines cs/ds/es/ss as register macros,
+# which mangles that struct when a system header pulls signal.h in after
+# the 86Box headers. Force the struct in first; its include guard keeps it
+# from being re-parsed under the macros.
+if(CMAKE_SYSTEM_NAME STREQUAL "Haiku" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_compile_options(${PROJECT_NAME} PRIVATE -include arch/x86_64/signal.h)
+endif()
+
+# Haiku executables link non-PIE by default, and its linker rejects the
+# local-exec TLS relocations (R_X86_64_TPOFF32) our thread_local variables
+# produce when the main program is linked PIE. Keep the executable non-PIE;
+# the CAPSImage/floppybridge plugins stay PIC through the global setting.
+if(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
+    set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+endif()
+
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     target_compile_definitions(${PROJECT_NAME} PRIVATE CPU_AARCH64)
-elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE
-            CPU_arm ARMV6_ASSEMBLY ARMV6T2 USE_ARMNEON ARM_HAS_DIV
-    )
 endif ()
 
 if(WIN32)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_WINDOWS UTF8PROC_STATIC USE_STD_FILESYSTEM SDL_MAIN_HANDLED)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE UTF8PROC_STATIC USE_STD_FILESYSTEM SDL_MAIN_HANDLED)
 endif()
 
 if(IOS)
     target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_IOS)
-endif()
-
-if(NOT USE_JIT)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_NO_JIT)
 endif()
 
 # Apply accumulated compile/link options from StandardProjectSettings.cmake
@@ -654,10 +702,20 @@ if(NOT ANDROID AND NOT WIN32
     # Linux/macOS x86-64 use RIP-relative + anchor-based allocation,
     # which is PIE-compatible.
     target_compile_options(${PROJECT_NAME} PRIVATE -fno-pie)
-    target_link_options(${PROJECT_NAME} PRIVATE -no-pie)
+    # Only toolchains that link PIE by default use -no-pie; clang before 24
+    # doesn't on FreeBSD and warns that it is unused. Checked on every
+    # configure, as CMake doesn't notice a compiler upgraded in place.
+    include(CheckCXXSourceCompiles)
+    unset(LINKER_USES_NO_PIE CACHE)
+    set(CMAKE_REQUIRED_LINK_OPTIONS -no-pie)
+    check_cxx_source_compiles("int main() { return 0; }" LINKER_USES_NO_PIE
+        FAIL_REGEX "unused.*-no-pie")
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+    if(LINKER_USES_NO_PIE)
+        target_link_options(${PROJECT_NAME} PRIVATE -no-pie)
+    endif()
 elseif(NOT IOS
         AND CMAKE_SYSTEM_NAME STREQUAL "Darwin"
-        AND USE_JIT
         AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"
              OR CMAKE_OSX_ARCHITECTURES MATCHES "(^|;)x86_64($|;)"))
     # Intel macOS Mach-O binaries normally reserve a 4GB __PAGEZERO segment.
@@ -696,12 +754,12 @@ target_include_directories(${PROJECT_NAME} PRIVATE
         src/include
         src/threaddep
         src/archivers
-        src/ppc/pearpc
         external/floppybridge/src
 )
 
-# ImGui include dirs (always enabled)
-target_include_directories(${PROJECT_NAME} PRIVATE external/imgui external/ImGuiFileDialog)
+if(AMIBERRY_IMGUI)
+    target_include_directories(${PROJECT_NAME} PRIVATE external/imgui external/ImGuiFileDialog)
+endif()
 
 # When bundling SDL3, set RPATH so the binary finds the co-installed shared libs.
 if(BUNDLE_SDL AND CMAKE_SYSTEM_NAME STREQUAL "Linux")

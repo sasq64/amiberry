@@ -239,7 +239,7 @@
                 <tbody>
                     <tr>
                         <td>Ubuntu</td>
-                        <td>22.04 LTS (Jammy), 24.04 LTS (Noble), 25.10 (Questing), 26.04 LTS (Resolute)</td>
+                        <td>22.04 LTS (Jammy), 24.04 LTS (Noble), 25.10 (Questing), 26.04 LTS (Resolute), 26.10 (Stonking)</td>
                         <td>apt</td>
                     </tr>
                     <tr>
@@ -315,6 +315,25 @@ sudo apt install amiberry</code>
                         </div>
                     </li>
                 </ol>
+            </div>
+        </section>
+        
+        <section>
+            <h2>Other Ways to Install</h2>
+            <div class="manual-section">
+                <h3>AppImage (no installation)</h3>
+                <p>Every <a href="https://github.com/BlitterStudio/amiberry/releases/latest">GitHub release</a> includes <code>Amiberry-&lt;version&gt;-x86_64.AppImage</code> and <code>Amiberry-&lt;version&gt;-aarch64.AppImage</code>. Download the one for your CPU, make it executable and run it:</p>
+                <div class="code-block">
+                    <code>chmod +x Amiberry-&lt;version&gt;-x86_64.AppImage
+./Amiberry-&lt;version&gt;-x86_64.AppImage</code>
+                </div>
+                <p class="copy-hint">Requires glibc 2.35 or newer. The AppImage does not receive updates through this repository; see the <a href="https://amiberry.com/linux-packages#appimage">AppImage guide</a>.</p>
+            </div>
+            <div class="manual-section">
+                <h3>Flatpak</h3>
+                <div class="code-block">
+                    <code>flatpak install flathub com.blitterstudio.amiberry</code>
+                </div>
             </div>
         </section>
         

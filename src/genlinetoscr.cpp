@@ -357,16 +357,18 @@ static void gen_shiftspr(int shift)
 	}
 }
 
-static void gen_ecsshresspr(void)
+// allpixels: write all four sprite pixel outputs, each resolved against its
+// own playfield half-pixel. Needed when the caller filters or stores
+// dpix_val1/dpix_val3; with NULL they keep their playfield values and
+// filter_pixel() would blend an opaque sprite with the background.
+static void gen_ecsshresspr(bool allpixels)
 {
 	outf("if (sv0 || sv1) {");
-	outf("get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);");
-	outf("if (sv0) {");
-	outf("dpix_val1 = dpix_val0;");
-	outf("}");
-	outf("if (sv1) {");
-	outf("dpix_val3 = dpix_val2;");
-	outf("}");
+	if (allpixels) {
+		outf("get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, &dpix_val1, &dpix_val2, &dpix_val3);");
+	} else {
+		outf("get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, NULL, &dpix_val2, NULL);");
+	}
 	outf("}");
 }
 
@@ -684,7 +686,7 @@ static void gen_pix_aga(void)
 		outf("internal_pixel_cnt += %d;", 4 / (1 << outres));
 	}
 
-	outf("if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {");
+	outf("if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_%dx) {", 1 << outres);
 
 	// bitplane/sprite merging
 	off = 0;
@@ -835,7 +837,7 @@ static void gen_pix(void)
 		}
 	}
 
-	outf("if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {");
+	outf("if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_%dx) {", 1 << outres);
 
 	// bitplane/sprite merging
 	for (int i = 0; i < (1 << outres); i++) {
@@ -1141,7 +1143,7 @@ static void gen_fastdraw_mode(int off, int total)
 		} else {
 			outf("get_shres_pix(c0, c1, &dpix_val0, &dpix_val1);");
 		}
-		if (doubling < 0) {
+		if (doubling < 0 && filtered) {
 			outf("dpix_val0 = filter_pixel(dpix_val0, dpix_val1);");
 			if (genlock) {
 				outf("gpix0 = filter_pixel_genlock(gpix0, gpix1);");
@@ -1189,8 +1191,7 @@ static void gen_fastdraw_mode(int off, int total)
 		outf("*buf2++ = col;");
 	}
 	if (genlock) {
-		outf("gpix = get_genlock_transparency_fast(c);");
-		outf("*gbuf++ = gpix;");
+		outf("*gbuf++ = get_genlock_transparency_fast(c);");
 	}
 }
 
@@ -1848,8 +1849,8 @@ int main (int argc, char *argv[])
 					gen_matchspr(0);
 					gen_sprpix(1);
 					gen_matchspr(2);
-					gen_ecsshresspr();
-					outf("if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {");
+					gen_ecsshresspr(filtered);
+					outf("if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_2x) {");
 					if (filtered) {
 						outf("dpix_val0 = filter_pixel(dpix_val0, dpix_val1);");
 						outf("dpix_val2 = filter_pixel(dpix_val2, dpix_val3);");
@@ -1866,8 +1867,8 @@ int main (int argc, char *argv[])
 					gen_matchspr(0);
 					gen_sprpix(1);
 					gen_matchspr(2);
-					gen_ecsshresspr();
-					outf("if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {");
+					gen_ecsshresspr(true);
+					outf("if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_4x) {");
 					gen_storepix(0, 0);
 					gen_storepix(1, 1);
 					gen_storepix(2, 2);

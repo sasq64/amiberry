@@ -473,12 +473,12 @@ enum {
 #define PSSO_BoardInfo_GetCompatibleDACFormats		    (PSSO_ReInitMemory + 4)
 #define PSSO_BoardInfo_CoerceMode		    (PSSO_BoardInfo_GetCompatibleDACFormats + 4)
 #define PSSO_BoardInfo_Reserved3Default		    (PSSO_BoardInfo_CoerceMode + 4)
-#define PSSO_BoardInfo_Reserved4		    (PSSO_BoardInfo_Reserved3Default + 4)
-#define PSSO_BoardInfo_Reserved4Default		    (PSSO_BoardInfo_Reserved4 + 4)
-#define PSSO_BoardInfo_Reserved5		    (PSSO_BoardInfo_Reserved4Default + 4)
-#define PSSO_BoardInfo_Reserved5Default		    (PSSO_BoardInfo_Reserved5 + 4)
+#define PSSO_BoardInfo_BlitRectTransparent    (PSSO_BoardInfo_Reserved3Default + 4)
+#define PSSO_BoardInfo_BlitRectTransparentDefault    (PSSO_BoardInfo_BlitRectTransparent + 4)
+#define PSSO_BoardInfo_GetVSyncState		    (PSSO_BoardInfo_BlitRectTransparentDefault + 4)
+#define PSSO_BoardInfo_GetVBeamPos		    (PSSO_BoardInfo_GetVSyncState + 4)
 
-#define PSSO_BoardInfo_SetDPMSLevel		    (PSSO_BoardInfo_Reserved5Default + 4)
+#define PSSO_BoardInfo_SetDPMSLevel		    (PSSO_BoardInfo_GetVBeamPos + 4)
 #define PSSO_BoardInfo_ResetChip		    (PSSO_BoardInfo_SetDPMSLevel + 4)
 
 #define PSSO_BoardInfo_GetFeatureAttrs		    (PSSO_BoardInfo_ResetChip + 4)
@@ -655,12 +655,14 @@ extern void init_hz_p96(int monid);
 extern void picasso_update_native_cursor(int monid);
 extern void picasso_handle_vsync();
 extern void picasso_trigger_vblank();
+extern int picasso_get_splitypos(int monid);
 extern bool picasso_is_active(int monid);
 extern int picasso_setwincursor(int monid);
 extern int picasso_palette(struct MyCLUTEntry *MCLUT, uae_u32 *clut);
 extern void picasso_allocatewritewatch (int index, int gfxmemsize);
 extern int picasso_getwritewatch(int index, int offset, uae_u8 ***gwwbufp, uae_u8 **startp);
 extern bool picasso_is_vram_dirty (int index, uaecptr addr, int size);
+extern void picasso_mark_host_write(const uae_u8 *addr, uae_u32 size);
 extern void picasso_statusline (int monid, uae_u8 *dst);
 extern void picasso_invalidate(int monid, int x, int y, int w, int h);
 

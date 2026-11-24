@@ -9,7 +9,7 @@ import org.junit.Test
 class RecentLaunchesTest {
 
 	@Test
-	fun `available launches prune stale paths and unsupported models while preserving order`() {
+	fun `items keep entries that cannot launch and mark why while preserving order`() {
 		val quickstart = quickstart(model = "A500", df0 = "/media/disk.adf")
 		val staleConfig = entry("config", path = "/configs/missing.uae")
 		val whdload = entry("whdload", path = "/whdload/Lotus.lha")
@@ -17,47 +17,136 @@ class RecentLaunchesTest {
 		val unsupportedModel = quickstart(model = "CD32", cd = "/cds/game.cue")
 		val unknownType = JSONObject().put("type", "mystery")
 
-		val available = RecentLaunches.available(
+		val items = RecentLaunches.items(
 			entries = listOf(quickstart, staleConfig, whdload, rp9, unsupportedModel, unknownType),
 			availableModels = setOf(AmigaModel.A500),
 			fileExists = { it in setOf("/media/disk.adf", "/whdload/Lotus.lha", "/rp9/Asteroids.rp9", "/cds/game.cue") }
 		)
 
-		assertEquals(listOf(quickstart, whdload, rp9), available)
+		assertEquals(listOf(quickstart, staleConfig, whdload, rp9, unsupportedModel), items.map { it.entry })
+		assertEquals(
+			listOf(
+				RecentLaunches.Status.Available,
+				RecentLaunches.Status.MissingFiles,
+				RecentLaunches.Status.Available,
+				RecentLaunches.Status.Available,
+				RecentLaunches.Status.ModelUnavailable
+			),
+			items.map { it.status }
+		)
 	}
 
 	@Test
 	fun `quickstart media paths are optional but must exist when present`() {
 		val noMedia = quickstart(model = "A1200")
 		val missingFloppy = quickstart(model = "A1200", df1 = "/media/df1.adf")
+		val unknownModel = quickstart(model = "UNKNOWN")
+		val models = setOf(AmigaModel.A1200)
 
-		val available = RecentLaunches.available(
-			entries = listOf(noMedia, missingFloppy),
-			availableModels = setOf(AmigaModel.A1200),
-			fileExists = { false }
-		)
-
-		assertEquals(listOf(noMedia), available)
+		assertEquals(RecentLaunches.Status.Available, RecentLaunches.status(noMedia, models) { false })
+		assertEquals(RecentLaunches.Status.MissingFiles, RecentLaunches.status(missingFloppy, models) { false })
+		assertEquals(RecentLaunches.Status.ModelUnavailable, RecentLaunches.status(unknownModel, models) { false })
 	}
 
 	@Test
-	fun `stored launches prune missing files but keep currently unsupported models`() {
-		val unsupportedModel = quickstart(model = "CD32", cd = "/cds/game.cue")
-		val staleConfig = entry("config", path = "/configs/missing.uae")
-		val invalidModel = quickstart(model = "UNKNOWN", df0 = "/media/disk.adf")
+	fun `items show up to ten entries`() {
+		val entries = (1..12).map { entry("config", path = "/configs/$it.uae") }
 
-		val stored = RecentLaunches.pruneMissingFiles(
-			entries = listOf(unsupportedModel, staleConfig, invalidModel),
-			fileExists = { it in setOf("/cds/game.cue", "/media/disk.adf") }
+		val items = RecentLaunches.items(entries, availableModels = emptySet(), fileExists = { true })
+
+		assertEquals(RecentLaunches.MAX_ITEMS, items.size)
+		assertEquals("/configs/1.uae", items.first().entry.optString("path"))
+	}
+
+	@Test
+	fun `removing an entry removes it in any model spelling and keeps the others`() {
+		val workbench = entry("config", path = "/configs/Workbench.uae")
+		val storedOldSpelling = quickstart(model = "A500", df0 = "/media/disk.adf")
+		val lotus = entry("whdload", path = "/whdload/Lotus.lha")
+		val entries = listOf(workbench, storedOldSpelling, lotus)
+
+		assertEquals(listOf(storedOldSpelling, lotus), RecentLaunches.remove(entries, workbench).toList())
+		assertEquals(
+			listOf(workbench, lotus),
+			RecentLaunches.remove(entries, quickstart(model = AmigaModel.A500.cmdArg, df0 = "/media/disk.adf"))
+		)
+	}
+
+	@Test
+	fun `a renamed configuration keeps its place in Recent`() {
+		val renamed = entry("config", path = "/configs/Workbench.uae")
+		val other = entry("config", path = "/configs/Games.uae")
+		val whdload = entry("whdload", path = "/configs/Workbench.uae")
+
+		val updated = RecentLaunches.replaceConfigPath(
+			listOf(renamed, other, whdload),
+			oldPath = "/configs/Workbench.uae",
+			newPath = "/configs/Workbench 3.1.uae"
 		)
 
-		assertEquals(listOf(unsupportedModel), stored)
+		assertEquals(
+			listOf("/configs/Workbench 3.1.uae", "/configs/Games.uae", "/configs/Workbench.uae"),
+			updated.map { it.optString("path") }
+		)
+		assertEquals("whdload", updated.last().optString("type"))
+	}
+
+	@Test
+	fun `a renamed machine keeps the Play In entries that played it`() {
+		val played = playin(path = "/configs/Workbench.uae", df0 = "/floppies/Game.adf")
+		val quickstart = this.quickstart(model = "a500", df0 = "/floppies/Game.adf")
+
+		val updated = RecentLaunches.replaceConfigPath(
+			listOf(played, quickstart),
+			oldPath = "/configs/Workbench.uae",
+			newPath = "/configs/Workbench 3.1.uae"
+		)
+
+		// The Play In follows its machine, keeping its media; a Quick Start has no
+		// configuration path to rewrite.
+		assertEquals("/configs/Workbench 3.1.uae", updated.first().optString("path"))
+		assertEquals("/floppies/Game.adf", updated.first().optString("df0"))
+		assertEquals(quickstart, updated.last())
+	}
+
+	@Test
+	fun `a machine deleted in the app takes its Play In entries out of Recent`() {
+		val played = playin(path = "/configs/Workbench.uae", cd = "/cds/Game.cue")
+		val other = playin(path = "/configs/Games.uae", df0 = "/floppies/Game.adf")
+
+		val updated = RecentLaunches.removeConfigPath(
+			listOf(played, other),
+			path = "/configs/./Workbench.uae"
+		)
+
+		assertEquals(listOf(other), updated)
+	}
+
+	@Test
+	fun `a configuration deleted in the app leaves Recent while other entries stay`() {
+		val deleted = entry("config", path = "/configs/Workbench.uae")
+		val other = entry("config", path = "/configs/Games.uae")
+		val sameFileWhdload = entry("whdload", path = "/configs/Workbench.uae")
+		val vanishedOutside = entry("config", path = "/configs/Gone.uae")
+
+		val updated = RecentLaunches.removeConfigPath(
+			listOf(deleted, other, sameFileWhdload, vanishedOutside),
+			path = "/configs/./Workbench.uae"
+		)
+
+		assertEquals(listOf(other, sameFileWhdload, vanishedOutside), updated)
+		// A file that vanished outside the app is still listed, marked missing.
+		assertEquals(
+			RecentLaunches.Status.MissingFiles,
+			RecentLaunches.items(updated, emptySet(), fileExists = { it == "/configs/Games.uae" })
+				.single { it.entry === vanishedOutside }.status
+		)
 	}
 
 	@Test
 	fun `labels match launch type and strip common file suffixes`() {
 		assertEquals(
-			"A500 \u2014 Workbench.adf, Extras.adf",
+			"Amiga 500 \u2014 Workbench.adf, Extras.adf",
 			RecentLaunches.label(quickstart(model = "A500", df0 = "/media/Workbench.adf", df1 = "/media/Extras.adf"))
 		)
 		assertEquals("Workbench", RecentLaunches.label(entry("config", path = "/configs/Workbench.uae")))
@@ -76,14 +165,15 @@ class RecentLaunchesTest {
 		val rp9 = RecentLaunches.details(entry("rp9", path = "/rp9/Asteroids.rp9"))
 
 		assertEquals("Workbench.adf", quickstart.title)
-		assertEquals("Quick Start", quickstart.typeLabel)
-		assertEquals("A500 - DF0: Workbench.adf, DF1: Extras.adf", quickstart.detail)
-		assertEquals("Configuration", config.typeLabel)
-		assertEquals("/configs/Workbench.uae", config.detail)
-		assertEquals("WHDLoad", whdload.typeLabel)
-		assertEquals("/whdload/Lotus.lha", whdload.detail)
-		assertEquals("RP9", rp9.typeLabel)
-		assertEquals("/rp9/Asteroids.rp9", rp9.detail)
+		assertEquals(RecentLaunches.Type.QuickStart, quickstart.type)
+		assertEquals("Amiga 500 - DF0: Workbench.adf, DF1: Extras.adf", quickstart.detail)
+		assertEquals("Workbench", config.title)
+		assertEquals(RecentLaunches.Type.Configuration, config.type)
+		assertEquals("Workbench.uae", config.detail)
+		assertEquals(RecentLaunches.Type.WhdLoad, whdload.type)
+		assertEquals("Lotus.lha", whdload.detail)
+		assertEquals(RecentLaunches.Type.Rp9, rp9.type)
+		assertEquals("Asteroids.rp9", rp9.detail)
 	}
 
 	@Test
@@ -94,11 +184,37 @@ class RecentLaunchesTest {
 		val added = RecentLaunches.add(existing, duplicate, maxItems = 10)
 
 		assertEquals(10, added.size)
-		assertEquals(duplicate.toString(), added.first().toString())
-		assertEquals(1, added.count { it.toString() == duplicate.toString() })
+		assertEquals("/configs/5.uae", added.first().optString("path"))
+		assertEquals(1, added.count { it.optString("path") == "/configs/5.uae" })
 		assertTrue(added.any { it.optString("path") == "/configs/10.uae" })
 		assertTrue(added.none { it.optString("path") == "/configs/11.uae" })
 		assertTrue(added.none { it.optString("path") == "/configs/12.uae" })
+	}
+
+	@Test
+	fun `a launch is stamped with its time and replaces the earlier launch of the same thing`() {
+		val first = RecentLaunches.add(emptyList(), entry("whdload", path = "/whdload/Lotus.lha"), nowMs = 1_000L)
+		val again = RecentLaunches.add(first, entry("whdload", path = "/whdload/Lotus.lha"), nowMs = 5_000L)
+
+		assertEquals(1, again.size)
+		assertEquals(5_000L, RecentLaunches.details(again.single()).launchedAtMs)
+	}
+
+	@Test
+	fun `entries stored before launch times have none and still remove by identity`() {
+		val old = entry("config", path = "/configs/A1200.uae")
+		val stamped = RecentLaunches.add(emptyList(), entry("config", path = "/configs/A1200.uae"), nowMs = 42L).single()
+
+		assertEquals(null, RecentLaunches.details(old).launchedAtMs)
+		assertTrue(RecentLaunches.remove(listOf(stamped), old).isEmpty())
+	}
+
+	@Test
+	fun `a WHDLoad entry is titled by its readable game name`() {
+		val details = RecentLaunches.details(entry("whdload", path = "/whdload/TheLostPixelv1.3_WHD4.lha"))
+
+		assertEquals("The Lost Pixel v1.3", details.title)
+		assertEquals("TheLostPixelv1.3_WHD4.lha", details.detail)
 	}
 
 	@Test
@@ -121,4 +237,10 @@ class RecentLaunchesTest {
 	private fun entry(type: String, path: String): JSONObject = JSONObject()
 		.put("type", type)
 		.put("path", path)
+
+	private fun playin(path: String, df0: String = "", cd: String = ""): JSONObject = JSONObject()
+		.put("type", "playin")
+		.put("path", path)
+		.put("df0", df0)
+		.put("cd", cd)
 }

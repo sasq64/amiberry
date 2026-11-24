@@ -11,18 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
-#ifdef USE_OLDGCC
-#include <experimental/filesystem>
-#else
 #include <filesystem>
-#endif
 
 #include "sysconfig.h"
 #include "sysdeps.h"
 
 #include "options.h"
-#include "threaddep/thread.h"
 #include "uae.h"
 #include "gensound.h"
 #include "audio.h"
@@ -40,10 +36,14 @@
 #include "keybuf.h"
 #include "gui.h"
 #include "zfile.h"
+#include "rommgr.h"
 #include "autoconf.h"
 #include "native2amiga.h"
 #include "savestate.h"
 #include "blkdev.h"
+#ifndef LIBRETRO
+#include "osdep/settings/settings_definitions.h"
+#endif
 #include "consolehook.h"
 #include "gfxboard.h"
 #ifdef WITH_LUA
@@ -72,8 +72,6 @@
 #endif
 
 #include "fsdb.h"
-#include "fsdb_host.h"
-#include "keyboard.h"
 #ifndef LIBRETRO
 #include "amiberry_update.h"
 #endif
@@ -315,11 +313,6 @@ void fixup_cpu (struct uae_prefs *p)
 	p->ppc_cpu_idle = 0;
 #endif
 
-	if (p->cpu_thread && (p->cpu_compatible || p->ppc_mode || p->cpu_memory_cycle_exact || p->cpu_model < 68020)) {
-		p->cpu_thread = false;
-		error_log(_T("Threaded CPU mode is not compatible with PPC emulation, More compatible or Cycle Exact modes. CPU type must be 68020 or higher."));
-	}
-
 #ifdef WITH_PPC
 	// 1 = "automatic" PPC config
 	if (p->ppc_mode == 1) {
@@ -333,6 +326,13 @@ void fixup_cpu (struct uae_prefs *p)
 		}
 		p->cpuboardmem1.size = std::max<uae_u32>(p->cpuboardmem1.size, 8 * 1024 * 1024);
 	}
+	// A PPC board always runs the PPC, as on the hardware, and everything
+	// that has to know about the PPC tests ppc_mode: a missing or empty
+	// ppc_model becomes manual.
+	if (!p->ppc_mode && cpuboard_is_ppc_accelerator(p)) {
+		error_log(_T("PPC CPU emulation cannot be disabled while a PPC accelerator board is selected: set to manual."));
+		p->ppc_mode = 2;
+	}
 #endif
 
 	if (p->cachesize_inhibit) {
@@ -342,9 +342,15 @@ void fixup_cpu (struct uae_prefs *p)
 		p->cachesize = 0;
 		error_log (_T("JIT requires 68020 or better CPU."));
 	}
+#ifdef AMIBERRY
+	// compfpu is the user's preference and only takes effect with JIT and an
+	// FPU (avoid_fpu and the fpp.cpp JIT paths need both), so keep it while
+	// either is off instead of losing it.
+#else
 	if ((p->fpu_model == 0 || !p->cachesize) && p->compfpu) {
 		p->compfpu = false;
 	}
+#endif
 
 	if (!p->cpu_memory_cycle_exact && p->cpu_cycle_exact)
 		p->cpu_memory_cycle_exact = true;
@@ -365,10 +371,8 @@ void fixup_cpu (struct uae_prefs *p)
 		error_log (_T("JIT is not compatible with unimplemented CPU/FPU instruction emulation."));
 		p->fpu_no_unimplemented = p->int_no_unimplemented = false;
 	}
-	if (p->cachesize && p->compfpu && p->fpu_mode > 0) {
-		error_log (_T("JIT FPU emulation is not compatible with softfloat FPU emulation."));
-		p->fpu_mode = 0;
-	}
+	// The exact FPU core works with the JIT too: the JIT then compiles FPU
+	// instructions as calls into it instead of to host floating point.
 
 #ifdef JIT
 	if (p->comptrustbyte < 0 || p->comptrustbyte > 3) {
@@ -462,6 +466,9 @@ void fixup_prefs (struct uae_prefs *p, bool userconfig)
 #endif
 	cfgfile_compatibility_romtype(p);
 
+#ifdef AMIBERRY
+	if (!fixup_prefs_preview_active)
+#endif
 	read_kickstart_version(p);
 
 	if (p->cpuboard_type && p->cpuboardmem1.size > cpuboard_maxmemory(p)) {
@@ -658,14 +665,6 @@ void fixup_prefs (struct uae_prefs *p, bool userconfig)
 		p->produce_sound = 0;
 	}
 
-	if ((p->z3fastmem[0].size || p->z3fastmem[1].size || p->z3fastmem[2].size || p->z3fastmem[3].size || p->z3chipmem.size) && p->address_space_24) {
-		error_log (_T("Z3 fast memory can't be used if address space is 24-bit."));
-		p->z3fastmem[0].size = 0;
-		p->z3fastmem[1].size = 0;
-		p->z3fastmem[2].size = 0;
-		p->z3fastmem[3].size = 0;
-		p->z3chipmem.size = 0;
-	}
 	for (auto& rtgboard : p->rtgboards)
 	{
 		if (rtgboard.rtgmem_size > 0 && rtgboard.rtgmem_type == GFXBOARD_UAE_Z3 && p->address_space_24) {
@@ -811,7 +810,7 @@ void fixup_prefs (struct uae_prefs *p, bool userconfig)
 		p->cs_ciaatod = p->ntscmode ? 2 : 1;
 	}
 
-	// PCem does not support max speed.
+	// The 86Box PC side does not support max speed.
 	p->x86_speed_throttle = std::max<float>(p->x86_speed_throttle, 0);
 
 	if (p->cs_hsyncadjust < 2 * 4 * 2) {
@@ -828,14 +827,67 @@ void fixup_prefs (struct uae_prefs *p, bool userconfig)
 	}
 
 	built_in_chipset_prefs (p);
+#ifdef AMIBERRY
+	if (!fixup_prefs_preview_active) {
+#endif
 	blkdev_fix_prefs (p);
 	inputdevice_fix_prefs(p, userconfig);
+#ifdef AMIBERRY
+	}
+#endif
 	target_fixup_options (p);
 #ifndef AMIBERRY
 	// This one caused crashes in some cases, and I don't think it's actually needed in Amiberry
 	cfgfile_createconfigstore(p);
 #endif
 }
+
+#ifdef AMIBERRY
+thread_local bool fixup_prefs_preview_active;
+
+namespace {
+// One preview: sets fixup_prefs_preview_active and, however the preview
+// ends (the settings layer catches exceptions at its C boundary), clears it
+// and puts back the process globals a preview reaches. The target defaults
+// a preset preview applies configure the default ports through
+// inputdevice_joyport_config(), which calls set_config_changed() and
+// records port memory (keyboard-layout fallbacks, recently used devices);
+// a preview must neither make the running emulator process a change nor
+// alter that memory.
+struct preview_scope {
+	const int changed = config_changed;
+	const int changed_flags = config_changed_flags;
+	struct inputdevice_port_memory* const port_memory = inputdevice_port_memory_save();
+	preview_scope() { fixup_prefs_preview_active = true; }
+	~preview_scope()
+	{
+		fixup_prefs_preview_active = false;
+		config_changed = changed;
+		config_changed_flags = changed_flags;
+		inputdevice_port_memory_restore(port_memory);
+	}
+	preview_scope(const preview_scope&) = delete;
+	preview_scope& operator=(const preview_scope&) = delete;
+};
+}
+
+void fixup_prefs_preview(struct uae_prefs *p)
+{
+	// fixup_cpu() can recompute the boot ROM type through need_uae_boot_rom().
+	const int boot_rom_type = uae_boot_rom_type;
+	{
+		preview_scope scope;
+		fixup_prefs(p, true);
+	}
+	uae_boot_rom_type = boot_rom_type;
+}
+
+int built_in_prefs_preview(struct uae_prefs *p, int model, int config, int compa)
+{
+	preview_scope scope;
+	return built_in_prefs(p, model, config, compa, 0);
+}
+#endif
 
 int quit_program = 0;
 static int restart_program;
@@ -873,11 +925,40 @@ void uae_quit (void)
 	target_quit ();
 }
 
+// The configuration a restart with the pending configuration starts with.
+// Kept apart until the old emulation has shut down, which it does with the
+// active configuration it was built from.
+static struct uae_prefs restart_pending_prefs;
+static bool restart_with_pending;
+
+void uae_restart_with_pending_prefs (void)
+{
+	uae_restart (&currprefs, 0, nullptr);
+	copy_prefs (&changed_prefs, &restart_pending_prefs);
+	restart_with_pending = true;
+}
+
+bool uae_restart_pending (void)
+{
+	return restart_program != 0;
+}
+
+void uae_cancel_restart (void)
+{
+	restart_program = 0;
+	restart_with_pending = false;
+}
+
 /* 0 = normal, 1 = nogui, -1 = disable nogui, -2 = autorestart */
 void uae_restart(struct uae_prefs *p, int opengui, const TCHAR *cfgfile)
 {
-	uae_quit ();
+	// A later restart decides what it starts with.
+	restart_with_pending = false;
+	// Set restart_program before uae_quit() so target_quit() can tell a
+	// restart from a real quit and avoid blocking work that only a quit
+	// needs (for example waiting for the update check's thread).
 	restart_program = opengui == -2 ? 4 : (opengui > 0 ? 1 : (opengui == 0 ? 2 : 3));
+	uae_quit ();
 	restart_config[0] = 0;
 	default_config = 0;
 	if (cfgfile)
@@ -1011,13 +1092,27 @@ void usage()
 	std::cout << " --log                      Show log output to console." << '\n';
 	std::cout << " --jit-selftest             Run JIT VM/write/execute selftest (ARM64 or x86_64) and exit." << '\n';
 	std::cout << " --dump-paths               Resolve startup paths, print them, and exit." << '\n';
-	std::cout << " --download-whdboot         Download/update WHDBooter files and exit." << '\n';
+	std::cout << " --dump-config              Print the resolved configuration (defaults, config file and" << '\n';
+	std::cout << "                            command line options, after fixup_prefs) and exit." << '\n';
+	std::cout << " --settings-schema[=<file>] Print the shared settings layer's options (only the IDs" << '\n';
+	std::cout << "                            listed in <file>), presets, resolution, availability and" << '\n';
+	std::cout << "                            transition tables as JSON and exit." << '\n';
+#ifdef AMIBERRY_NATIVE_UI_TESTS
+	std::cout << " --native-ui-tests=<bundle> Run the native UI bridge tests (an XCTest bundle) where" << '\n';
+	std::cout << "                            the GUI would open, and exit with their result." << '\n';
+#endif
+	std::cout << " --download-whdboot         Download/update the WHDBooter files and exit. WHDLoad" << '\n';
+	std::cout << "                            comes from whdload.de; the RTB files, JST and the" << '\n';
+	std::cout << "                            optional Amiga libraries from Aminet." << '\n';
 	std::cout << " -f <file>                  Load a configuration file." << '\n';
 	std::cout << " --config <file>            " << '\n';
+	std::cout << " --apply-preset <preset>[:<config>[:<compatibility>]]" << '\n';
+	std::cout << "                            Apply a Quickstart preset (for example a1200:1:1) through" << '\n';
+	std::cout << "                            the shared settings layer. Combine with --dump-config." << '\n';
 	std::cout << " --model <Amiga Model>      Amiga model to emulate, from the QuickStart options." << '\n';
 	std::cout << "                            Available options are: A1000, A500, A500P, A600, A2000, A3000, A1200, A4000, CD32 and CDTV.\n" <<
 		'\n';
-	std::cout << " --autoload <file>          Load an RP9 package, an .lha WHDLoad game, or a CD image." << '\n';
+	std::cout << " --autoload <file>          Load an RP9 package, a WHDLoad game (.lha, .lzh, .lzx), or a CD image." << '\n';
 	std::cout << " --cdimage <file>           Load the CD image provided when starting emulation." << '\n';
 	std::cout << " --statefile <file>         Load a save state file." << '\n';
 	std::cout << " -s <option>=<value>        Set one or more configuration options directly, without loading a file." <<
@@ -1026,7 +1121,7 @@ void usage()
 		'\n';
 	std::cout << "\nAdditional options:" << '\n';
 	std::cout << "amiberry <file>             Auto-detect the type of file and use the default action for it." << '\n';
-	std::cout << "                            Supported file types are: .uae configs, .rp9 packages, .lha WHDLoad, CD and disk images." << '\n';
+	std::cout << "                            Supported file types are: .uae configs, .rp9 packages, .lha WHDLoad games, CD and disk images." << '\n';
 	std::cout << " -0 <disk.adf>              Insert specified ADF image into emulated floppy drive 0-3." << '\n';
 	std::cout << " -1 <disk.adf>              " << '\n';
 	std::cout << " -2 <disk.adf>              " << '\n';
@@ -1054,7 +1149,7 @@ void usage()
 	std::cout << " -F <value>                 Fastmem size, value in 1MB blocks, i.e. 2=2MB." << '\n';
 	std::cout << " -b <value>                 Bogomem size, value in 256KB blocks, i.e. 2=512KB." << '\n';
 	std::cout << " -c <value>                 Size of chip memory (in number of 512 KBytes chunks)." << '\n';
-	std::cout << " -I <value>                 Set keyboard layout language. Possible values: de, dk, us, se, fr, it, es." <<
+	std::cout << " -l <value>                 Set keyboard layout language. Possible values: de, dk, us, se, fr, it, es." <<
 		'\n';
 	std::cout << " -O <value>                 Set graphics specs." << '\n';
 	std::cout << " -H <value>                 Color mode." << '\n';
@@ -1070,10 +1165,16 @@ void usage()
 	std::cout << "This will load the conf/A500.uae configuration file, with the save state named game." << '\n';
 	std::cout << "It will override 'use_gui' to 'no', so that it enters emulation directly." << '\n';
 	std::cout << "\nExample 3:" << '\n';
-	std::cout << "amiberry lha/MyGame.lha" << '\n';
 	std::cout << "This will load the WHDLoad game MyGame.lha, using the autoload mechanism." << '\n';
 	exit(0);
 }
+
+// Set by parse_cmdline()/parse_cmdline_2() when the recorded configuration
+// source failed to load, or a required option argument was absent; the dump
+// refuses to serialize in those cases instead of presenting defaults as if
+// they were the requested configuration.
+static bool cmdline_config_source_failed;
+static bool cmdline_missing_operand;
 
 static void parse_cmdline_2 (int argc, TCHAR **argv)
 {
@@ -1082,8 +1183,10 @@ static void parse_cmdline_2 (int argc, TCHAR **argv)
 		if (_tcsncmp(argv[i], _T("-cfgparam="), 10) == 0) {
 			cfgfile_addcfgparam(argv[i] + 10);
 		} else if (_tcscmp(argv[i], _T("-cfgparam")) == 0) {
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log (_T("Missing argument for '-cfgparam' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 				cfgfile_addcfgparam (argv[++i]);
 		}
@@ -1126,6 +1229,9 @@ static void parse_diskswapper (const TCHAR *s)
 					continue;
 				}
 
+#ifdef AMIBERRY
+				target_resolve_relative_path(path, MAX_DPATH);
+#endif
 				auto *expanded = target_expand_environment(path, nullptr, 0);
 				const TCHAR *use_path = expanded ? expanded : path;
 
@@ -1170,12 +1276,37 @@ static TCHAR *parsetextpath (const TCHAR *s)
 	auto* const s2 = parsetext (s);
 	auto* const s3 = target_expand_environment (s2, nullptr, 0);
 	xfree(s2);
+#ifdef AMIBERRY
+	TCHAR resolved[MAX_DPATH];
+	_tcsncpy(resolved, s3, MAX_DPATH - 1);
+	resolved[MAX_DPATH - 1] = 0;
+	if (target_resolve_relative_path(resolved, MAX_DPATH)) {
+		xfree(s3);
+		return my_strdup(resolved);
+	}
+#endif
 	return s3;
+}
+
+// The archive types --autoload sends to WHDBooter: it mounts the archive itself
+// as the game drive, and the archive filesystem reads LHA (.lha/.lzh) and LZX
+// alike. --autoload names WHDLoad content explicitly; a positional .lzh/.lzx
+// may be a packed disk image instead.
+static bool is_whdload_archive_extension(const std::string& extension)
+{
+	return _tcsicmp(extension.c_str(), ".lha") == 0
+		|| _tcsicmp(extension.c_str(), ".lzh") == 0
+		|| _tcsicmp(extension.c_str(), ".lzx") == 0;
 }
 
 #ifdef AMIBERRY
 static void register_cmdline_rp9_rom_sources(const int argc, TCHAR** argv)
 {
+	struct rom_directory_scan {
+		std::string path;
+		int key_count;
+	};
+	std::vector<rom_directory_scan> registered_directories;
 	for (auto index = 1; index < argc; ++index) {
 		if (argv[index][0] != '-')
 			continue;
@@ -1232,7 +1363,21 @@ static void register_cmdline_rp9_rom_sources(const int argc, TCHAR** argv)
 
 			auto* const path = parsetextpath(path_argument);
 			if (directory) {
+				// Autoload callers may repeat these options to restore preferences.
+				// Retry if a later source added a key needed by an encrypted ROM.
+				// The keyring only grows during this pre-scan.
+				const auto previous_scan = std::find_if(registered_directories.begin(),
+					registered_directories.end(), [path](const auto& scan) { return scan.path == path; });
+				if (previous_scan != registered_directories.end()
+					&& previous_scan->key_count == get_keyring()) {
+					xfree(path);
+					continue;
+				}
 				const auto registered = rp9_register_rom_directory(path);
+				if (previous_scan != registered_directories.end())
+					previous_scan->key_count = get_keyring();
+				else
+					registered_directories.push_back({ path, get_keyring() });
 				if (registered > 0) {
 					write_log(_T("RP9: registered %d ROM(s) from command-line ROM path '%s'\n"), registered, path);
 				}
@@ -1260,6 +1405,11 @@ extern void set_last_active_config(const char* filename);
 extern void set_last_active_config_from_media(const char* filename);
 
 static bool cmdline_started;
+// Set by parse_cmdline() when a command line argument replaces the default
+// configuration source (config file, RP9 package, WHDLoad archive, CD image).
+// --dump-config reports it in the header.
+static TCHAR cmdline_config_source[MAX_DPATH];
+
 
 #ifdef LIBRETRO
 void reset_parse_cmdline()
@@ -1277,6 +1427,14 @@ static void parse_cmdline (int argc, TCHAR **argv)
 	if (cmdline_started)
 		return;
 	cmdline_started = true;
+#ifdef AMIBERRY
+	// "./" paths typed on the command line stay relative to the working directory;
+	// configuration files loaded from here switch back to the relative path base.
+	struct cmdline_path_scope {
+		bool previous = target_set_cmdline_path_mode(true);
+		~cmdline_path_scope() { target_set_cmdline_path_mode(previous); }
+	} const path_scope;
+#endif
 
 #ifdef AMIBERRY
 	// RP9 validates required ROMs as soon as --autoload is parsed, so publish
@@ -1315,16 +1473,21 @@ static void parse_cmdline (int argc, TCHAR **argv)
 				i++;
 		}
 		else if (_tcscmp(argv[i], _T("--config")) == 0 || _tcscmp(argv[i], _T("-f")) == 0) {
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '--config' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 			{
 				auto* const txt = parsetextpath(argv[++i]);
+				_tcsncpy(cmdline_config_source, txt, MAX_DPATH - 1);
+				cmdline_config_source[MAX_DPATH - 1] = 0;
 				currprefs.mountitems = 0;
-				target_cfgfile_load(&currprefs, txt,
+				if (!target_cfgfile_load(&currprefs, txt,
 					firstconfig
 					? CONFIG_TYPE_ALL
-					: CONFIG_TYPE_HARDWARE | CONFIG_TYPE_HOST | CONFIG_TYPE_NORESET, 0);
+					: CONFIG_TYPE_HARDWARE | CONFIG_TYPE_HOST | CONFIG_TYPE_NORESET, 0))
+					cmdline_config_source_failed = true;
 				xfree(txt);
 				firstconfig = false;
 				config_loaded = true;
@@ -1332,8 +1495,10 @@ static void parse_cmdline (int argc, TCHAR **argv)
 			loaded = true;
 		}
 		else if (_tcscmp(argv[i], _T("--model")) == 0) {
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '--model' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 			{
 				auto* const txt = parsetextpath(argv[++i]);
@@ -1379,9 +1544,69 @@ static void parse_cmdline (int argc, TCHAR **argv)
 				}
 			}
 		}
+#ifndef LIBRETRO
+		// Applies a Quickstart preset (model[:config[:compatibility]], for
+		// example a1200:1:1) through the shared settings layer; combined
+		// with --dump-config it shows the configuration the preset produces.
+		// The libretro core has no settings layer; RetroArch chooses models
+		// through its own core options.
+		else if (_tcscmp(argv[i], _T("--apply-preset")) == 0) {
+			if (i + 1 == argc) {
+				write_log(_T("Missing argument for '--apply-preset' option.\n"));
+				cmdline_missing_operand = true;
+			}
+			else
+			{
+				auto* const txt = parsetextpath(argv[++i]);
+				TCHAR spec[64] = {};
+				_tcsncpy(spec, txt, sizeof spec / sizeof(TCHAR) - 1);
+				xfree(txt);
+				TCHAR original[64];
+				_tcscpy(original, spec);
+				// model[:config[:compatibility]]: every part must parse
+				// completely and lie within the preset's ranges, so a typo
+				// cannot silently produce another machine.
+				auto parse_part = [](const TCHAR* text, int& out) {
+					if (!text[0])
+						return false;
+					TCHAR* end = nullptr;
+					const long value = _tcstol(text, &end, 10);
+					if (*end || value < 0 || value > 255)
+						return false;
+					out = static_cast<int>(value);
+					return true;
+				};
+				TCHAR* config_part = _tcschr(spec, ':');
+				TCHAR* compa_part = nullptr;
+				if (config_part) {
+					*config_part++ = 0;
+					compa_part = _tcschr(config_part, ':');
+					if (compa_part)
+						*compa_part++ = 0;
+				}
+				const amiberry_settings_preset* preset = amiberry_settings_preset_find(spec);
+				int config = 0;
+				int compatibility = preset ? std::min(1, preset->compatibility_max) : 0;
+				int model = -1;
+				const bool valid = preset
+					&& (!config_part || parse_part(config_part, config))
+					&& (!compa_part || parse_part(compa_part, compatibility))
+					&& amiberry_settings::check_preset(spec, config, compatibility, model) == AMIBERRY_SETTINGS_OK;
+				if (!valid) {
+					write_log(_T("Invalid preset '%s' for '--apply-preset' (model[:config[:compatibility]] within the preset's ranges).\n"),
+						original);
+					cmdline_missing_operand = true;
+				} else {
+					amiberry_settings::apply_preset(currprefs, model, config, compatibility, false);
+				}
+			}
+		}
+#endif
 		else if (_tcscmp(argv[i], _T("--statefile")) == 0) {
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '--statefile' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 			{
 				auto* const txt = parsetextpath(argv[++i]);
@@ -1409,11 +1634,15 @@ static void parse_cmdline (int argc, TCHAR **argv)
 		// Auto-load RP9, WHDLoad or CD content.
 		else if (_tcscmp(argv[i], _T("--autoload")) == 0)
 		{
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '--autoload' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 			{
 				auto* const txt = parsetextpath(argv[++i]);
+				_tcsncpy(cmdline_config_source, txt, MAX_DPATH - 1);
+				cmdline_config_source[MAX_DPATH - 1] = 0;
 				const auto txt2 = get_filename_extension(txt); // Extract the extension from the string  (incl '.')
 				std::error_code autoload_ec;
 				if (std::filesystem::is_directory(txt, autoload_ec))
@@ -1432,8 +1661,10 @@ static void parse_cmdline (int argc, TCHAR **argv)
 					write_log("RP9... %s\n", txt);
 					if (target_cfgfile_load(&currprefs, txt, CONFIG_TYPE_ALL, 0))
 						config_loaded = true;
+					else
+						cmdline_config_source_failed = true;
 				}
-				else if (_tcsicmp(txt2.c_str(), ".lha") == 0)
+				else if (is_whdload_archive_extension(txt2))
 				{
 					write_log("WHDLoad... %s\n", txt);
 					add_file_to_mru_list(lstMRUWhdloadList, std::string(txt));
@@ -1448,30 +1679,51 @@ static void parse_cmdline (int argc, TCHAR **argv)
 					add_file_to_mru_list(lstMRUCDList, std::string(txt));
 					cd_auto_prefs(&currprefs, txt);
 				}
-				else
+				else {
 					write_log("Unknown extension for autoload... %s\n", txt);
+					// The requested media type cannot provide preferences;
+					// dumping defaults under its name would be misleading.
+					cmdline_config_source_failed = true;
+				}
 				xfree(txt);
 				loaded = true;
 			}
 		}
-		else if (_tcscmp(argv[i], _T("--log")) == 0)
-			console_logging = 1;
+		else if (_tcscmp(argv[i], _T("--log")) == 0) {
+			// write_log() console output goes to stdout and would interleave
+			// with the serialized configuration; --dump-config ignores --log.
+			if (!amiberry_dump_config_mode)
+				console_logging = 1;
+		}
 		else if (_tcscmp(argv[i], _T("--rescan-roms")) == 0)
 		{
 			// already handled during the early platform startup scan
 		}
+#ifdef AMIBERRY_NATIVE_UI_TESTS
+		else if (_tcsncmp(argv[i], _T("--native-ui-tests="), 18) == 0)
+		{
+			// handled in amiberry_main(); the tests run in gui_init()
+		}
+#endif
 		else if (_tcscmp(argv[i], _T("-s")) == 0)
 		{
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '-s' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 				cfgfile_parse_line(&currprefs, argv[++i], 0);
 		} else if (_tcscmp(argv[i], _T("--cdimage")) == 0) {
-			if (i + 1 == argc)
+			if (i + 1 == argc) {
 				write_log(_T("Missing argument for '--cdimage' option.\n"));
+				cmdline_missing_operand = true;
+				}
 			else
 			{
 				auto* const txt = parsetextpath(argv[++i]);
+				// A CD image attaches media on top of the current
+				// configuration; it is not a configuration source itself.
+				cmdline_config_source[0] = 0;
 				auto* const txt2 = xmalloc(TCHAR, _tcslen(txt) + 7);
 				_tcscpy(txt2, txt);
 				if (_tcsrchr(txt2, ',') == nullptr)
@@ -1496,6 +1748,8 @@ static void parse_cmdline (int argc, TCHAR **argv)
 				i++;
 		} else if (!loaded) {
 			auto* const txt = parsetextpath(argv[i]);
+			_tcsncpy(cmdline_config_source, txt, MAX_DPATH - 1);
+			cmdline_config_source[MAX_DPATH - 1] = 0;
 			const auto txt2 = get_filename_extension(txt); // Extract the extension from the string  (incl '.')
 #ifdef AMIBERRY
 			if (_tcsicmp(txt2.c_str(), ".rp9") == 0)
@@ -1505,7 +1759,10 @@ static void parse_cmdline (int argc, TCHAR **argv)
 					config_loaded = true;
 					currprefs.start_gui = false;
 				}
+				else
+					cmdline_config_source_failed = true;
 			}
+			// Only .lha: an LZX- or LZH-packed disk image goes to DF0: below.
 			else if (_tcsicmp(txt2.c_str(), ".lha") == 0)
 			{
 				write_log("WHDLoad... %s\n", txt);
@@ -1515,6 +1772,9 @@ static void parse_cmdline (int argc, TCHAR **argv)
 			}
 			else if (_tcscmp(txt2.c_str(), ".uss") == 0)
 			{
+				// A statefile is not a configuration source; drop the
+				// positional path recorded above.
+				cmdline_config_source[0] = 0;
 				write_log("Statefile... %s\n", txt);
 				if (my_existsfile2(txt))
 				{
@@ -1539,12 +1799,12 @@ static void parse_cmdline (int argc, TCHAR **argv)
 				add_file_to_mru_list(lstMRUCDList, std::string(txt));
 				cd_auto_prefs(&currprefs, txt);
 			}
-			else if (_tcscmp(txt2.c_str(), ".adf") == 0
-				|| _tcscmp(txt2.c_str(), ".adz") == 0
-				|| _tcscmp(txt2.c_str(), ".dms") == 0
-				|| _tcscmp(txt2.c_str(), ".ipf") == 0
-				|| _tcscmp(txt2.c_str(), ".zip") == 0
-				|| _tcscmp(txt2.c_str(), ".7z") == 0
+			else if (_tcsicmp(txt2.c_str(), ".adf") == 0
+				|| _tcsicmp(txt2.c_str(), ".adz") == 0
+				|| _tcsicmp(txt2.c_str(), ".dms") == 0
+				|| _tcsicmp(txt2.c_str(), ".ipf") == 0
+				|| _tcsicmp(txt2.c_str(), ".zip") == 0
+				|| _tcsicmp(txt2.c_str(), ".7z") == 0
 				)
 			{
 				write_log("Floppy... %s\n", txt);
@@ -1565,25 +1825,31 @@ static void parse_cmdline (int argc, TCHAR **argv)
 				}
 
 				std::string config_full_path = get_configuration_path() + filename;
-				if (my_existsfile2(config_full_path.c_str()))
-				{
-					write_log("Loading configuration file %s\n", config_full_path.c_str());
-					currprefs.mountitems = 0;
-					target_cfgfile_load(&currprefs, config_full_path.c_str(),
-						firstconfig
-						? CONFIG_TYPE_ALL
-						: CONFIG_TYPE_HARDWARE | CONFIG_TYPE_HOST | CONFIG_TYPE_NORESET, 0);
-					currprefs.start_gui = false;
-					config_loaded = true;
-				}
-				else
-				{
-					write_log("No configuration file found for %s, inserting disk in DF0: with default settings\n", txt);
-					disk_insert(0, txt);
-					set_last_active_config_from_media(txt);
-					currprefs.start_gui = false;
-				}
+			if (my_existsfile2(config_full_path.c_str()))
+			{
+				write_log("Loading configuration file %s\n", config_full_path.c_str());
+				_tcsncpy(cmdline_config_source, config_full_path.c_str(), MAX_DPATH - 1);
+				cmdline_config_source[MAX_DPATH - 1] = 0;
+				currprefs.mountitems = 0;
+				if (!target_cfgfile_load(&currprefs, config_full_path.c_str(),
+					firstconfig
+					? CONFIG_TYPE_ALL
+					: CONFIG_TYPE_HARDWARE | CONFIG_TYPE_HOST | CONFIG_TYPE_NORESET, 0))
+					cmdline_config_source_failed = true;
+				currprefs.start_gui = false;
+				config_loaded = true;
 			}
+			else
+			{
+				write_log("No configuration file found for %s, inserting disk in DF0: with default settings\n", txt);
+				// A plain disk image is not a configuration source; drop
+				// the positional path recorded above.
+				cmdline_config_source[0] = 0;
+				disk_insert(0, txt);
+				set_last_active_config_from_media(txt);
+				currprefs.start_gui = false;
+			}
+		}
 #endif
 			else
 			{
@@ -1592,14 +1858,40 @@ static void parse_cmdline (int argc, TCHAR **argv)
 					const auto type = zfile_gettype(z);
 					zfile_fclose(z);
 					if (type == ZFILE_CONFIGURATION) {
+						_tcsncpy(cmdline_config_source, txt, MAX_DPATH - 1);
+						cmdline_config_source[MAX_DPATH - 1] = 0;
 						currprefs.mountitems = 0;
-						target_cfgfile_load(&currprefs, txt, CONFIG_TYPE_ALL, 0);
+						if (!target_cfgfile_load(&currprefs, txt, CONFIG_TYPE_ALL, 0))
+							cmdline_config_source_failed = true;
 						config_loaded = true;
 					}
 					else if (type == ZFILE_STATEFILE) {
+						// A statefile is not a configuration source; drop
+						// the positional path recorded above.
+						cmdline_config_source[0] = 0;
 						savestate_state = STATE_DORESTORE;
 						_tcscpy(savestate_fname, txt);
 					}
+					else if (type == ZFILE_DISKIMAGE) {
+						// A floppy image the extension list above does not
+						// name (.scp, .fdi, an extensionless ADF, ...).
+						write_log("Floppy... %s\n", txt);
+						cmdline_config_source[0] = 0;
+						disk_insert(0, txt);
+						set_last_active_config_from_media(txt);
+						currprefs.start_gui = false;
+					}
+					else {
+						// Openable media of another type is not a
+						// configuration source either.
+						cmdline_config_source[0] = 0;
+					}
+				}
+				else {
+					// The positional file cannot be opened at all: treat it
+					// like -f with a missing file rather than dumping
+					// defaults under its name.
+					cmdline_config_source_failed = true;
 				}
 			}
 			xfree(txt);
@@ -1642,6 +1934,128 @@ static void parse_cmdline_and_init_file(int argc, TCHAR **argv)
 
 	fixup_prefs(&currprefs, false);
 }
+
+#ifdef AMIBERRY
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+extern void rp9_cleanup();
+// --dump-config entry point: resolve currprefs exactly as a normal start would
+// and print the result to stdout, without starting the emulator. The sequence
+// mirrors real_main2()/parse_cmdline_and_init_file(): built-in defaults, the
+// default configuration (if present), command line overrides (-f/-s/--model/
+// ...), then fixup_prefs() -- so the dump shows what the emulator settled on,
+// including the silent corrections fixup_prefs applies.
+int dump_config_and_exit(int argc, TCHAR* argv[])
+{
+#ifdef _WIN32
+	// Redirected stdout stays in text mode on Windows, translating every LF
+	// in the dump to CRLF and breaking the byte-for-byte comparison with a
+	// saved .uae. Switch the stream to binary before emitting anything.
+	fflush(stdout);
+	_setmode(_fileno(stdout), _O_BINARY);
+#endif
+	default_prefs(&currprefs, true, 0);
+	fixup_prefs(&currprefs, true);
+
+	parse_cmdline_2(argc, argv);
+
+	TCHAR default_config_path[MAX_DPATH] = {};
+	get_configuration_path(default_config_path, sizeof default_config_path / sizeof(TCHAR));
+	_tcscat(default_config_path, OPTIONSFILENAME);
+	_tcscat(default_config_path, _T(".uae"));
+	const bool have_default_config = my_existsfile2(default_config_path) != 0;
+	bool default_config_load_failed = false;
+	if (have_default_config) {
+		if (!target_cfgfile_load(&currprefs, default_config_path, CONFIG_TYPE_DEFAULT, 1)) {
+			write_log(_T("failed to load config '%s'\n"), default_config_path);
+			default_config_load_failed = true;
+		}
+	}
+
+	// Corrections logged against configurations that the command line is about
+	// to replace (the normalised defaults, and the default configuration when
+	// a -f config follows) are noise: only the fixes applied to the final
+	// resolution belong on stderr.
+	error_log(nullptr);
+	parse_cmdline(argc, argv);
+	fixup_prefs(&currprefs, false);
+
+	// parse_cmdline() records whatever command line argument replaced the
+	// default configuration source: -f/--config, a positional config, or an
+	// autoloaded RP9/WHDLoad/CD package.
+	const TCHAR* config_file = cmdline_config_source[0] ? cmdline_config_source : nullptr;
+	// An RP9 package (--autoload, -f or positional) extracts its media into a
+	// temporary directory during resolution. The resolved preferences already
+	// carry the media paths, so remove the tree now: this covers every exit
+	// path below, not just the success path.
+	rp9_cleanup();
+	if (cmdline_config_source_failed) {
+		fprintf(stderr, "--dump-config: failed to load '%s'; refusing to dump, since the\n"
+			"result would show unrelated settings as if they came from that file.\n",
+			cmdline_config_source);
+		return 1;
+	}
+	if (default_config_load_failed && !config_file) {
+		// The default configuration is what these preferences claim to come
+		// from; with it unreadable, the dump would present unrelated settings
+		// under its name. An explicit configuration source replaces it, so a
+		// failed default only matters when nothing else was loaded.
+		fprintf(stderr, "--dump-config: failed to load the default configuration '%s';\n"
+			"refusing to dump unrelated settings under its name.\n", default_config_path);
+		return 1;
+	}
+	if (cmdline_missing_operand) {
+		// A required option argument was absent; the dump would look like a
+		// valid defaults dump while the command line was malformed.
+		fprintf(stderr, "--dump-config: incomplete command line (an option was missing its argument);\n"
+			"refusing to dump.\n");
+		return 1;
+	}
+
+	printf("; --dump-config: resolved configuration (currprefs after fixup_prefs)\n");
+	printf("; %s\n", get_version_string().c_str());
+	printf("; default configuration: %s\n",
+		have_default_config ? default_config_path : _T("(not found)"));
+	printf("; configuration file: %s\n",
+		config_file ? config_file
+		: (have_default_config ? default_config_path : _T("(built-in defaults)")));
+	fflush(stdout);
+
+	if (!cfgfile_dump_config(&currprefs, 0)) {
+		fprintf(stderr, "--dump-config: failed to serialise the resolved configuration.\n");
+		return 1;
+	}
+	// A buffered write can still fail here (full disk, closed pipe); without
+	// this check the dump would exit successfully with truncated output.
+	if (fflush(stdout) != 0) {
+		fprintf(stderr, "--dump-config: writing the configuration to stdout failed.\n");
+		return 1;
+	}
+
+	if (is_error_log()) {
+		TCHAR* const corrections = get_error_log();
+		if (corrections && corrections[0])
+			fprintf(stderr, "; corrections applied to the resolved configuration:\n%s", corrections);
+		xfree(corrections);
+	}
+	// Entries no parser took (the dump echoes them back as they were):
+	// reported, so a key the writer spells differently from the parser
+	// does not pass for a stored setting.
+	bool unknown_reported = false;
+	for (const struct strlist* line = currprefs.all_lines; line; line = line->next) {
+		if (!line->unknown)
+			continue;
+		if (!unknown_reported) {
+			fprintf(stderr, "; unknown configuration entries:\n");
+			unknown_reported = true;
+		}
+		fprintf(stderr, "%s=%s\n", line->option, line->value ? line->value : _T(""));
+	}
+	return 0;
+}
+#endif
 
 /* Okay, this stuff looks strange, but it is here to encourage people who
 * port UAE to re-use as much of this code as possible. Functions that you
@@ -1686,9 +2100,12 @@ static void leave_program ()
 
 long get_file_size(const std::string& filename)
 {
-	struct stat stat_buf{};
-	const auto rc = stat(filename.c_str(), &stat_buf);
-	return rc == 0 ? static_cast<long>(stat_buf.st_size) : -1;
+	// Not stat(): sysdeps.h redefines it as posixemu_stat(), whose STAT
+	// argument is not `struct stat` on every target (it is _stat64 under
+	// MinGW), so the plain POSIX spelling does not compile everywhere.
+	std::error_code ec;
+	const auto size = std::filesystem::file_size(filename, ec);
+	return ec ? -1 : static_cast<long>(size);
 }
 
 // In case of error, print the error code and close the application
@@ -1853,6 +2270,10 @@ void real_main (int argc, TCHAR **argv)
 	default_config = 1;
 
 	while (restart_program) {
+		if (restart_with_pending) {
+			copy_prefs(&restart_pending_prefs, &currprefs);
+			restart_with_pending = false;
+		}
 		copy_prefs(&currprefs, &changed_prefs);
 		const auto ret = real_main2 (argc, argv);
 		if (ret == 0 && quit_to_gui)

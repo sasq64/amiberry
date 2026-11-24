@@ -3,7 +3,8 @@ package com.blitterstudio.amiberry.data
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
 import com.blitterstudio.amiberry.data.model.EmulatorSettingsConstraints
-import com.blitterstudio.amiberry.data.model.HardDrive
+import com.blitterstudio.amiberry.data.model.MountEntry
+import com.blitterstudio.amiberry.data.model.MountKind
 import com.blitterstudio.amiberry.data.model.StoragePaths
 import org.junit.Assert.*
 import org.junit.Rule
@@ -25,6 +26,53 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
+	fun `generate writes vkbd toggle when set`() {
+		val output = ConfigGenerator.generate(
+			EmulatorSettings(onScreenKeyboardButton = true, onScreenKeyboardToggle = "rightstick")
+		)
+		assertContains(output, "amiberry.vkbd_toggle=rightstick")
+	}
+
+	@Test
+	fun `generated explicitly empty vkbd toggle parses back as disabled`() {
+		val file = tempDir.newFile("disabled-toggle.uae")
+		file.writeText(
+			ConfigGenerator.generate(
+				EmulatorSettings(onScreenKeyboardButton = true, onScreenKeyboardToggle = "")
+			)
+		)
+
+		assertEquals("", ConfigParser.parse(file).settings.onScreenKeyboardToggle)
+	}
+
+	@Test
+	fun `saved default toggle survives remembered fallback on reload`() {
+		val file = tempDir.newFile("default-toggle.uae")
+		val settings = EmulatorSettings(onScreenKeyboardButton = true, onScreenKeyboardToggle = null)
+		for (generated in listOf(ConfigGenerator.generate(settings), ConfigGenerator.generateControlConfig(settings))) {
+			file.writeText(generated)
+			val parsed = ConfigParser.parse(file)
+			val reloaded = AndroidControlSettings.withFallback(
+				settings = parsed.settings,
+				explicitKeys = parsed.explicitKeys,
+				fallback = EmulatorSettings(onScreenKeyboardToggle = "rightstick")
+			)
+			assertNull(reloaded.onScreenKeyboardToggle)
+		}
+
+		// A legacy config written before the key existed must keep falling back
+		// to the remembered toggle.
+		file.writeText("amiberry.vkbd_enabled=true")
+		val legacyParsed = ConfigParser.parse(file)
+		val legacy = AndroidControlSettings.withFallback(
+			settings = legacyParsed.settings,
+			explicitKeys = legacyParsed.explicitKeys,
+			fallback = EmulatorSettings(onScreenKeyboardToggle = "rightstick")
+		)
+		assertEquals("rightstick", legacy.onScreenKeyboardToggle)
+	}
+
+	@Test
 	fun `generate includes CPU settings`() {
 		val output = ConfigGenerator.generate(EmulatorSettings(cpuModel = 68020))
 		assertContains(output, "cpu_model=68020")
@@ -40,9 +88,9 @@ class ConfigGeneratorTest {
 	// --- Conditional output ---
 
 	@Test
-	fun `generate omits FPU when fpuModel is 0`() {
-		val output = ConfigGenerator.generate(EmulatorSettings(fpuModel = 0))
-		assertNotContains(output, "fpu_model=")
+	fun `generate writes no FPU over a preset that has one`() {
+		val output = ConfigGenerator.generate(EmulatorSettings.fromModel(AmigaModel.A3000).copy(fpuModel = 0))
+		assertContainsLine(output.lines(), "fpu_model=0")
 	}
 
 	@Test
@@ -52,10 +100,9 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
-	fun `generate omits JIT when cachesize is 0`() {
-		val output = ConfigGenerator.generate(EmulatorSettings(jitCacheSize = 0))
-		assertNotContains(output, "cachesize=")
-		assertNotContains(output, "compfpu=")
+	fun `generate writes the JIT off over a preset that has it on`() {
+		val output = ConfigGenerator.generate(EmulatorSettings.fromModel(AmigaModel.A4000).copy(jitCacheSize = 0))
+		assertContainsLine(output.lines(), "cachesize=0")
 	}
 
 	@Test
@@ -66,9 +113,9 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
-	fun `generate omits z3mem when 0`() {
+	fun `generate writes no Z3 RAM explicitly`() {
 		val output = ConfigGenerator.generate(EmulatorSettings(z3Ram = 0))
-		assertNotContains(output, "z3mem_size=")
+		assertContainsLine(output.lines(), "z3mem_size=0")
 	}
 
 	@Test
@@ -78,16 +125,17 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
-	fun `generate constrained cycle exact chipset settings without immediate blits`() {
+	fun `generate constrained cycle exact chipset settings`() {
 		val constrained = EmulatorSettingsConstraints.apply(
-			EmulatorSettings(cycleExact = true, immediateBlits = true),
+			EmulatorSettings(cycleExact = "true", jitCacheSize = 8192),
 			hasTouchScreen = true
 		)
 		val output = ConfigGenerator.generate(constrained)
 		val lines = output.lines()
 
 		assertContainsLine(lines, "cycle_exact=true")
-		assertContainsLine(lines, "immediate_blits=false")
+		// The emulator turns the JIT off in cycle-exact mode.
+		assertContainsLine(lines, "cachesize=0")
 	}
 
 	@Test
@@ -128,22 +176,68 @@ class ConfigGeneratorTest {
 		val output = ConfigGenerator.generate(
 			EmulatorSettings(
 				hardDrives = listOf(
-					HardDrive(path = "/hd/system.hdf", readOnly = false, bootPriority = 0),
-					HardDrive(path = "/hd/work.hdf", readOnly = true, bootPriority = -1)
+					MountEntry(MountKind.Hardfile, path = "/hd/system.hdf", readOnly = false, bootPriority = 0, controller = "uae0"),
+					MountEntry(MountKind.Hardfile, path = "/hd/work.hdf", readOnly = true, bootPriority = -1, controller = "uae1")
 				)
 			)
 		)
 		val lines = output.lines()
-		assertContainsLine(lines, "hardfile2=rw,:/hd/system.hdf,0,0,0,512,0,,uae0")
-		assertContainsLine(lines, "hardfile2=ro,:/hd/work.hdf,0,0,0,512,-1,,uae1")
+		assertContainsLine(lines, "hardfile2=rw,:/hd/system.hdf,32,1,2,512,0,,uae0")
+		assertContainsLine(lines, "hardfile2=ro,:/hd/work.hdf,32,1,2,512,-1,,uae1")
 	}
 
 	@Test
 	fun `generate skips hard drive with empty path`() {
 		val output = ConfigGenerator.generate(
-			EmulatorSettings(hardDrives = listOf(HardDrive(path = "")))
+			EmulatorSettings(hardDrives = listOf(MountEntry(MountKind.Hardfile, path = "")))
 		)
 		assertNotContains(output, "hardfile2=")
+	}
+
+	@Test
+	fun `generate round trips every mount spelling`() {
+		val mounts = listOf(
+			MountEntry(MountKind.Directory, "/host/Work, files", "DH0", "Work", injectIcons = true),
+			MountEntry(MountKind.Hardfile, "/hd/system.hdf", "DH1", readOnly = true, bootPriority = -128,
+				sectors = 0, surfaces = 0, reserved = 0, controller = "ide0"),
+			MountEntry(MountKind.Cd, "", readOnly = true, sectors = 0, surfaces = 0, reserved = 0,
+				blockSize = 2048, controller = "scsi0", unit = 1),
+			MountEntry(MountKind.Tape, "/tapes", sectors = 0, surfaces = 0, reserved = 0,
+				controller = "uae0", unit = 2)
+		)
+		val file = tempDir.newFile("mounts.uae").apply { writeText(ConfigGenerator.generate(EmulatorSettings(hardDrives = mounts))) }
+		val parsed = ConfigParser.parse(file)
+
+		assertEquals(mounts, parsed.settings.hardDrives)
+		assertTrue(parsed.unknownLines.isEmpty())
+		assertContains(file.readText(), """filesystem2=rw,DH0:Work:"/host/Work, files",0""")
+	}
+
+	@Test
+	fun `generate quotes the geometry file as the native writer does`() {
+		val mount = MountEntry(MountKind.Hardfile, "/hd/system.hdf", "DH0", controller = "uae0",
+			physicalGeometry = "980/10/17", geometry = "/storage/disks/custom.geo")
+		val output = ConfigGenerator.generate(EmulatorSettings(hardDrives = listOf(mount)))
+		// The loader reads the geometry field only when it starts with a quote.
+		assertContains(output, """,uae0,0,980/10/17,"/storage/disks/custom.geo"""")
+		assertEquals(listOf(mount), roundTrip(EmulatorSettings(hardDrives = listOf(mount)), "geometry.uae").hardDrives)
+	}
+
+	@Test
+	fun `a CD drive after eight mounts stays editable`() {
+		val dirs = (0 until 9).map { MountEntry(MountKind.Directory, "/host/d$it", "DH$it", "V$it") }
+		val cd = MountEntry(MountKind.Cd, "", readOnly = true, sectors = 0, surfaces = 0, reserved = 0,
+			blockSize = 2048, controller = "scsi0", unit = 0)
+		val settings = EmulatorSettings(hardDrives = dirs + cd)
+		assertContains(ConfigGenerator.generate(settings), "uaehf9=cd0,")
+		assertEquals(dirs + cd, roundTrip(settings, "late-cd.uae").hardDrives)
+	}
+
+	@Test
+	fun `a directory whose device name was cleared is still saved`() {
+		val dir = MountEntry(MountKind.Directory, "/host/Work", "", "Work")
+		assertContains(ConfigGenerator.generate(EmulatorSettings(hardDrives = listOf(dir))), "filesystem2=rw,:Work:/host/Work,0")
+		assertEquals(listOf(dir), roundTrip(EmulatorSettings(hardDrives = listOf(dir)), "blank-device.uae").hardDrives)
 	}
 
 	// --- Joystick port 1 special handling ---
@@ -166,12 +260,35 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
+	fun `generate writes mouse map state explicitly for both ports`() {
+		val enabled = ConfigGenerator.generate(
+			EmulatorSettings(joyport0 = "joy0", joyport1 = "joy1", joyport0MouseMap = true, joyport1MouseMap = true)
+		)
+		assertContainsLine(enabled.lines(), "joyport0mousemap=1")
+		assertContainsLine(enabled.lines(), "joyport1mousemap=1")
+
+		val disabled = ConfigGenerator.generate(EmulatorSettings(joyport0 = "mouse", joyport1 = "joy0"))
+		assertContainsLine(disabled.lines(), "joyport0mousemap=0")
+		assertContainsLine(disabled.lines(), "joyport1mousemap=0")
+	}
+
+	@Test
+	fun `control config writes mouse map state explicitly`() {
+		val output = ConfigGenerator.generateControlConfig(
+			EmulatorSettings(joyport0 = "mouse", joyport1 = "joy0", joyport1MouseMap = true)
+		)
+
+		assertContainsLine(output.lines(), "joyport0mousemap=0")
+		assertContainsLine(output.lines(), "joyport1mousemap=1")
+	}
+
+	@Test
 	fun `generate writes enabled on-screen control contract`() {
 		val output = ConfigGenerator.generate(
 			EmulatorSettings(
 				joyport1 = "onscreen_joy",
 				onScreenJoystick = true,
-				onScreenKeyboard = true,
+				onScreenKeyboardButton = true,
 				onScreenKeyboardNumpad = true
 			)
 		)
@@ -181,7 +298,27 @@ class ConfigGeneratorTest {
 		assertContainsLine(lines, "amiberry.android_joyport1=onscreen_joy")
 		assertContainsLine(lines, "amiberry.onscreen_joystick=true")
 		assertContainsLine(lines, "amiberry.vkbd_enabled=true")
+		assertContainsLine(lines, "amiberry.vkbd_touch_button=true")
 		assertContainsLine(lines, "amiberry.vkbd_numpad=true")
+		assertContainsLine(lines, "input.default_osk=true")
+	}
+
+	@Test
+	fun `generate keeps gamepad keyboard access with the touch button hidden`() {
+		// Android TV: no on-screen controls, but the gamepad toggle still opens the keyboard.
+		val output = ConfigGenerator.generate(
+			EmulatorSettings(
+				joyport1 = "joy1",
+				onScreenJoystick = false,
+				onScreenKeyboardButton = false
+			)
+		)
+		val lines = output.lines()
+
+		assertContainsLine(lines, "amiberry.onscreen_joystick=false")
+		assertContainsLine(lines, "amiberry.vkbd_enabled=true")
+		assertContainsLine(lines, "amiberry.vkbd_touch_button=false")
+		assertContainsLine(lines, "amiberry.vkbd_toggle=default")
 		assertContainsLine(lines, "input.default_osk=true")
 	}
 
@@ -191,7 +328,8 @@ class ConfigGeneratorTest {
 			EmulatorSettings(
 				joyport1 = "joy1",
 				onScreenJoystick = false,
-				onScreenKeyboard = false
+				onScreenKeyboardButton = false,
+				onScreenKeyboardToggle = ""
 			)
 		)
 		val lines = output.lines()
@@ -200,8 +338,23 @@ class ConfigGeneratorTest {
 		assertContainsLine(lines, "amiberry.android_joyport1=joy1")
 		assertContainsLine(lines, "amiberry.onscreen_joystick=false")
 		assertContainsLine(lines, "amiberry.vkbd_enabled=false")
+		assertContainsLine(lines, "amiberry.vkbd_touch_button=false")
 		assertContainsLine(lines, "amiberry.vkbd_numpad=false")
+		assertContainsLine(lines, "amiberry.vkbd_toggle=")
 		assertContainsLine(lines, "input.default_osk=false")
+	}
+
+	@Test
+	fun `parse round-trips gamepad-only and fully disabled keyboard`() {
+		val gamepadOnly = EmulatorSettings(onScreenKeyboardButton = false, onScreenKeyboardToggle = "back")
+		val disabled = EmulatorSettings(onScreenKeyboardButton = false, onScreenKeyboardToggle = "")
+		for (original in listOf(gamepadOnly, disabled)) {
+			val file = tempDir.newFile()
+			file.writeText(ConfigGenerator.generate(original))
+			val parsed = ConfigParser.parse(file).settings
+			assertEquals(original.onScreenKeyboardButton, parsed.onScreenKeyboardButton)
+			assertEquals(original.onScreenKeyboardToggle, parsed.onScreenKeyboardToggle)
+		}
 	}
 
 	@Test
@@ -212,7 +365,8 @@ class ConfigGeneratorTest {
 				joyport0 = "mouse",
 				joyport1 = "joy1",
 				onScreenJoystick = false,
-				onScreenKeyboard = false
+				onScreenKeyboardButton = false,
+				onScreenKeyboardToggle = ""
 			)
 		)
 		val lines = output.lines()
@@ -246,6 +400,19 @@ class ConfigGeneratorTest {
 		assertFalse(lines.any { it.startsWith("joyport1=") })
 		assertContainsLine(lines, "amiberry.android_joyport1=onscreen_joy")
 		assertContainsLine(lines, "amiberry.onscreen_joystick=true")
+	}
+
+	@Test
+	fun `the WHDLoad control config carries the custom controls`() {
+		val control = requireNotNull(com.blitterstudio.amiberry.data.model.SettingsSchema.current).customControls.first()
+		val key = com.blitterstudio.amiberry.data.model.CustomControls.Key(1, false, control.axis, control.id)
+		val settings = EmulatorSettings(
+			joyport1 = "joy0",
+			customControls = com.blitterstudio.amiberry.data.model.CustomControls().with(key, "KEY_SPACE")
+		)
+		val lines = ConfigGenerator.generateControlConfig(settings).lines()
+
+		assertContainsLine(lines, "${key.id}=KEY_SPACE")
 	}
 
 	@Test
@@ -337,14 +504,14 @@ class ConfigGeneratorTest {
 		val settings = EmulatorSettings.fromModel(AmigaModel.A4000)
 		val output = ConfigGenerator.generate(settings)
 
-		assertContains(output, "cpu_model=68040")
+		// The emulator's Quick Start A4000 (its first configuration).
+		assertContains(output, "cpu_model=68030")
 		assertContains(output, "cpu_compatible=false")
 		assertContains(output, "chipset=aga")
-		assertContains(output, "fpu_model=68040")
+		assertContains(output, "fpu_model=68882")
 		assertContains(output, "cachesize=16384")
-		assertContains(output, "compfpu=true")
+		assertContains(output, "cpu_speed=max")
 		assertContains(output, "chipmem_size=4")
-		assertContains(output, "fastmem_size=8")
 	}
 
 	// --- Round-trip with ConfigParser ---
@@ -361,7 +528,7 @@ class ConfigGeneratorTest {
 			chipset = "aga",
 			immediateBlits = true,
 			collisionLevel = "full",
-			cycleExact = true,
+			cycleExact = "true",
 			ntsc = false,
 			chipRam = 4,
 			slowRam = 0,
@@ -371,6 +538,7 @@ class ConfigGeneratorTest {
 			floppy0Type = 0,
 			soundOutput = "exact",
 			soundFreq = 44100,
+			soundBuffer = 16384,
 			soundChannels = "stereo",
 			gfxWidth = 720,
 			gfxHeight = 568,
@@ -379,8 +547,10 @@ class ConfigGeneratorTest {
 			joyport0 = "mouse",
 			joyport1 = "joy0",
 			onScreenJoystick = false,
-			onScreenKeyboard = true,
-			onScreenKeyboardNumpad = true
+			onScreenKeyboardButton = true,
+			onScreenKeyboardNumpad = true,
+			joyport1MouseMap = true,
+			analogMouseSpeed = 50
 		)
 
 		val configText = ConfigGenerator.generate(original)
@@ -407,6 +577,7 @@ class ConfigGeneratorTest {
 		assertEquals(original.floppy0Type, result.floppy0Type)
 		assertEquals(original.soundOutput, result.soundOutput)
 		assertEquals(original.soundFreq, result.soundFreq)
+		assertEquals(original.soundBuffer, result.soundBuffer)
 		assertEquals(original.soundChannels, result.soundChannels)
 		assertEquals(original.gfxWidth, result.gfxWidth)
 		assertEquals(original.gfxHeight, result.gfxHeight)
@@ -415,8 +586,129 @@ class ConfigGeneratorTest {
 		assertEquals(original.joyport0, result.joyport0)
 		assertEquals(original.joyport1, result.joyport1)
 		assertEquals(original.onScreenJoystick, result.onScreenJoystick)
-		assertEquals(original.onScreenKeyboard, result.onScreenKeyboard)
 		assertEquals(original.onScreenKeyboardNumpad, result.onScreenKeyboardNumpad)
+		assertFalse(result.joyport0MouseMap)
+		assertTrue(result.joyport1MouseMap)
+		assertEquals(50, result.analogMouseSpeed)
+	}
+
+	@Test
+	fun `editor rows retain RTG and cartridge settings through config`() {
+		val settings = EmulatorSettings()
+			.withOption("gfxcard_type", "ZorroIII")
+			.withOption("gfxcard_size", "8")
+			.withOption("cart_file", "/ROMs/ActionReplay.rom")
+			.withOption("genlock_image", "/Images/genlock.png")
+			.withOption("genlock_video", "/Videos/genlock.mp4")
+			.withOption("rtc_file", "/RTC/clock.bin")
+			.withOption("amiberry.open_gui", "LCtrl+F12")
+			.withOption("joyport2", "joy0")
+			.withOption("joyport2autofire", "1")
+			.withOption("rtg_modes:16bit", "R5G5B5PC")
+			.withOption("gfxcard_options:monitor", "1")
+			.withOption("gfxcard_options:autoswitch", "false")
+			.withOption("gfxcard_options:initial", "true")
+			.withOption("maprom", "e00000")
+		val expected = mapOf(
+			"gfxcard_size" to "8",
+			"cart_file" to "/ROMs/ActionReplay.rom",
+			"genlock_image" to "/Images/genlock.png",
+			"genlock_video" to "/Videos/genlock.mp4",
+			"rtc_file" to "/RTC/clock.bin",
+			"amiberry.open_gui" to "LCtrl+F12",
+			"joyport2" to "joy0",
+			"joyport2autofire" to "1",
+			"rtg_modes" to "0x122",
+			"gfxcard_options" to "monitor=1,noautoswitch,initial",
+			"maprom" to "0xe00000"
+		)
+		val config = ConfigGenerator.generate(settings)
+		expected.forEach { (id, value) -> assertContains(config, "$id=$value") }
+		assertFalse(config.contains("rtg_modes:"))
+		assertFalse(config.contains("gfxcard_options:"))
+		val file = tempDir.newFile("editor-options.uae")
+		file.writeText(config)
+		val parsed = ConfigParser.parse(file)
+		expected.forEach { (id, value) -> assertEquals(id, value, parsed.settings.optionValue(id)) }
+		assertEquals("R5G5B5PC", parsed.settings.optionValue("rtg_modes:16bit"))
+		assertEquals("1", parsed.settings.optionValue("gfxcard_options:monitor"))
+		assertEquals("false", parsed.settings.optionValue("gfxcard_options:autoswitch"))
+		assertEquals("true", parsed.settings.optionValue("gfxcard_options:initial"))
+		assertTrue(parsed.unknownLines.none { line -> expected.keys.any { id -> line.startsWith("$id=") } })
+	}
+
+	@Test
+	fun `editor option writer keeps packed and explicit native values`() {
+		val settings = EmulatorSettings(options = mapOf(
+			"rtg_modes" to "0x122",
+			"rtg_modes:16bit" to "R5G6B5PC",
+			"gfxcard_options" to "monitor=1,initial",
+			"gfxcard_options:initial" to "false"
+		))
+			.withOption("amiberry.open_gui", "")
+			.withOption("amiberry.shader_rtg", "none")
+			.withOption("displaydata_pal", "55")
+		assertEquals("R5G5B5PC", settings.optionValue("rtg_modes:16bit"))
+		assertEquals("true", settings.optionValue("gfxcard_options:initial"))
+		val config = ConfigGenerator.generate(settings)
+		assertContains(config, "amiberry.open_gui=")
+		assertContains(config, "displaydata_pal=55.000000,t=PAL,locked")
+		assertContains(config, "amiberry.shader_rtg=none")
+		assertFalse(config.contains("rtg_modes:"))
+		assertFalse(config.contains("gfxcard_options:"))
+	}
+
+	@Test
+	fun `changed cartridge drops its stale identity line`() {
+		assertEquals(
+			listOf("use_gui=no", "cart_file=/ROMs/new.rom"),
+			ConfigGenerator.withoutCartIdentity(listOf("cart=:action_replay", "use_gui=no", "cart_file=/ROMs/new.rom"))
+		)
+	}
+
+	@Test
+	fun `enabling RTG under 24 bit addressing keeps fitting boards`() {
+		val picasso = EmulatorSettings(address24Bit = true, options = mapOf("gfxcard_type" to "PicassoII"))
+			.withOption("gfxcard_size", "4")
+		assertEquals("PicassoII", picasso.optionValue("gfxcard_type"))
+		assertEquals("4", picasso.optionValue("gfxcard_size"))
+		val zorroThree = EmulatorSettings(address24Bit = true).withOption("gfxcard_size", "32")
+		assertEquals("ZorroII", zorroThree.optionValue("gfxcard_type"))
+		assertEquals("8", zorroThree.optionValue("gfxcard_size"))
+		val noFit = EmulatorSettings(address24Bit = true, chipRam = 8).withOption("gfxcard_size", "4")
+		assertEquals("0", noFit.optionValue("gfxcard_size") ?: "0")
+	}
+
+	@Test
+	fun `changed floppy bridge profile drops its stale subtype identity`() {
+		assertEquals(
+			listOf("floppy0subtype=2", "floppy1subtypeid=1:Normal"),
+			ConfigGenerator.withoutFloppyBridgeIdentities(
+				listOf("floppy0subtypeid=1:Normal", "floppy0subtype=2", "floppy1subtypeid=1:Normal"),
+				setOf(0)
+			)
+		)
+	}
+
+	@Test
+	fun `custom bezel selection mirrors the native bezel toggles`() {
+		val picked = EmulatorSettings().withOption("amiberry.custom_bezel", "frame.png")
+		assertEquals("true", picked.schemaState().getValue("amiberry.use_custom_bezel"))
+		assertEquals("false", picked.schemaState().getValue("amiberry.use_bezel"))
+		val cleared = picked.withOption("amiberry.custom_bezel", "none")
+		assertEquals("false", cleared.schemaState().getValue("amiberry.use_custom_bezel"))
+		assertContains(ConfigGenerator.generate(cleared), "amiberry.use_custom_bezel=false")
+	}
+
+	@Test
+	fun `changed owner drops every companion identity`() {
+		assertEquals(
+			listOf("joyportname1=keep"),
+			ConfigGenerator.withoutCompanionLines(
+				listOf("joyportname2=old", "joyportfriendlyname2=Old", "joyportname1=keep"),
+				setOf("joyport2")
+			)
+		)
 	}
 
 	@Test
@@ -442,14 +734,94 @@ class ConfigGeneratorTest {
 		assertTrue(parsed.unknownLines.none { it.trimStart().startsWith("amiberry.shader=") })
 	}
 
+	private fun roundTrip(settings: EmulatorSettings, name: String): EmulatorSettings {
+		val file = tempDir.newFile(name)
+		file.writeText(ConfigGenerator.generate(settings))
+		return ConfigParser.parse(file).settings
+	}
+
+	@Test
+	fun `round-trip keeps every cycle-exact mode`() {
+		for (mode in listOf("false", "memory", "true")) {
+			val output = ConfigGenerator.generate(EmulatorSettings(cycleExact = mode))
+			assertContainsLine(output.lines(), "cycle_exact=$mode")
+			assertEquals(mode, roundTrip(EmulatorSettings(cycleExact = mode), "ce_$mode.uae").cycleExact)
+		}
+	}
+
+	@Test
+	fun `round-trip keeps every floppy drive type`() {
+		for (type in listOf(-1, 0, 1, 2, 7, 3, 8)) {
+			val parsed = roundTrip(EmulatorSettings(floppy2 = "", floppy2Type = type), "floppy_$type.uae")
+			assertEquals("$type", type, parsed.floppy2Type)
+		}
+	}
+
+	@Test
+	fun `round-trip keeps every sound frequency`() {
+		for (frequency in listOf(11025, 22050, 32000, 44100, 48000)) {
+			assertEquals(frequency, roundTrip(EmulatorSettings(soundFreq = frequency), "freq_$frequency.uae").soundFreq)
+		}
+	}
+
+	@Test
+	fun `round-trip keeps the volumes and drive sounds as stored attenuation`() {
+		val original = EmulatorSettings(
+			soundVolume = 10,
+			soundVolumePaula = 20,
+			soundVolumeCd = 30,
+			soundVolumeAhi = 40,
+			soundVolumeMidi = 50,
+			floppy0Sound = 1,
+			floppy3Sound = -1,
+			floppy0SoundVolumeDisk = 5,
+			floppy3SoundVolumeEmpty = 90
+		)
+		val output = ConfigGenerator.generate(original).lines()
+		assertContainsLine(output, "sound_volume=10")
+		assertContainsLine(output, "sound_volume_paula=20")
+		assertContainsLine(output, "sound_volume_cd=30")
+		assertContainsLine(output, "sound_volume_ahi=40")
+		assertContainsLine(output, "sound_volume_midi=50")
+		assertContainsLine(output, "floppy0sound=1")
+		assertContainsLine(output, "floppy0soundvolume_disk=5")
+
+		val parsed = roundTrip(original, "volumes.uae")
+		assertEquals(original.soundVolume, parsed.soundVolume)
+		assertEquals(original.soundVolumePaula, parsed.soundVolumePaula)
+		assertEquals(original.soundVolumeCd, parsed.soundVolumeCd)
+		assertEquals(original.soundVolumeAhi, parsed.soundVolumeAhi)
+		assertEquals(original.soundVolumeMidi, parsed.soundVolumeMidi)
+		assertEquals(original.floppy0Sound, parsed.floppy0Sound)
+		assertEquals(original.floppy3Sound, parsed.floppy3Sound)
+		assertEquals(original.floppy0SoundVolumeDisk, parsed.floppy0SoundVolumeDisk)
+		assertEquals(original.floppy3SoundVolumeEmpty, parsed.floppy3SoundVolumeEmpty)
+	}
+
+	@Test
+	fun `default volumes are the emulator's`() {
+		val s = EmulatorSettings()
+		assertEquals(0, s.soundVolume)
+		assertEquals(0, s.soundVolumePaula)
+		assertEquals(20, s.soundVolumeCd)
+		assertEquals(33, s.floppy0SoundVolumeDisk)
+		assertEquals(0, s.floppy0Sound)
+	}
+
+	@Test
+	fun `round-trip keeps the built-in AROS ROM token`() {
+		val parsed = roundTrip(EmulatorSettings(romFile = ":AROS"), "aros.uae")
+		assertEquals(":AROS", parsed.romFile)
+	}
+
 	// --- Hard drive round-trip ---
 
 	@Test
 	fun `round-trip preserves hard drives`() {
 		val original = EmulatorSettings(
 			hardDrives = listOf(
-				HardDrive(path = "/hd/system.hdf", readOnly = false, bootPriority = 0),
-				HardDrive(path = "/hd/work.hdf", readOnly = true, bootPriority = 2)
+				MountEntry(MountKind.Hardfile, path = "/hd/system.hdf", readOnly = false, bootPriority = 0),
+				MountEntry(MountKind.Hardfile, path = "/hd/work.hdf", readOnly = true, bootPriority = 2)
 			)
 		)
 		val file = tempDir.newFile("roundtrip_hd.uae")
@@ -465,8 +837,8 @@ class ConfigGeneratorTest {
 	fun `generate emits default scaling keys`() {
 		val output = ConfigGenerator.generate(EmulatorSettings())
 		val lines = output.lines()
-		assertContains(output, "scaling_method=-1")
-		assertFalse(lines.any { it == "amiberry.scaling_method=-1" })
+		assertTrue(lines.any { it == "amiberry.scaling_method=-1" })
+		assertFalse(lines.any { it.startsWith("scaling_method=") })
 		assertContains(output, "gfx_autoresolution=0")
 	}
 
@@ -475,7 +847,7 @@ class ConfigGeneratorTest {
 		val output = ConfigGenerator.generate(
 			EmulatorSettings(scalingMethod = 2, gfxAutoresolution = 1)
 		)
-		assertContains(output, "scaling_method=2")
+		assertContains(output, "amiberry.scaling_method=2")
 		assertContains(output, "gfx_autoresolution=1")
 	}
 

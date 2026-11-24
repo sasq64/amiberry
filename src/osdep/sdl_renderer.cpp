@@ -9,8 +9,9 @@
 
 #include "sysdeps.h"
 
-#ifndef USE_OPENGL
-
+// SDL software renderer backend. Compiled in every configuration (it only
+// depends on SDL3 + irenderer.h): primary renderer in no-GL builds and the
+// runtime GL-to-SDL demotion target in USE_OPENGL builds (gfx_window.cpp).
 #include "options.h"
 #include "xwin.h"
 #include "picasso96.h"
@@ -94,10 +95,16 @@ void SDLRenderer::destroy_platform_renderer(AmigaMonitor* mon)
 		if (mon->gui_renderer == mon->amiga_renderer) {
 			// GUI is sharing this renderer - don't destroy
 		} else {
+			// The on-screen joystick's textures die with the renderer; it
+			// is set up again for the next one (gfx_window.cpp).
+			on_screen_joystick_quit();
 			SDL_DestroyRenderer(mon->amiga_renderer);
 			mon->amiga_renderer = nullptr;
 		}
 #else
+		// The on-screen joystick's textures die with the renderer; left
+		// pointing at them, its next set-up destroyed them a second time.
+		on_screen_joystick_quit();
 		SDL_DestroyRenderer(mon->amiga_renderer);
 		mon->amiga_renderer = nullptr;
 #endif
@@ -402,7 +409,7 @@ bool SDLRenderer::render_frame(int monid, int mode, int immediate)
 			static_cast<float>(sly - (mon->statusline_surface->h - led_h)),
 			static_cast<float>(mon->statusline_surface->w), static_cast<float>(mon->statusline_surface->h) };
 		int lw = 0, lh = 0;
-		SDL_LogicalPresentation lmode = SDL_LOGICAL_PRESENTATION_DISABLED;
+		auto lmode = SDL_LOGICAL_PRESENTATION_DISABLED;
 		SDL_GetRenderLogicalPresentation(mon->amiga_renderer, &lw, &lh, &lmode);
 		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
 		SDL_RenderTexture(mon->amiga_renderer, mon->statusline_texture, nullptr, &dst_osd);
@@ -469,11 +476,21 @@ void SDLRenderer::get_gfx_offset(int monid, float src_w, float src_h, float src_
 
 	*dx = 0; *dy = 0; *mx = 1.0f; *my = 1.0f;
 
+	if (!adisplays[monid].picasso_on) {
+		// Native frames draw the presented source rect into render_quad, and
+		// pointer events arrive in the same logical presentation space
+		// (SDL_RenderCoordinatesFromWindow already strips letterboxing).
+		const AmiberryGfxInputOffset offset = amiberry_gfx_input_offset(
+			{ render_quad.x, render_quad.y, render_quad.w, render_quad.h },
+			src_x, src_y, src_w, src_h, false);
+		*dx = offset.dx;
+		*dy = offset.dy;
+		*mx = offset.mx;
+		*my = offset.my;
+		return;
+	}
+
 	if (isfullscreen() < 0) {
-		if (currprefs.gfx_auto_crop) {
-			*dx -= src_x;
-			*dy -= src_y;
-		}
 		if (!(mon->scalepicasso && mon->screen_is_picasso) &&
 			!(mon->currentmode.fullfill && (mon->currentmode.current_width > mon->currentmode.native_width ||
 			                                 mon->currentmode.current_height > mon->currentmode.native_height))) {
@@ -528,4 +545,3 @@ void SDLRenderer::close_hwnds_cleanup(AmigaMonitor* mon)
 }
 
 #endif // AMIBERRY
-#endif // !USE_OPENGL

@@ -1,0 +1,700 @@
+package com.blitterstudio.amiberry.overlay
+
+import android.app.Application
+import android.graphics.BitmapFactory
+import androidx.annotation.StringRes
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.blitterstudio.amiberry.R
+import com.blitterstudio.amiberry.data.AndroidAutosave
+import com.blitterstudio.amiberry.data.FileRepository
+import com.blitterstudio.amiberry.data.InGameControls
+import com.blitterstudio.amiberry.data.model.AmigaFile
+import com.blitterstudio.amiberry.data.model.FileCategory
+import com.blitterstudio.amiberry.data.model.SettingsSchema
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+
+/** A state slot as the States page shows it. */
+data class SlotState(
+	val paths: SlotPaths,
+	/** When the state was saved (epoch ms); null for an empty slot. */
+	val savedAt: Long?,
+	val thumbnail: ImageBitmap?
+)
+
+/** A saved named state, with its thumbnail when the matching screenshot exists. */
+data class NamedState(
+	val paths: NamedStatePaths,
+	val savedAt: Long,
+	val thumbnail: ImageBitmap?
+)
+
+/** A short message under the menu's title: what an action did, or why it failed. */
+data class OverlayNotice(
+	@StringRes val text: Int,
+	val slot: Int? = null,
+	val error: Boolean = false,
+	val detail: String? = null
+)
+
+/** gui_ask_disk's request, as [OverlayNative.dialogRequest] hands it over. */
+data class FloppyRecoveryRequest(val drive: Int, val missingPath: String) {
+	companion object {
+		/** [fields]: drive number and the missing image's path; null when malformed. */
+		fun parse(fields: Array<String>): FloppyRecoveryRequest? {
+			if (fields.size != 2) return null
+			val drive = fields[0].toIntOrNull() ?: return null
+			if (drive !in 0..3) return null
+			return FloppyRecoveryRequest(drive, fields[1])
+		}
+	}
+}
+
+/**
+ * What keeps the overlay's Compose view up: the menu's native loop, a
+ * queued message box, or the recovery requester. The view hides — and SDL
+ * gets its focus back — when [view] turns false, so nothing keeps
+ * intercepting the emulation's input.
+ */
+data class OverlayViewPresence(
+	val menu: Boolean = false,
+	val messages: Int = 0,
+	val recovery: Boolean = false
+) {
+	/** A native dialog shows, alone or over the menu. */
+	val dialogs: Boolean get() = messages > 0 || recovery
+
+	/** The view shows anything at all. */
+	val view: Boolean get() = menu || dialogs
+}
+
+/**
+ * The in-emulation menu's state and actions. The menu shows while the
+ * native loop (android_overlay_run) holds the emulation paused; everything
+ * it changes goes through [OverlayNative]: actions are posted from the UI
+ * thread, settings and state names are read and written on background
+ * threads, which wait for the emulator thread.
+ */
+class OverlayViewModel(application: Application) : AndroidViewModel(application) {
+	var menu by mutableStateOf(OverlayMenu.HOME)
+		private set
+	/** How often the menu has opened: each opening focuses its first item again. */
+	var openings by mutableIntStateOf(0)
+		private set
+	var status by mutableStateOf(OverlayStatus.EMPTY)
+		private set
+	var swapper by mutableStateOf<List<String>>(emptyList())
+		private set
+	var settings by mutableStateOf<Map<String, SettingState>>(emptyMap())
+		private set
+	/** The layer's shader choices (built-ins and the shaders folder); null until read. */
+	var shaderChoices by mutableStateOf<List<SettingsSchema.Choice>?>(null)
+		private set
+	/** The choices each All settings row may take now. */
+	var settingChoices by mutableStateOf<Map<String, List<SettingsSchema.Choice>>>(emptyMap())
+		private set
+	/** The devices each port may take now, by port option; read as the Controls page opens. */
+	var portChoices by mutableStateOf<Map<String, List<SettingsSchema.Choice>>>(emptyMap())
+		private set
+	var slots by mutableStateOf<List<SlotState>>(emptyList())
+		private set
+	var namedStates by mutableStateOf<List<NamedState>>(emptyList())
+		private set
+	/** The strongest committed settings change waiting for a reset or restart. */
+	var pendingApply by mutableStateOf(PendingApply.NONE)
+		private set
+	/** A save or load is running; the States page waits for it. */
+	var busy by mutableStateOf(false)
+		private set
+	/** A transient result of a menu action. */
+	var notice by mutableStateOf<OverlayNotice?>(null)
+		private set
+	/** The menu's loop runs; false while only a native dialog shows (or nothing). */
+	var menuUp by mutableStateOf(false)
+		private set
+	/** gui_message's texts, shown one at a time over whatever runs. */
+	var nativeMessages by mutableStateOf<List<String>>(emptyList())
+		private set
+	/** gui_ask_disk's recovery dialog; null when none is open. */
+	var recovery by mutableStateOf<FloppyRecoveryRequest?>(null)
+		private set
+	/** The recovery dialog is listing replacement images (Locate pressed). */
+	var recoveryPicking by mutableStateOf(false)
+		private set
+	/** The on-screen keyboard's keys; its posts go through [OverlayNative.key]. */
+	val keyboard = AmigaKeyboardModel(post = { code, pressed -> OverlayNative.key(code, pressed) })
+	/** The native on-screen keyboard shows, over the running emulation (android_osk_toggle). */
+	var keyboardVisible by mutableStateOf(false)
+		private set
+	/** The on-screen keyboard's options, read each time it shows. */
+	var keyboardOptions by mutableStateOf(KeyboardOptions())
+		private set
+
+	private val files = FileRepository.getInstance(application)
+	val floppies: StateFlow<List<AmigaFile>> = files.floppies
+	val cdImages: StateFlow<List<AmigaFile>> = files.cdImages
+	val scanning: StateFlow<Boolean> = files.isScanning
+
+	/** Hides the overlay's view; set by [OverlayHost]. */
+	internal var hideView: () -> Unit = {}
+
+	/** Told whenever a native dialog comes or goes, with whether any shows; set by [OverlayHost]. */
+	internal var dialogsChanged: (Boolean) -> Unit = {}
+
+	private var polling: Job? = null
+	private var noticeTimeout: Job? = null
+	private var sources: StateNameSources? = null
+	/** Setting changes commit through this, in order (kotlinx's Mutex is fair). */
+	private val settingWrites = Mutex()
+	/** Changes made and not yet committed; main thread only. */
+	private var pendingWrites = 0
+	/** Follows the emulation's Caps Lock while the keyboard shows. */
+	private var capsPolling: Job? = null
+
+	/**
+	 * The overlay became visible: a fresh menu over the current machine.
+	 * [pageKey] is what a media or state hotkey asked the native side for;
+	 * [OverlayMenu.pageFor] maps it, and -1 (or any unknown key) opens the
+	 * menu's Home.
+	 */
+	fun shown(pageKey: Int = -1) {
+		menuUp = true
+		menu = OverlayMenu.HOME
+		openings++
+		notice = null
+		busy = false
+		polling?.cancel()
+		// The media a session's states are named after may have changed since.
+		sources = null
+		OverlayMenu.pageFor(pageKey)?.let { open(it, OverlayKeys.MEDIA) }
+		polling = viewModelScope.launch {
+			while (isActive) {
+				refreshStatus()
+				delay(STATUS_INTERVAL_MS)
+			}
+		}
+		viewModelScope.launch { readSettings() }
+		viewModelScope.launch { loadSlots() }
+		viewModelScope.launch { loadNamedStates() }
+	}
+
+	/** Tells [OverlayHost] whether a native dialog shows now (message boxes, recovery). */
+	private fun notifyDialogsChanged() {
+		dialogsChanged(OverlayViewPresence(
+			menu = menuUp,
+			messages = nativeMessages.size,
+			recovery = recovery != null
+		).dialogs)
+	}
+
+	/** The recovery dialog opened: [FloppyRecoveryRequest.parse] of the native request. */
+	fun recoveryShown(request: FloppyRecoveryRequest?) {
+		recovery = request
+		recoveryPicking = false
+		if (request != null) {
+			// The emulator process starts with no scan: the list fills once
+			// the category is scanned, as the menu's picker does.
+			viewModelScope.launch { files.rescanCategory(FileCategory.FLOPPIES) }
+		}
+		notifyDialogsChanged()
+	}
+
+	/** The recovery dialog left without an answer (the native side gave up). */
+	fun recoveryHidden() {
+		recovery = null
+		recoveryPicking = false
+		notifyDialogsChanged()
+	}
+
+	/** gui_message's texts arrived; they show one at a time until dismissed. */
+	fun messagesQueued(texts: List<String>) {
+		nativeMessages = nativeMessages + texts
+		notifyDialogsChanged()
+	}
+
+	/** The message box's OK: the next message, or none left. */
+	fun dismissMessage() {
+		nativeMessages = nativeMessages.drop(1)
+		notifyDialogsChanged()
+	}
+
+	/** Locate: list the replacement images for the recovery dialog. */
+	fun openRecoveryPicker() {
+		recoveryPicking = true
+	}
+
+	/** Back from the replacement list: the recovery dialog again. */
+	fun closeRecoveryPicker() {
+		recoveryPicking = false
+	}
+
+	/** The recovery dialog's answer: [OverlayNative.RECOVERY_*] with the chosen path. */
+	fun answerRecovery(answer: Int, path: String = "") {
+		recovery = null
+		recoveryPicking = false
+		OverlayNative.answerDialog(answer, path)
+		notifyDialogsChanged()
+	}
+
+	/** The overlay was hidden. */
+	fun hidden() {
+		menuUp = false
+		polling?.cancel()
+		polling = null
+	}
+
+	/** The native side showed the on-screen keyboard (a hotkey, a button, the menu's Keyboard entry). */
+	fun keyboardShown() {
+		keyboardVisible = true
+		viewModelScope.launch { readKeyboardOptions() }
+		capsPolling?.cancel()
+		capsPolling = viewModelScope.launch {
+			while (isActive) {
+				// The emulation's Caps Lock can change under the view (a
+				// hardware keyboard, a restored state); the key shows it —
+				// but only a keyboard model whose LED the guest drives
+				// reflects this keyboard's own Caps, so the poll runs only
+				// while it latches (KeyboardOptions.capsLatches).
+				if (keyboard.capsLatches) keyboard.syncCapsLock(OverlayNative.capsLockOn())
+				delay(STATUS_INTERVAL_MS)
+			}
+		}
+	}
+
+	/** The keyboard hid itself (its Hide key, Back, the B button): what it holds is released on the way down. */
+	fun hideKeyboard() {
+		if (!keyboardVisible) return
+		keyboardHidden()
+		OverlayNative.hideKeyboard()
+	}
+
+	/** The native side hid the keyboard (Back through SDL, the menu opening, the app backgrounding). */
+	fun keyboardHidden() {
+		if (!keyboardVisible) return
+		keyboard.releaseAll()
+		keyboardVisible = false
+		capsPolling?.cancel()
+		capsPolling = null
+	}
+
+	private suspend fun readKeyboardOptions() {
+		val ids = KeyboardOptions.IDS.toTypedArray()
+		val read = withContext(Dispatchers.IO) {
+			SettingState.parse(ids.toList(), OverlayNative.readSettings(ids))
+		}
+		if (read.isNotEmpty()) {
+			keyboardOptions = KeyboardOptions.from(read)
+			keyboard.capsLatches = keyboardOptions.capsLatches
+		}
+	}
+
+	fun open(page: OverlayPage, from: String) {
+		notice = null
+		menu = menu.open(page, from)
+		when (page) {
+			is OverlayPage.Picker -> viewModelScope.launch {
+				files.rescanCategory(if (page.target == MediaTarget.Cd) FileCategory.CD_IMAGES else FileCategory.FLOPPIES)
+			}
+			OverlayPage.Settings -> if (shaderChoices == null) viewModelScope.launch { readShaderChoices() }
+			OverlayPage.AllSettings -> viewModelScope.launch {
+				readSettings()
+				readSettingChoices()
+			}
+			// Controllers may have come or gone since the last opening.
+			OverlayPage.Controls -> viewModelScope.launch { readPortChoices() }
+			else -> Unit
+		}
+	}
+
+	/** Back: the page under this one, or out of the menu on Home. */
+	fun back() {
+		notice = null
+		menu = menu.back() ?: run {
+			resume()
+			return
+		}
+	}
+
+	fun resume() = close(OverlayNative.CLOSE_RESUME)
+
+	/** Leaves the menu with the emulation paused (until the menu is opened and left again). */
+	fun pause() {
+		OverlayNative.pause()
+		close(OverlayNative.CLOSE_RESUME)
+	}
+
+	/** Resets the running machine; it also applies staged reset-class settings. */
+	fun reset(hard: Boolean) {
+		OverlayNative.reset(hard)
+		if (pendingApply == PendingApply.RESET) pendingApply = PendingApply.NONE
+		close(OverlayNative.CLOSE_RESUME)
+	}
+
+	/** Applies staged settings with a hard reset, then returns to the emulation. */
+	fun resetWithChanges() {
+		OverlayNative.applySettings(OverlayNative.APPLY_RESET)
+		pendingApply = PendingApply.NONE
+		close(OverlayNative.CLOSE_RESUME)
+	}
+
+	/** Restarts the emulator with staged settings, then returns to the emulation. */
+	fun restartWithChanges() {
+		OverlayNative.applySettings(OverlayNative.APPLY_RESTART)
+		pendingApply = PendingApply.NONE
+		close(OverlayNative.CLOSE_RESUME)
+	}
+
+	fun quit() {
+		OverlayNative.quit()
+		close(OverlayNative.CLOSE_RESUME)
+	}
+
+	fun showKeyboard() = close(OverlayNative.CLOSE_KEYBOARD)
+
+	fun insert(target: MediaTarget, path: String) {
+		when (target) {
+			is MediaTarget.Floppy -> OverlayNative.insertFloppy(target.drive, path)
+			MediaTarget.Cd -> OverlayNative.insertCd(path)
+			is MediaTarget.Swapper -> setSwapperEntry(target.index, path)
+		}
+		menu = menu.back() ?: OverlayMenu.HOME
+		viewModelScope.launch { refreshSoon() }
+	}
+
+	fun eject(target: MediaTarget) {
+		when (target) {
+			is MediaTarget.Floppy -> OverlayNative.ejectFloppy(target.drive)
+			MediaTarget.Cd -> OverlayNative.ejectCd()
+			is MediaTarget.Swapper -> setSwapperEntry(target.index, "")
+		}
+		viewModelScope.launch { refreshSoon() }
+	}
+
+	fun insertSwapperEntry(index: Int, drive: Int) {
+		OverlayNative.insertSwapperEntry(index, drive)
+		viewModelScope.launch { refreshSoon() }
+	}
+
+	/** Fills or clears a swapper slot, as the disk swapper panel's file dialog does. */
+	fun setSwapperEntry(index: Int, path: String) {
+		OverlayNative.setSwapperEntry(index, path)
+		viewModelScope.launch { refreshSoon() }
+	}
+
+	/** Changes one setting (see [changeAll]). */
+	fun change(id: String, value: String) = changeAll(mapOf(id to value))
+
+	/** Port 1's device into port 2 and port 2's into port 1, in one commit. */
+	fun swapPorts() {
+		OverlaySettings.swappedPorts(settings)?.let(::changeAll)
+	}
+
+	/**
+	 * Commits settings one at a time in the order made. Live changes apply
+	 * between frames; reset and restart changes remain staged until the user
+	 * explicitly applies them from Home.
+	 */
+	private fun changeAll(values: Map<String, String>) {
+		values.forEach { (id, value) -> settings[id]?.let { settings = settings + (id to it.copy(value = value)) } }
+		pendingWrites++
+		viewModelScope.launch {
+			val ids = values.keys.toTypedArray()
+			val texts = values.values.toTypedArray()
+			val applied = settingWrites.withLock {
+				withContext(Dispatchers.IO) { OverlayNative.changeSettings(ids, texts) }
+			}
+			pendingWrites--
+			if (applied < 0) {
+				showNotice(OverlayNotice(R.string.overlay_setting_failed, error = true))
+			} else {
+				if (applied == OverlayNative.APPLY_LIVE) {
+					OverlayNative.applySettings(OverlayNative.APPLY_LIVE)
+				} else {
+					pendingApply = PendingApply.merge(pendingApply, applied)
+				}
+				withContext(Dispatchers.IO) {
+					values.filterKeys { it in OverlaySettings.CONTROLS }.forEach { (id, value) ->
+						InGameControls.record(getApplication(), id, value == "true")
+					}
+				}
+			}
+			if (pendingWrites == 0) {
+				readSettings()
+				if (menu.page == OverlayPage.AllSettings) readSettingChoices()
+				if (values.keys.any { it in OverlaySettings.PORTS || it == OverlaySettings.ON_SCREEN_JOYSTICK }) readPortChoices()
+			}
+		}
+	}
+
+	/** Save on a slot: straight away when it is empty, after a confirmation when it holds a state. */
+	fun requestSave(slot: SlotState) {
+		if (busy) return
+		if (slot.savedAt == null) saveSlot(slot)
+		else open(OverlayPage.Confirm(ConfirmAction.Overwrite(slot)), OverlayKeys.save(slot.paths.slot))
+	}
+
+	/** The confirmation page's action, back on the page that asked for it. */
+	fun confirm(action: ConfirmAction) {
+		when (action) {
+			ConfirmAction.Reset -> reset(hard = false)
+			ConfirmAction.HardReset -> reset(hard = true)
+			ConfirmAction.ResetWithChanges -> resetWithChanges()
+			ConfirmAction.RestartWithChanges -> restartWithChanges()
+			ConfirmAction.Quit -> quit()
+			is ConfirmAction.Overwrite -> {
+				menu = menu.back() ?: OverlayMenu.HOME
+				saveSlot(action.slot)
+			}
+			is ConfirmAction.OverwriteNamed -> {
+				menu = menu.back() ?: OverlayMenu.HOME
+				saveNamedState(action.paths)
+			}
+		}
+	}
+
+	private fun saveSlot(slot: SlotState) {
+		if (busy) return
+		busy = true
+		notice = null
+		viewModelScope.launch {
+			val saved = finished(OverlayNative.saveState(slot.paths.state))
+			// The thumbnail is the frame the state was saved at, as the built-in GUI takes it.
+			if (saved) finished(OverlayNative.screenshot(slot.paths.thumbnail))
+			showNotice(
+				if (saved) {
+					OverlayNotice(R.string.overlay_state_saved, slot.paths.slot)
+				} else {
+					OverlayNotice(R.string.overlay_state_save_failed, slot.paths.slot, error = true)
+				}
+			)
+			loadSlots()
+			busy = false
+		}
+	}
+
+	fun loadSlot(slot: SlotState) {
+		if (busy) return
+		busy = true
+		notice = null
+		viewModelScope.launch {
+			// A load ends the native loop itself (the emulation restores the
+			// state), which hides the menu; a failed one leaves it up.
+			if (finished(OverlayNative.loadState(slot.paths.state))) {
+				close(OverlayNative.CLOSE_RESUME)
+			} else {
+				showNotice(OverlayNotice(R.string.overlay_state_load_failed, slot.paths.slot, error = true))
+			}
+			busy = false
+		}
+	}
+
+	/** Resolves a named state before deciding whether saving needs confirmation. */
+	fun requestSaveNamedState(name: String) {
+		if (busy) return
+		notice = null
+		viewModelScope.launch {
+			val destination = withContext(Dispatchers.IO) {
+				stateSources()?.let { sources ->
+					val paths = StateSlots.namedPaths(sources, name)
+					paths to StateSlots.isSlotPath(sources, paths)
+				}
+			}
+			when {
+				destination == null -> showNotice(OverlayNotice(R.string.overlay_named_state_save_failed, error = true))
+				destination.second -> showNotice(OverlayNotice(R.string.overlay_named_state_slot_name, error = true))
+				File(destination.first.state).isFile ->
+					open(OverlayPage.Confirm(ConfirmAction.OverwriteNamed(destination.first)), "save_named")
+				else -> saveNamedState(destination.first)
+			}
+		}
+	}
+
+	/** Saves a resolved named state in the same folders and with the same thumbnail rule as slots. */
+	private fun saveNamedState(paths: NamedStatePaths) {
+		if (busy) return
+		busy = true
+		notice = null
+		viewModelScope.launch {
+			val saved = finished(OverlayNative.saveState(paths.state))
+			if (saved) finished(OverlayNative.screenshot(paths.thumbnail))
+			showNotice(
+				if (saved) OverlayNotice(R.string.overlay_named_state_saved, detail = paths.name)
+				else OverlayNotice(R.string.overlay_named_state_save_failed, error = true)
+			)
+			loadNamedStates()
+			busy = false
+		}
+	}
+
+	/** Loads a named state; a successful load ends the native menu loop. */
+	fun loadNamedState(state: NamedState) {
+		if (busy) return
+		busy = true
+		notice = null
+		viewModelScope.launch {
+			if (finished(OverlayNative.loadState(state.paths.state))) {
+				close(OverlayNative.CLOSE_RESUME)
+			} else {
+				showNotice(OverlayNotice(R.string.overlay_named_state_load_failed, detail = state.paths.name, error = true))
+			}
+			busy = false
+		}
+	}
+
+	private fun close(how: Int) {
+		hideView()
+		OverlayNative.close(how)
+	}
+
+	/** Shows [shown] over the page for a while; it covers nothing the page needs and moves nothing. */
+	private fun showNotice(shown: OverlayNotice) {
+		notice = shown
+		noticeTimeout?.cancel()
+		noticeTimeout = viewModelScope.launch {
+			delay(NOTICE_MS)
+			if (notice == shown) notice = null
+		}
+	}
+
+	private fun refreshStatus() {
+		OverlayStatus.parse(OverlayNative.status())?.let { status = it }
+		swapper = OverlayNative.swapperEntries().toList()
+	}
+
+	/** Actions run at the native loop's next pass; show what they did once they have. */
+	private suspend fun refreshSoon() {
+		delay(ACTION_SETTLE_MS)
+		refreshStatus()
+	}
+
+	private suspend fun readSettings() {
+		val schema = SettingsSchema.current ?: SettingsSchema.bundled(getApplication())
+		val ids = OverlaySettings.readIds(schema)
+		val read = withContext(Dispatchers.IO) {
+			SettingState.parse(ids, OverlayNative.readSettings(ids.toTypedArray()))
+		}
+		if (read.isNotEmpty()) settings = read
+	}
+
+	private suspend fun readShaderChoices() {
+		val pairs = withContext(Dispatchers.IO) { OverlayNative.settingChoices(OverlaySettings.SHADER) } ?: return
+		shaderChoices = pairs.toList().chunked(2).filter { it.size == 2 }.map { SettingsSchema.Choice(it[0], it[1]) }
+	}
+
+	private suspend fun readPortChoices() {
+		val read = withContext(Dispatchers.IO) {
+			OverlaySettings.PORTS.associateWith { id ->
+				OverlayNative.settingChoices(id)?.toList()?.chunked(2)?.filter { it.size == 2 }
+					?.map { SettingsSchema.Choice(it[0], it[1]) }
+			}
+		}
+		portChoices = read.filterValues { it != null }.mapValues { it.value.orEmpty() }
+	}
+
+	private suspend fun readSettingChoices() {
+		val schema = SettingsSchema.current ?: SettingsSchema.bundled(getApplication()) ?: return
+		val ids = OverlaySettings.allSettings(schema)
+			.filter { it.type == SettingsSchema.TYPE_CHOICE }
+			.map { it.id }
+		val choices = withContext(Dispatchers.IO) {
+			ids.associateWith { id ->
+				OverlayNative.settingChoices(id)?.toList()?.chunked(2)?.filter { it.size == 2 }
+					?.map { SettingsSchema.Choice(it[0], it[1]) }
+			}
+		}
+		settingChoices = choices.filterValues { it != null }.mapValues { it.value.orEmpty() }
+	}
+
+	private suspend fun loadSlots() {
+		val loaded = withContext(Dispatchers.IO) {
+			val native = StateNameSources.parse(OverlayNative.stateNameSources())
+			val restored = AndroidAutosave.load(getApplication())
+			val names = sources ?: restored?.slotSources
+				?.takeIf { it.size == 7 && native?.stateDir?.endsWith(AndroidAutosave.STATE_FILE_NAME) == true }
+				?.let(StateNameSources::parse)
+				?: native
+			names?.let { found ->
+				found to StateSlots.slots.map { slot -> readSlot(StateSlots.paths(found, slot)) }
+			}
+		} ?: return
+		sources = loaded.first
+		slots = loaded.second
+	}
+
+	private suspend fun stateSources(): StateNameSources? =
+		sources ?: withContext(Dispatchers.IO) { StateNameSources.parse(OverlayNative.stateNameSources()) }
+			?.also { sources = it }
+
+	private suspend fun loadNamedStates() {
+		val named = withContext(Dispatchers.IO) {
+			stateSources()?.let { sources ->
+				StateSlots.namedStates(sources).map { paths ->
+					NamedState(paths, File(paths.state).lastModified(), decodeThumbnail(paths.thumbnail))
+				}
+			}
+		} ?: return
+		namedStates = named
+	}
+
+	/** Polls a posted action until it has run; false when it was rejected, failed or never ran. */
+	private suspend fun finished(id: Long): Boolean {
+		if (id == 0L) return false
+		var waited = 0L
+		while (waited < ACTION_TIMEOUT_MS) {
+			when (OverlayNative.poll(id)) {
+				OverlayNative.RESULT_DONE -> return true
+				OverlayNative.RESULT_PENDING -> Unit
+				else -> return false
+			}
+			delay(ACTION_POLL_MS)
+			waited += ACTION_POLL_MS
+		}
+		return false
+	}
+
+	override fun onCleared() {
+		polling?.cancel()
+	}
+
+	private companion object {
+		const val STATUS_INTERVAL_MS = 250L
+		const val NOTICE_MS = 4_000L
+		const val ACTION_SETTLE_MS = 100L
+		const val ACTION_POLL_MS = 30L
+		const val ACTION_TIMEOUT_MS = 15_000L
+		/** Thumbnails are decoded at no more than this width. */
+		const val THUMBNAIL_WIDTH = 360
+
+		fun readSlot(paths: SlotPaths): SlotState {
+			val state = File(paths.state)
+			if (!state.isFile) return SlotState(paths, savedAt = null, thumbnail = null)
+			return SlotState(paths, savedAt = state.lastModified(), thumbnail = decodeThumbnail(paths.thumbnail))
+		}
+
+		fun decodeThumbnail(path: String): ImageBitmap? {
+			if (!File(path).isFile) return null
+			val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+			BitmapFactory.decodeFile(path, bounds)
+			var sample = 1
+			while (bounds.outWidth / (sample * 2) >= THUMBNAIL_WIDTH) sample *= 2
+			val options = BitmapFactory.Options().apply { inSampleSize = sample }
+			return BitmapFactory.decodeFile(path, options)?.asImageBitmap()
+		}
+	}
+
+}

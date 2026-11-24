@@ -19,9 +19,7 @@
 #include "autoconf.h"
 #include "traps.h"
 #include "bsdsocket.h"
-#include "threaddep/thread.h"
 #include "native2amiga.h"
-#include "debug.h"
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -40,9 +38,9 @@ static uae_u32 SockLibBase;
 
 /* ObtainSocket()/ReleaseSocket() public socket pool */
 struct sockd {
-	long sockpoolids[SOCKPOOLSIZE];
-	SOCKET_TYPE sockpoolsocks[SOCKPOOLSIZE];
-	uae_u32 sockpoolflags[SOCKPOOLSIZE];
+	long sockpoolids;
+	SOCKET_TYPE sockpoolsocks;
+	uae_u32 sockpoolflags;
 };
 
 static long curruniqid = 65536;
@@ -199,9 +197,23 @@ bool checksd(TrapContext *ctx, SB, int sd)
 				}
 			}
 		}
-		for (iCounter  = 0; iCounter < SOCKPOOLSIZE; iCounter++) {
-			if (s == sockdata->sockpoolsocks[iCounter])
+		for (iCounter = 0; iCounter < SOCKPOOLSIZE; iCounter++) {
+			if (sockdata[iCounter].sockpoolids != UNIQUE_ID && s == sockdata[iCounter].sockpoolsocks)
 				return true;
+		}
+		/* ReleaseCopyOfSocket() shares the native socket with other tasks and
+		 * ObtainSocket() drops the pool entry, so another task may still hold
+		 * this socket: release the local descriptor and keep the native one
+		 * open for the remaining owner. */
+		for (struct socketbase *sb2 = socketbases; sb2; sb2 = sb2->next) {
+			if (sb2 == sb || !sb2->dtable)
+				continue;
+			for (iCounter = 1; iCounter <= sb2->dtablesize; iCounter++) {
+				if (sb2->dtable[iCounter - 1] == s) {
+					releasesock(ctx, sb, sd);
+					return true;
+				}
+			}
 		}
 	}
 	BSDTRACE((_T("checksd FALSE s 0x%x sd %d\n"),s,sd));
@@ -453,6 +465,28 @@ STATIC_INLINE struct socketbase *get_socketbase (TrapContext *ctx)
 	return (struct socketbase*)get_pointer (trap_get_areg(ctx, 6) + offsetof (struct UAEBSDBase, sb));
 }
 
+/* Remove sb from the open list if it is live and was opened as library base
+ * 'base'. Only one caller can win, so a base is cleaned up at most once even
+ * when Close re-enters the guest (or runs on another trap thread) mid-way. */
+static bool claim_socketbase (struct socketbase *sb, uaecptr base)
+{
+	bool claimed = false;
+
+	locksigqueue ();
+	for (struct socketbase **link = &socketbases; *link; link = &(*link)->next) {
+		if (*link == sb) {
+			if (sb->libbase == base) {
+				*link = sb->next;
+				claimed = true;
+			}
+			break;
+		}
+	}
+	unlocksigqueue ();
+	return claimed;
+}
+
+/* Close claims the socketbase (unlinks it from socketbases) before this. */
 static void free_socketbase (TrapContext *ctx)
 {
 	struct socketbase *sb, *nsb;
@@ -485,17 +519,6 @@ static void free_socketbase (TrapContext *ctx)
 		free (sb->ftable);
 
 		locksigqueue ();
-
-		if (sb == socketbases)
-			socketbases = sb->next;
-		else {
-			for (nsb = socketbases; nsb; nsb = nsb->next) {
-				if (sb == nsb->next) {
-					nsb->next = sb->next;
-					break;
-				}
-			}
-		}
 
 #if 1
 		if (sb == sbsigqueue)
@@ -554,6 +577,7 @@ static uae_u32 REGPARAM2 bsdsocklib_Open (TrapContext *ctx)
 		result = trap_call_lib(ctx, sb->sysbase, -0x54); /* MakeLibrary */
 
 		put_pointer(result + offsetof(struct UAEBSDBase, sb), sb);
+		sb->libbase = result;
 
 		BSDTRACE ((_T("%0x [%d]\n"), result, opencount));
 	} else
@@ -567,6 +591,16 @@ static uae_u32 REGPARAM2 bsdsocklib_Close (TrapContext *ctx)
 	int opencount;
 
 	uae_u32 base = trap_get_areg(ctx, 6);
+
+	struct socketbase *sb = get_socketbase (ctx);
+
+	/* A program that closes its base twice (GLQuake does) would free the
+	 * socketbase and the library memory again; the stale base still holds
+	 * the freed socketbase pointer. */
+	if (!claim_socketbase (sb, base)) {
+		write_log (_T("bsdsocket: CloseLibrary() of base 0x%08x that is not open, ignored\n"), base);
+		return 0;
+	}
 	uae_u32 negsize = get_word (base + 16);
 
 	free_socketbase(ctx);
@@ -781,7 +815,7 @@ static int sockpoolindex (long id)
 	int i;
 
 	for (i = 0; i < SOCKPOOLSIZE; i++)
-		if (sockdata->sockpoolids[i] == id)
+		if (sockdata[i].sockpoolids == id)
 			return i;
 
 	return -1;
@@ -806,7 +840,7 @@ static uae_u32 REGPARAM2 bsdsocklib_ObtainSocket (TrapContext *ctx)
 		BSDTRACE ((_T("[invalid key]\n")));
 		return -1;
 	}
-	s = sockdata->sockpoolsocks[i];
+	s = sockdata[i].sockpoolsocks;
 
 	sd = getsd(ctx, sb, s); /* FBCD_CHECK */
 
@@ -814,8 +848,9 @@ static uae_u32 REGPARAM2 bsdsocklib_ObtainSocket (TrapContext *ctx)
 
 	if (sd != -1) {
 		if (!callfdcallback(ctx, sb, sd - 1, FDCB_ALLOC)) { /* can fail */
-			sb->ftable[sd - 1] = sockdata->sockpoolflags[i];
-			sockdata->sockpoolids[i] = UNIQUE_ID;
+			sb->ftable[sd - 1] = sockdata[i].sockpoolflags;
+			sockdata[i].sockpoolids = UNIQUE_ID;
+			sockdata[i].sockpoolsocks = 0;
 			return sd - 1;
 		}
 	}
@@ -873,9 +908,9 @@ static uae_u32 REGPARAM2 bsdsocklib_ReleaseSocket (TrapContext *ctx)
 			write_log (_T("bsdsocket: ERROR: Global socket pool overflow\n"));
 			return -1;
 		}
-		sockdata->sockpoolids[i] = id;
-		sockdata->sockpoolsocks[i] = s;
-		sockdata->sockpoolflags[i] = flags;
+		sockdata[i].sockpoolids = id;
+		sockdata[i].sockpoolsocks = s;
+		sockdata[i].sockpoolflags = flags;
 
 		BSDTRACE ((_T("id %d s 0x%x\n"), id,s));
 	} else {
@@ -933,9 +968,9 @@ static uae_u32 REGPARAM2 bsdsocklib_ReleaseCopyOfSocket (TrapContext *ctx)
 			write_log (_T("bsdsocket: ERROR: Global socket pool overflow\n"));
 			return -1;
 		}
-		sockdata->sockpoolids[i] = id;
-		sockdata->sockpoolsocks[i] = s;
-		sockdata->sockpoolflags[i] = flags;
+		sockdata[i].sockpoolids = id;
+		sockdata[i].sockpoolsocks = s;
+		sockdata[i].sockpoolflags = flags;
 
 		BSDTRACE ((_T("id %d s 0x%x\n"), id,s));
 
@@ -980,14 +1015,51 @@ static uae_u32 REGPARAM2 bsdsocklib_SetErrnoPtr (TrapContext *ctx)
 /* Inet_NtoA(in)(d0) */
 static uae_u32 REGPARAM2 bsdsocklib_Inet_NtoA (TrapContext *ctx)
 {
-	struct socketbase *sb = get_socketbase (ctx);
-	return host_Inet_NtoA(ctx, sb, trap_get_dreg(ctx, 0));
+	uae_u32 in = trap_get_dreg(ctx, 0);
+	char text[16];
+	snprintf(text, sizeof text, "%u.%u.%u.%u",
+		(unsigned int)(in >> 24), (unsigned int)((in >> 16) & 255),
+		(unsigned int)((in >> 8) & 255), (unsigned int)(in & 255));
+	uaecptr scratchbuf = trap_get_areg(ctx, 6) +
+		offsetof(struct UAEBSDBase, scratchbuf);
+	strncpyha(ctx, scratchbuf, text, SCRATCHBUFSIZE);
+	if (ISBSDTRACE) {
+		TCHAR *s = au(text);
+		BSDTRACE((_T("Inet_NtoA(%08x) -> %s\n"), in, s));
+		xfree(s);
+	}
+	return scratchbuf;
+}
+
+static uae_u32 parse_ipv4_address(TrapContext *ctx, uaecptr address)
+{
+	if (!trap_valid_address(ctx, address, 4))
+		return 0;
+
+	// Keep address strings within the 256-byte limit, including the NUL,
+	// and reject strings that have no terminator inside it.
+	char text[256];
+	for (unsigned int i = 0; i < sizeof text; i++) {
+		if (!trap_valid_address(ctx, address + i, 1))
+			return 0;
+		text[i] = trap_get_byte(ctx, address + i);
+		if (!text[i]) {
+			uae_u32 result = host_inet_addr(text);
+			if (ISBSDTRACE) {
+				TCHAR *s = au(text);
+				BSDTRACE((_T("inet_addr(%s) -> 0x%08x\n"), s, result));
+				xfree(s);
+			}
+			return result;
+		}
+	}
+	return 0xffffffff; // INADDR_NONE: no terminator within the buffer.
 }
 
 /* inet_addr(cp)(a0) */
 static uae_u32 REGPARAM2 bsdsocklib_inet_addr (TrapContext *ctx)
 {
-	return host_inet_addr(ctx, trap_get_areg(ctx, 0));
+	return parse_ipv4_address(ctx, trap_get_areg(ctx, 0));
 }
 
 /* Inet_LnaOf(in)(d0) */
@@ -1011,7 +1083,7 @@ static uae_u32 REGPARAM2 bsdsocklib_Inet_MakeAddr (TrapContext *ctx)
 /* inet_network(cp)(a0) */
 static uae_u32 REGPARAM2 bsdsocklib_inet_network (TrapContext *ctx)
 {
-	return host_inet_addr(ctx, trap_get_areg(ctx, 0));
+	return parse_ipv4_address(ctx, trap_get_areg(ctx, 0));
 }
 
 /* *------ gethostbyname etc */
@@ -1922,9 +1994,10 @@ void bsdlib_reset (void)
 #endif
 
 	for (i = 0; i < SOCKPOOLSIZE; i++) {
-		if (sockdata->sockpoolids[i] != UNIQUE_ID) {
-			sockdata->sockpoolids[i] = UNIQUE_ID;
-			host_closesocketquick (sockdata->sockpoolsocks[i]);
+		if (sockdata[i].sockpoolids != UNIQUE_ID) {
+			sockdata[i].sockpoolids = UNIQUE_ID;
+			host_closesocketquick (sockdata[i].sockpoolsocks);
+			sockdata[i].sockpoolsocks = 0;
 		}
 	}
 
@@ -1992,9 +2065,13 @@ void bsdlib_install (void)
 	int i;
 
 	if (!sockdata) {
-		sockdata = xcalloc (struct sockd, 1);
-		for (i = 0; i < SOCKPOOLSIZE; i++)
-			sockdata->sockpoolids[i] = UNIQUE_ID;
+		sockdata = xcalloc (struct sockd, SOCKPOOLSIZE);
+		if (!sockdata) {
+			return;
+		}
+		for (i = 0; i < SOCKPOOLSIZE; i++) {
+			sockdata[i].sockpoolids = UNIQUE_ID;
+		}
 	}
 
 	if (!init_socket_layer ())
@@ -2060,41 +2137,11 @@ void bsdlib_install (void)
  * library calls available on all platforms.
  * ========================================================================= */
 
-uae_u32 host_Inet_NtoA(TrapContext *ctx, SB, uae_u32 in)
+uae_u32 host_inet_addr(const char *text)
 {
-	uae_char *addr;
-	struct in_addr ina;
-	uae_u32 scratchbuf;
-
-	*(uae_u32 *)&ina = htonl(in);
-
-	BSDTRACE((_T("Inet_NtoA(%x) -> "), in));
-
-	if ((addr = inet_ntoa(ina)) != NULL) {
-		scratchbuf = trap_get_areg(ctx, 6) + offsetof(struct UAEBSDBase, scratchbuf);
-		strncpyha(ctx, scratchbuf, addr, SCRATCHBUFSIZE);
-		BSDTRACE((_T("%s\n"), addr));
-		return scratchbuf;
-	} else
-		bsdsocklib_seterrno(ctx, sb, 22); /* EINVAL */
-
-	BSDTRACE((_T("failed (%d)\n"), sb->sb_errno));
-
-	return 0;
-}
-
-uae_u32 host_inet_addr(TrapContext *ctx, uae_u32 cp)
-{
-	uae_u32 addr;
-	char *cp_rp;
-
-	if (!trap_valid_address(ctx, cp, 4))
-		return 0;
-	cp_rp = trap_get_alloc_string(ctx, cp, 256);
-	addr = htonl(inet_addr(cp_rp));
-	BSDTRACE((_T("inet_addr(%s) -> 0x%08lx\n"), cp_rp, addr));
-	xfree(cp_rp);
-	return addr;
+	// Keep the native parser's legacy address syntax and return the numeric
+	// value expected by the big-endian Amiga, independent of host byte order.
+	return htonl(inet_addr(text));
 }
 
 uae_u32 host_Inet_LnaOf(uae_u32 in)
@@ -2144,14 +2191,33 @@ uae_u32 host_Inet_MakeAddr(uae_u32 net, uae_u32 host)
 
 uae_u32 host_gethostname(TrapContext *ctx, uae_u32 name, uae_u32 namelen)
 {
+	char buf[256];
+	size_t len;
+
 	if (!trap_valid_address(ctx, name, namelen))
 		return -1;
-	char buf[256];
+	if (namelen == 0)
+		return -1;
 	if (gethostname(buf, sizeof(buf)) != 0)
 		return -1;
 	buf[sizeof(buf) - 1] = '\0';
-	trap_put_string(ctx, (uae_char *)buf, name, namelen);
+	len = strlen(buf);
+	if (len >= namelen)
+		len = namelen - 1; /* caller's buffer too small: truncate */
+	buf[len] = '\0';
+	/* trap_put_string() copies through the terminating NUL and ignores its
+	 * maxlen on the direct-memory path, so use a strictly bounded copy */
+	trap_put_bytes(ctx, buf, name, (int)(len + 1));
 	return 0;
+}
+
+#else
+
+volatile int bsd_int_requested;
+
+void bsdsock_fake_int_handler(void)
+{
+	bsd_int_requested = 0;
 }
 
 #endif /* ! BSDSOCKET */

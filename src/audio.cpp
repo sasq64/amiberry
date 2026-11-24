@@ -30,12 +30,14 @@
 #include "zfile.h"
 #include "uae.h"
 #include "gui.h"
-#include "debug.h"
 #ifdef WITH_SNDBOARD
 #include "sndboard.h"
 #endif
 #ifdef AVIOUTPUT
 #include "avioutput.h"
+#endif
+#ifdef VIDEOGRAB
+#include "videograb.h"
 #endif
 #ifdef AHI
 #include "ahi_v1.h"
@@ -707,14 +709,21 @@ static void do_extra_channels(int idx, int ch, int *data1, int *data2, int *data
 	} else if (ch == 1) {
 		int datas[1];
 		samplexx_anti_handler(datas, idx, 1);
+		// A mono stream goes to both sides, mixed with each side's own sample
 		int d1 = *data1 + datas[0];
 		if (d1 < -32768)
 			d1 = -32768;
 		if (d1 > 32767)
 			d1 = 32767;
 		*data1 = d1;
-		if (data2)
-			*data2 = d1;
+		if (data2) {
+			int d2 = *data2 + datas[0];
+			if (d2 < -32768)
+				d2 = -32768;
+			if (d2 > 32767)
+				d2 = 32767;
+			*data2 = d2;
+		}
 	} else if (ch > 2) {
 		int datas[AUDIO_CHANNEL_MAX_STREAM_CH];
 		samplexx_anti_handler(datas, idx, 6);
@@ -1552,10 +1561,12 @@ uae_u16 audio_dmal(void)
 	uae_u16 dmal = 0;
 	for (int nr = 0; nr < AUDIO_CHANNELS_PAULA; nr++) {
 		struct audio_channel_data *cdp = audio_channel + nr;
-		if (cdp->dr)
+		if (cdp->dr || cdp->dsr) {
 			dmal |= 1 << (nr * 2 + 1);
-		if (cdp->dsr)
+		}
+		if (cdp->dsr) {
 			dmal |= 1 << (nr * 2 + 0);
+		}
 		cdp->dr = cdp->dsr = false;
 	}
 	return dmal;
@@ -2222,6 +2233,11 @@ void set_audio (void)
 #ifdef WITH_SNDBOARD
 	sndboard_ext_volume();
 #endif
+#ifdef AHI
+	// The AHI stream is separate from Paula's, so refresh its gain here too:
+	// with Paula sound off, init_audio() below never reaches set_volume().
+	ahi_apply_volume();
+#endif
 
 	if (1) { // always reset if (1 || ch >= 0) {
 		if (currprefs.produce_sound >= 2) {
@@ -2242,6 +2258,10 @@ void set_audio (void)
 	} else {
 		sound_volume (0);
 	}
+
+#ifdef VIDEOGRAB
+	setsoundoutputvideograb(currprefs.produce_sound >= 2);
+#endif
 
 	sep = (currprefs.sound_stereo_separation = changed_prefs.sound_stereo_separation) * 3 / 2;
 	if (sep >= 15)

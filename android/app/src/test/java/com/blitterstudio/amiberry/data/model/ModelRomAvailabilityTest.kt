@@ -14,8 +14,8 @@ class ModelRomAvailabilityTest {
 		val models = ModelRomAvailability.availableModels(roms)
 
 		assertTrue(models.contains(AmigaModel.A500))
-		assertTrue(models.contains(AmigaModel.A500_PLUS))
-		assertTrue(models.contains(AmigaModel.A2000))
+		// The emulator's A500+ preset asks for its own 2.04 Kickstart.
+		assertFalse(models.contains(AmigaModel.A500_PLUS))
 		assertFalse(models.contains(AmigaModel.A600))
 		assertFalse(models.contains(AmigaModel.A1200))
 		assertFalse(models.contains(AmigaModel.CD32))
@@ -63,6 +63,92 @@ class ModelRomAvailabilityTest {
 		val selected = ModelRomAvailability.selectRomsForModel(AmigaModel.A500, roms)
 
 		assertEquals("/roms/a-kick13.rom", selected.kick?.path)
+	}
+
+	@Test
+	fun `a model is built from a later configuration when only its ROM is installed`() {
+		val kick12 = listOf(rom("kick12.rom", 0xa6ce1636L))
+		val a500 = ModelRomAvailability.selectRomsForModel(AmigaModel.A500, kick12)
+		assertEquals("/roms/kick12.rom", a500.kick?.path)
+		assertEquals("1.2 ROM", AmigaModel.A500.configs[a500.config].label.substringBefore(','))
+
+		val kick31 = listOf(rom("kick31-a3000.rom", 0xefb239ccL))
+		val a3000 = ModelRomAvailability.selectRomsForModel(AmigaModel.A3000, kick31)
+		assertEquals("/roms/kick31-a3000.rom", a3000.kick?.path)
+		assertTrue(AmigaModel.A3000.configs[a3000.config].label.startsWith("3.1 ROM"))
+	}
+
+	@Test
+	fun `the first configuration wins when its ROM is installed`() {
+		val roms = listOf(rom("kick12.rom", 0xa6ce1636L), rom("kick13.rom", 0xc4f0f55fL))
+		val selected = ModelRomAvailability.selectRomsForModel(AmigaModel.A500, roms)
+		assertEquals(0, selected.config)
+		assertEquals("/roms/kick13.rom", selected.kick?.path)
+	}
+
+	@Test
+	fun `without its Kickstart a model boots the built-in AROS ROM`() {
+		val roms = listOf(rom("aros-rom.bin", 0x11111111L), rom("aros-ext.bin", 0x22222222L))
+
+		val selected = ModelRomAvailability.selectRomsForModel(AmigaModel.A1200, roms)
+
+		assertTrue(selected.aros)
+		assertTrue(selected.isBootable)
+		assertEquals(ModelRomAvailability.arosRomFile, selected.romFile)
+		assertEquals("", selected.romExtFile)
+		assertTrue(ModelRomAvailability.isModelAvailable(AmigaModel.A500, roms))
+		assertFalse(ModelRomAvailability.hasKickstart(AmigaModel.A500, roms))
+		// The CD32 and CDTV need their own extended ROMs to play discs.
+		assertFalse(ModelRomAvailability.isModelAvailable(AmigaModel.CD32, roms))
+		assertFalse(ModelRomAvailability.isModelAvailable(AmigaModel.CDTV, roms))
+		// A board with its own boot ROM (the DraCo) needs it too.
+		assertFalse(ModelRomAvailability.isModelAvailable(AmigaModel.find("macrosystem")!!, roms))
+	}
+
+	@Test
+	fun `an installed Kickstart wins over AROS`() {
+		val roms = listOf(
+			rom("aros-rom.bin", 0x11111111L),
+			rom("aros-ext.bin", 0x22222222L),
+			rom("kick13.rom", 0xc4f0f55fL)
+		)
+
+		val selected = ModelRomAvailability.selectRomsForModel(AmigaModel.A500, roms)
+
+		assertFalse(selected.aros)
+		assertEquals("/roms/kick13.rom", selected.romFile)
+	}
+
+	@Test
+	fun `AROS needs both of its files`() {
+		val roms = listOf(rom("aros-rom.bin", 0x11111111L))
+
+		assertFalse(ModelRomAvailability.selectRomsForModel(AmigaModel.A500, roms).isBootable)
+		assertEquals("", ModelRomAvailability.selectRomsForModel(AmigaModel.A500, roms).romFile)
+	}
+
+	@Test
+	fun `ROMs are identified by the emulator's ROM table and AROS by its files`() {
+		assertEquals(
+			RomIdentity.Kickstart("KS ROM v1.3 (A500,A1000,A2000)"),
+			ModelRomAvailability.romIdentity(rom("kick13.rom", 0xc4f0f55fL))
+		)
+		assertEquals(RomIdentity.BuiltInAros, ModelRomAvailability.romIdentity(rom("aros-ext.bin", 0x22222222L)))
+		assertEquals(RomIdentity.Unknown, ModelRomAvailability.romIdentity(rom("mystery.rom", 0x12345678L)))
+	}
+
+	@Test
+	fun `the AROS extension file is told apart from the AROS ROM`() {
+		assertTrue(ModelRomAvailability.isBuiltInArosExtension(rom("AROS-EXT.BIN", 0x22222222L)))
+		assertFalse(ModelRomAvailability.isBuiltInArosExtension(rom("aros-rom.bin", 0x11111111L)))
+	}
+
+	@Test
+	fun `the AROS token is recognised in a kickstart_rom_file value`() {
+		assertTrue(ModelRomAvailability.isBuiltInArosRom(":AROS"))
+		assertTrue(ModelRomAvailability.isBuiltInArosRom("/games/a.rp9:AROS"))
+		assertFalse(ModelRomAvailability.isBuiltInArosRom("/roms/kick13.rom"))
+		assertFalse(ModelRomAvailability.isBuiltInArosRom(""))
 	}
 
 	private fun rom(name: String, crc32: Long, path: String = "/roms/$name") = AmigaFile(

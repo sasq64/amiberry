@@ -35,6 +35,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <atomic>
+#include <vector>
 
 #include "uae.h"
 
@@ -103,15 +105,19 @@ static int picasso96_GCT = GCT_Unknown;
 static int picasso96_PCT = PCT_Unknown;
 
 #if defined(_WIN32) && !defined(AMIBERRY)
-int mman_GetWriteWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize, PVOID *lpAddresses, PULONG_PTR lpdwCount, PULONG lpdwGranularity);
+int mman_GetWriteWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize, PVOID *lpAddresses, PULONG_PTR lpdwCount, PULONG_PTR lpdwGranularity);
 void mman_ResetWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize);
 #else
 static constexpr int DIRTY_PAGE_SHIFT = 12;
 static constexpr int DIRTY_PAGE_SIZE = 1 << DIRTY_PAGE_SHIFT;
-static bool* dirty_page_map[MAX_RTG_BOARDS];
+static std::atomic<bool>* dirty_page_map[MAX_RTG_BOARDS];
 static int dirty_page_map_size[MAX_RTG_BOARDS];
-static int min_dirty_page_index[MAX_RTG_BOARDS];
-static int max_dirty_page_index[MAX_RTG_BOARDS];
+// Dirty-page bounds packed into a single word, (min_page << 32) | (max_page + 1):
+// mark_dirty() runs in the CPU write handlers while picasso_getwritewatch()
+// drains from the RTG render thread, and a single word lets the drain claim
+// the whole range with one compare_exchange so a concurrent writer can never
+// have its freshly published range overwritten by a reset.
+static std::atomic<uae_u64> dirty_bounds[MAX_RTG_BOARDS];
 #endif
 
 static void picasso_flushpixels(int index, uae_u8 *src, int offset, bool render);
@@ -502,6 +508,26 @@ static int gwwbufsize[MAX_RTG_BOARDS], gwwpagesize[MAX_RTG_BOARDS], gwwpagemask[
 extern uae_u8 *natmem_offset;
 
 #if !defined(_WIN32) || defined(AMIBERRY)
+// Widen the published dirty range. Called from the CPU write handlers after
+// the page bits have been set.
+static void dirty_bounds_widen(int index, int start_page, int end_page)
+{
+	uae_u64 cur = dirty_bounds[index].load();
+	for (;;) {
+		const int cur_min = static_cast<int>(cur >> 32);
+		const int cur_max = static_cast<int32_t>(static_cast<uint32_t>(cur)) - 1;
+		const int new_min = start_page < cur_min ? start_page : cur_min;
+		const int new_max = end_page > cur_max ? end_page : cur_max;
+		if (new_min == cur_min && new_max == cur_max) {
+			return;
+		}
+		const uae_u64 next = (static_cast<uae_u64>(new_min) << 32) | static_cast<uae_u32>(new_max + 1);
+		if (dirty_bounds[index].compare_exchange_weak(cur, next)) {
+			return;
+		}
+	}
+}
+
 static void NOINLINE mark_dirty(int index, uae_u8* addr, int size)
 {
 	if (index < 0 || !dirty_page_map[index])
@@ -517,17 +543,39 @@ static void NOINLINE mark_dirty(int index, uae_u8* addr, int size)
 	if (start_page < 0) start_page = 0;
 	if (end_page >= dirty_page_map_size[index]) end_page = dirty_page_map_size[index] - 1;
 
-	if (start_page < min_dirty_page_index[index]) min_dirty_page_index[index] = start_page;
-	if (end_page > max_dirty_page_index[index]) max_dirty_page_index[index] = end_page;
-
-	if (start_page <= end_page) {
-		dirty_page_map[index][start_page] = true;
-		for (int i = start_page + 1; i <= end_page; ++i) {
-			dirty_page_map[index][i] = true;
-		}
+	if (start_page > end_page) {
+		return;
 	}
+	dirty_page_map[index][start_page].store(true, std::memory_order_relaxed);
+	for (int i = start_page + 1; i <= end_page; ++i) {
+		dirty_page_map[index][i].store(true, std::memory_order_relaxed);
+	}
+
+	// Publish the widened bounds only after the bits are set. The bounds are
+	// a single word so picasso_getwritewatch() can claim the whole range with
+	// one compare_exchange; two separate words would let a drain reset one
+	// half after a writer published, losing the range until a later write.
+	dirty_bounds_widen(index, start_page, end_page);
 }
 #endif
+
+// Marks RTG memory that host code wrote through a direct pointer (bypassing the
+// CPU write handlers) so the display refresh picks it up. Ignores memory that
+// does not belong to an RTG bank.
+void picasso_mark_host_write(const uae_u8 *addr, uae_u32 size)
+{
+#if !defined(_WIN32) || defined(AMIBERRY)
+	for (int i = 0; i < MAX_RTG_BOARDS; i++) {
+		const addrbank *bank = gfxmem_banks[i];
+		if (!bank || !bank->baseaddr || !dirty_page_map[i])
+			continue;
+		if (addr >= bank->baseaddr && addr < bank->baseaddr + bank->allocated_size) {
+			mark_dirty(i, const_cast<uae_u8 *>(addr), static_cast<int>(size));
+			return;
+		}
+	}
+#endif
+}
 
 static uae_u8 GetBytesPerPixel(uae_u32 RGBfmt)
 {
@@ -1176,6 +1224,35 @@ bool p96_is_zero_copy_surface(int monid, const void* pixels)
 	const uae_u8* rtg_vram = p96_get_render_buffer_pointer(monid);
 	return rtg_vram && pixels == rtg_vram;
 }
+
+// The feature overlay (PIP) is composited into the copied frame by
+// picasso_flushoverlay(), which a zero-copy surface never receives.
+bool p96_overlay_active()
+{
+	return overlay_vram && overlay_active;
+}
+
+// True if ptr lies inside any RTG board's VRAM, using the same natmem mapping as
+// p96_get_render_buffer_pointer(). A zero-copy surface wraps VRAM at whatever
+// XYOffset was current when it was created, so a range test still catches it
+// after the guest has moved to another screen or display offset.
+bool p96_is_vram_pointer(const void* ptr)
+{
+	// Without a natmem reservation, start + natmem_offset is a guest address,
+	// not a host pointer, and there is no zero-copy VRAM mapping to detect.
+	if (!ptr || !natmem_offset)
+		return false;
+	const auto* p = static_cast<const uae_u8*>(ptr);
+	for (int i = 0; i < MAX_RTG_BOARDS; i++) {
+		const addrbank* bank = gfxmem_banks[i];
+		if (!bank || !bank->allocated_size)
+			continue;
+		const uae_u8* base = bank->start + natmem_offset;
+		if (p >= base && p < base + bank->allocated_size)
+			return true;
+	}
+	return false;
+}
 #endif
 
 static void rtg_render()
@@ -1723,53 +1800,57 @@ static void picasso_handle_hsync()
 #define BLT_MULT 1
 #define BLT_NAME BLIT_FALSE_32
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_32
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_32
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_32
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_32
 #define BLT_FUNC(s,d) *d = (*s) & ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_32
 #define BLT_FUNC(s,d) *d = (~(*d)) & rgbmask
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_32
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_32
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_32
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_32
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_32
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_32
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_32
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_32
 #ifdef AMIBERRY
 #define BLT_FUNC(s,d) memset(d, 0xff, sizeof (*d))
 #else
 #define BLT_FUNC(s,d) *d = 0xffffffff
 #endif
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_32
-#define BLT_FUNC(s,d) { uae_u16 tmp = *d ; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#define BLT_FUNC(s,d) { auto tmp = *d; *d = *s; *s = tmp; }
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_32
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_32
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
@@ -1777,49 +1858,54 @@ static void picasso_handle_hsync()
 #define BLT_MULT 1
 #define BLT_NAME BLIT_FALSE_24
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_24
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_24
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_24
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_24
 #define BLT_FUNC(s,d) *d = (*s) & (~(*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_24
 #define BLT_FUNC(s,d) *d = (~(*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_24
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_24
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_24
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_24
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_24
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_24
 #define BLT_FUNC(s,d) *d = (~(*d)) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_24
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_24
 #define BLT_FUNC(s,d) *d = 0xffffffff
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_24
-#define BLT_FUNC(s,d) { uae_u32 tmp = *d; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#define BLT_FUNC(s,d) { auto tmp = *d; *d = *s; *s = tmp; }
+#define BLT_WRITES_SRC
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_24
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_24
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
@@ -1827,49 +1913,53 @@ static void picasso_handle_hsync()
 #define BLT_MULT 2
 #define BLT_NAME BLIT_FALSE_16
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_16
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_16
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_16
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_16
 #define BLT_FUNC(s,d) *d = (*s) & ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_16
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_16
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_16
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_16
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_16
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_16
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_16
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_16
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_16
 #define BLT_FUNC(s,d) *d = 0xffff
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_16
-#define BLT_FUNC(s,d) { uae_u16 tmp = *d; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#define BLT_FUNC(s,d) { auto tmp = *d; *d = *s; *s = tmp; }
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_16
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_16
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
@@ -1879,92 +1969,128 @@ static void picasso_handle_hsync()
 #define BLT_NAME_MASK BLIT_FALSE_MASK_8
 #define BLT_FUNC(s,d) *d = 0
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((0) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_8
 #define BLT_NAME_MASK BLIT_NOR_MASK_8
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) | (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_8
 #define BLT_NAME_MASK BLIT_ONLYDST_MASK_8
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*d) & ~(*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_8
 #define BLT_NAME_MASK BLIT_NOTSRC_MASK_8
 #define BLT_FUNC(s,d) *d = ~(*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_8
 #define BLT_NAME_MASK BLIT_ONLYSRC_MASK_8
 #define BLT_FUNC(s,d) *d = (*s) & ~(*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) & ~(*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_8
 #define BLT_NAME_MASK BLIT_NOTDST_MASK_8
 #define BLT_FUNC(s,d) *d = ~(*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_8
 #define BLT_NAME_MASK BLIT_EOR_MASK_8
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) ^ (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_8
 #define BLT_NAME_MASK BLIT_NAND_MASK_8
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) & (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_8
 #define BLT_NAME_MASK BLIT_AND_MASK_8
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) & (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_8
 #define BLT_NAME_MASK BLIT_NEOR_MASK_8
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) ^ (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_8
 #define BLT_NAME_MASK BLIT_NOTONLYSRC_MASK_8
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*s) | (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SRC_8
 #define BLT_NAME_MASK BLIT_SRC_MASK_8
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_8
 #define BLT_FUNC(s,d) *d = *s
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((*s) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_8
 #define BLT_NAME_MASK BLIT_NOTONLYDST_MASK_8
 #define BLT_FUNC(s,d) *d = ~(*d) | (*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*d) | (*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_8
 #define BLT_NAME_MASK BLIT_OR_MASK_8
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) | (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_8
 #define BLT_NAME_MASK BLIT_TRUE_MASK_8
 #define BLT_FUNC(s,d) *d = 0xff
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((0xff) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_8
 #define BLT_NAME_MASK BLIT_SWAP_MASK_8
-#define BLT_FUNC(s,d) { uae_u8 tmp = *d; *d = *s; *s = tmp; }
-#define BLT_FUNC_MASK(s,d,mask) { uae_u8 tmp = *d; *d = ((*d) & ~mask) | ((*s) & mask); *s = ((*s) & ~mask) | ((tmp) & mask); }
-#include "p96_blit.cpp.in"
+#define BLT_FUNC(s,d) { auto tmp = *d; *d = *s; *s = tmp; }
+#define BLT_FUNC_MASK(s,d,mask) { auto tmp = *d; *d = ((*d) & ~mask) | ((*s) & mask); *s = ((*s) & ~mask) | ((tmp) & mask); }
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
 #define PARMS width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, rgbmask
 #define PARMSM width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, mask
+#define PARMST width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, transparentcolor, rgbmask
 
 /*
 * Functions to perform an action on the frame-buffer
 */
-static void do_blitrect_frame_buffer (const struct RenderInfo *ri, const struct
+static void do_blitrect_frame_buffer_transparent(struct RenderInfo *ri, struct
+	RenderInfo *dstri, uae_u32 srcx, uae_u32 srcy,
+	uae_u32 dstx, uae_u32 dsty, uae_u32 width, uae_u32 height,
+	uae_u8 mask, uae_u32 transparentcolor, uae_u32 RGBFmt, BLIT_OPCODE opcode)
+{
+	uae_u8 Bpp = GetBytesPerPixel(RGBFmt);
+	uae_u32 total_width = width * Bpp;
+	uae_u32 rgbmask = rgbfmasks[RGBFmt];
+	endianswap(&transparentcolor, Bpp);
+	transparentcolor &= rgbmask;
+
+	uae_u8 *src = ri->Memory + srcx * Bpp + srcy * ri->BytesPerRow;
+	uae_u8 *dst = dstri->Memory + dstx * Bpp + dsty * dstri->BytesPerRow;
+
+	P96TRACE((_T("(%dx%d)=(%dx%d)=(%dx%d)=%d C=%08x\n"), srcx, srcy, dstx, dsty, width, height, opcode, transparentcolor));
+	if (Bpp == 1) {
+
+		BLIT_SRC_TRANS_8(PARMST);
+
+	} else if (Bpp == 4) {
+
+		BLIT_SRC_TRANS_32(PARMST);
+
+	} else if (Bpp == 3) {
+
+		BLIT_SRC_TRANS_24(PARMST);
+
+	} else if (Bpp == 2) {
+
+		BLIT_SRC_TRANS_16(PARMST);
+
+	}
+}
+
+static void do_blitrect_frame_buffer (struct RenderInfo *ri, struct
 	RenderInfo *dstri, uae_u32 srcx, uae_u32 srcy,
 	uae_u32 dstx, uae_u32 dsty, uae_u32 width, uae_u32 height,
 	uae_u8 mask, uae_u32 RGBFmt, BLIT_OPCODE opcode)
@@ -1985,7 +2111,7 @@ static void do_blitrect_frame_buffer (const struct RenderInfo *ri, const struct
 		case BLIT_FALSE: BLIT_FALSE_MASK_8(PARMSM); break;
 		case BLIT_NOR: BLIT_NOR_MASK_8(PARMSM); break;
 		case BLIT_ONLYDST: BLIT_ONLYDST_MASK_8(PARMSM); break;
-		case BLIT_NOTSRC: BLIT_NOTSRC_8(PARMSM); break;
+		case BLIT_NOTSRC: BLIT_NOTSRC_MASK_8(PARMSM); break;
 		case BLIT_ONLYSRC: BLIT_ONLYSRC_MASK_8(PARMSM); break;
 		case BLIT_NOTDST: BLIT_NOTDST_MASK_8(PARMSM); break;
 		case BLIT_EOR: BLIT_EOR_MASK_8(PARMSM); break;
@@ -2009,20 +2135,17 @@ static void do_blitrect_frame_buffer (const struct RenderInfo *ri, const struct
 			if (ri->BytesPerRow == dstri->BytesPerRow && total_width == ri->BytesPerRow) {
 				// write_log("Optimized BlitRect: w=%d, h=%d, bpr=%d\n", width, height, ri->BytesPerRow);
 				memmove(dst, src, total_width * height);
-			} else if (ri->Memory == dstri->Memory && dsty == srcy) {
-				// write_log("BlitRect Fallback 1: w=%d, h=%d, bpr=%d vs tot=%d\n", width, height, ri->BytesPerRow, total_width);
+			} else if (dst <= src) {
+				// Pitches are equal when the rectangles overlap (the caller
+				// copies the source otherwise), so the address order decides
+				// the direction, whichever RenderInfo each one came from.
 				for (int i = 0; i < height; i++, src += ri->BytesPerRow, dst += dstri->BytesPerRow)
 					memmove (dst, src, total_width);
-			} else if (dsty < srcy) {
-				// write_log("BlitRect Fallback 2: w=%d, h=%d\n", width, height);
-				for (int i = 0; i < height; i++, src += ri->BytesPerRow, dst += dstri->BytesPerRow)
-					memcpy (dst, src, total_width);
 			} else {
-				// write_log("BlitRect Fallback 3: w=%d, h=%d\n", width, height);
 				src += (height - 1) * ri->BytesPerRow;
 				dst += (height - 1) * dstri->BytesPerRow;
 				for (int i = 0; i < height; i++, src -= ri->BytesPerRow, dst -= dstri->BytesPerRow)
-					memcpy (dst, src, total_width);
+					memmove (dst, src, total_width);
 			}
 
 		} else {
@@ -2227,6 +2350,59 @@ static void putmousepixel(const SDL_Surface* cursor_surface, const int x, const 
 		*target_pixel = amiberry_cursor_rgba32_from_rgb24(ct[c]);
 	}
 }
+
+static SDL_Surface* create_host_cursor_surface(const uae_u8* image, const int pitch,
+	const int src_w, const int src_h, const uae_u32* ct, const int dst_w, const int dst_h)
+{
+	SDL_Surface* surface = SDL_CreateSurface(dst_w, dst_h, SDL_PIXELFORMAT_RGBA32);
+	if (!surface) {
+		return nullptr;
+	}
+	for (int y = 0; y < dst_h; y++) {
+		const uae_u8* row = image + amiberry_cursor_scaled_source_index(y, dst_h, src_h) * pitch;
+		for (int x = 0; x < dst_w; x++) {
+			putmousepixel(surface, x, y, row[amiberry_cursor_scaled_source_index(x, dst_w, src_w)], ct);
+		}
+	}
+	return surface;
+}
+
+// Host cursor units per decoded cursor pixel, so the host cursor is as large
+// as the pointer the Amiga display would show.
+static void host_cursor_display_scale(const int monid, const bool native,
+	float* scale_x, float* scale_y, float* pixel_density)
+{
+	if (getgfxwindowscale(monid, scale_x, scale_y) && native) {
+		// Decoded native cursors use mousehack units, hires pixels and
+		// interlaced lines, while the scale is per native buffer pixel.
+		*scale_x *= static_cast<float>(1 << currprefs.gfx_resolution) / 2.0f;
+		*scale_y *= static_cast<float>(1 << coord_native_line_shift()) / 2.0f;
+	}
+	SDL_Window* window = AMonitors[monid].amiga_window;
+	*pixel_density = window ? SDL_GetWindowPixelDensity(window) : 1.0f;
+}
+
+static SDL_Cursor* create_host_cursor(const uae_u8* image, const int pitch,
+	const int src_w, const int src_h, const uae_u32* ct, const AmiberryCursorHostImage& layout)
+{
+	SDL_Surface* surface = create_host_cursor_surface(image, pitch, src_w, src_h, ct,
+		layout.width, layout.height);
+	if (!surface) {
+		return nullptr;
+	}
+	if (layout.pixel_width != layout.width || layout.pixel_height != layout.height) {
+		// HiDPI windows pick this copy instead of upscaling the cursor units.
+		SDL_Surface* hidpi = create_host_cursor_surface(image, pitch, src_w, src_h, ct,
+			layout.pixel_width, layout.pixel_height);
+		if (hidpi) {
+			SDL_AddSurfaceAlternateImage(surface, hidpi);
+			SDL_DestroySurface(hidpi);
+		}
+	}
+	SDL_Cursor* cursor = SDL_CreateColorCursor(surface, layout.hot_x, layout.hot_y);
+	SDL_DestroySurface(surface);
+	return cursor;
+}
 #else
 static void putwinmousepixel(HDC andDC, HDC xorDC, int x, int y, int c, uae_u32 *ct)
 {
@@ -2250,16 +2426,22 @@ static int tmp_sprite_hotspot_x, tmp_sprite_hotspot_y;
 static int tmp_sprite_residual_x, tmp_sprite_residual_y;
 static int tmp_sprite_chipset = -1;
 static int tmp_sprite_monid = -1;
+static AmiberryCursorHostImage tmp_sprite_layout;
 #endif
 
 extern uaecptr sprite_0;
+#ifdef AMIBERRY
 extern int sprite_0_width, sprite_0_height, sprite_0_doubled, sprite_0_x, sprite_0_y;
+#else
+extern int sprite_0_width, sprite_0_height, sprite_0_doubled;
+#endif
 extern uae_u32 sprite_0_colors[4];
 
 static int createwindowscursor(int monid, int set, int chipset)
 {
 #ifdef AMIBERRY
-	SDL_Surface* cursor_surface = nullptr;
+	float scale_x = 1.0f, scale_y = 1.0f, pixel_density = 1.0f;
+	AmiberryCursorHostImage layout{};
 	int ret = 0;
 	bool isdata = false;
 	SDL_Cursor* old_cursor = p96_cursor;
@@ -2288,6 +2470,7 @@ static int createwindowscursor(int monid, int set, int chipset)
 		isfullscreen() == 0)) {
 		goto exit;
 	}
+	host_cursor_display_scale(monid, chipset != 0, &scale_x, &scale_y, &pixel_density);
 
 	if (chipset) {
 		reset_p96_cursor_hotspot_tracker();
@@ -2385,7 +2568,7 @@ static int createwindowscursor(int monid, int set, int chipset)
 		// Native pointer and sprite positions both use hires coordinate units.
 		// Decoded low-res cursor pixels use those same units on both axes.
 		if (amiberry_input_cursor_hotspot_tracker_sample(hotspot_tracker,
-			pointer_valid, pointer_x, pointer_y, sprite_0_x, sprite_0_y,
+			pointer_valid, vsync_counter, pointer_x, pointer_y, sprite_0_x, sprite_0_y,
 			w, h, 3, &hotspot_x, &hotspot_y)) {
 			// The pointer-to-sprite delta contains small native positioning biases.
 			// If it lands at a decoded row/column crossing, prefer the bitmap's
@@ -2409,14 +2592,17 @@ static int createwindowscursor(int monid, int set, int chipset)
 				&p96_cursor_hotspot_tracker_cache, w, h, hotspot_signature);
 
 			if (amiberry_input_cursor_hotspot_tracker_sample(hotspot_tracker,
-				pointer_valid, pointer_x, pointer_y,
+				pointer_valid, vsync_counter, pointer_x, pointer_y,
 				newcursor_x, newcursor_y, w, h, 3, &hotspot_x, &hotspot_y)) {
 				residual_x = 0;
 				residual_y = 0;
 			}
 
+			layout = amiberry_cursor_host_image(w, h, hotspot_x, hotspot_y,
+				scale_x, scale_y, pixel_density);
 			const bool cursor_update_needed = !cursor_cache_matches
-				|| hotspot_x != tmp_sprite_hotspot_x || hotspot_y != tmp_sprite_hotspot_y;
+				|| hotspot_x != tmp_sprite_hotspot_x || hotspot_y != tmp_sprite_hotspot_y
+				|| !amiberry_cursor_host_image_equal(layout, tmp_sprite_layout);
 			if (amiberry_input_cursor_hotspot_should_defer_swap(cursor_update_needed,
 				old_cursor && tmp_sprite_chipset == 0, hotspot_tracker)) {
 				SDL_SetCursor(old_cursor);
@@ -2429,7 +2615,9 @@ static int createwindowscursor(int monid, int set, int chipset)
 		}
 	}
 
-	if (cursor_cache_matches && hotspot_x == tmp_sprite_hotspot_x && hotspot_y == tmp_sprite_hotspot_y) {
+	layout = amiberry_cursor_host_image(w, h, hotspot_x, hotspot_y, scale_x, scale_y, pixel_density);
+	if (cursor_cache_matches && hotspot_x == tmp_sprite_hotspot_x && hotspot_y == tmp_sprite_hotspot_y
+		&& amiberry_cursor_host_image_equal(layout, tmp_sprite_layout)) {
 		if (SDL_GetCursor() == p96_cursor) {
 			SDL_ShowCursor();
 			tmp_sprite_residual_x = residual_x;
@@ -2442,34 +2630,22 @@ static int createwindowscursor(int monid, int set, int chipset)
 
 	p96_cursor = nullptr;
 
-	write_log(_T("p96_cursor: %dx%d\n"), w, h);
+	write_log(_T("p96_cursor: %dx%d -> %dx%d\n"), w, h, layout.width, layout.height);
 
 	tmp_sprite_w = tmp_sprite_h = 0;
 	tmp_sprite_hotspot_x = tmp_sprite_hotspot_y = 0;
 	tmp_sprite_residual_x = tmp_sprite_residual_y = 0;
 	tmp_sprite_chipset = -1;
 	tmp_sprite_monid = -1;
+	tmp_sprite_layout = {};
 
-	cursor_surface = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32);
-	if (!cursor_surface)
-		goto end;
-
-	isdata = false;
-	for (int y = 0; y < h; y++) {
-		uae_u8* s = image + y * w;
-		for (int x = 0; x < w; x++) {
-			int c = *s++;
-			putmousepixel(cursor_surface, x, y, c, ct);
-			if (c > 0) {
-				isdata = true;
-			}
-		}
-	}
+	isdata = std::any_of(image, image + datasize, [](const uae_u8 c) { return c != 0; });
 	ret = 1;
-
-end:
 	if (isdata) {
-		p96_cursor = SDL_CreateColorCursor(cursor_surface, hotspot_x, hotspot_y);
+		p96_cursor = create_host_cursor(image, w, w, h, ct, layout);
+		ret = p96_cursor != nullptr;
+	}
+	if (p96_cursor) {
 		tmp_sprite_w = w;
 		tmp_sprite_h = h;
 		tmp_sprite_hotspot_x = hotspot_x;
@@ -2478,14 +2654,9 @@ end:
 		tmp_sprite_residual_y = residual_y;
 		tmp_sprite_chipset = chipset;
 		tmp_sprite_monid = monid;
+		tmp_sprite_layout = layout;
 		memcpy(tmp_sprite_data, image, datasize);
 		memcpy(tmp_sprite_colors, ct, sizeof(uae_u32) * 4);
-	}
-
-	if (cursor_surface != nullptr)
-	{
-		SDL_DestroySurface(cursor_surface);
-		cursor_surface = nullptr;
 	}
 
 	if (p96_cursor) {
@@ -2703,10 +2874,15 @@ void picasso_update_external_host_cursor(const int monid, const uae_u8* image, c
 
 	hotspot_x = std::clamp(hotspot_x, 0, width - 1);
 	hotspot_y = std::clamp(hotspot_y, 0, height - 1);
+	float scale_x = 1.0f, scale_y = 1.0f, pixel_density = 1.0f;
+	host_cursor_display_scale(monid, false, &scale_x, &scale_y, &pixel_density);
+	const AmiberryCursorHostImage layout = amiberry_cursor_host_image(width, height,
+		hotspot_x, hotspot_y, scale_x, scale_y, pixel_density);
 	bool same_image = p96_cursor && tmp_sprite_chipset == 2
 		&& tmp_sprite_monid == monid
 		&& tmp_sprite_w == width && tmp_sprite_h == height
 		&& tmp_sprite_hotspot_x == hotspot_x && tmp_sprite_hotspot_y == hotspot_y
+		&& amiberry_cursor_host_image_equal(layout, tmp_sprite_layout)
 		&& !memcmp(tmp_sprite_colors, colors, sizeof(uae_u32) * 4);
 	for (int y = 0; same_image && y < height; ++y) {
 		same_image = !memcmp(tmp_sprite_data + y * width, image + y * image_pitch, width);
@@ -2721,24 +2897,15 @@ void picasso_update_external_host_cursor(const int monid, const uae_u8* image, c
 		return;
 	}
 
-	SDL_Surface* cursor_surface = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
-	if (!cursor_surface) {
-		return;
-	}
-
 	bool has_visible_pixel = false;
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const int color = image[y * image_pitch + x];
-			putmousepixel(cursor_surface, x, y, color, colors);
-			has_visible_pixel |= color != 0;
-		}
+	for (int y = 0; y < height && !has_visible_pixel; ++y) {
+		const uae_u8* row = image + y * image_pitch;
+		has_visible_pixel = std::any_of(row, row + width, [](const uae_u8 c) { return c != 0; });
 	}
 
 	SDL_Cursor* new_cursor = has_visible_pixel
-		? SDL_CreateColorCursor(cursor_surface, hotspot_x, hotspot_y)
+		? create_host_cursor(image, image_pitch, width, height, colors, layout)
 		: nullptr;
-	SDL_DestroySurface(cursor_surface);
 	if (!new_cursor) {
 		picasso_clear_external_host_cursor(monid);
 		return;
@@ -2754,6 +2921,7 @@ void picasso_update_external_host_cursor(const int monid, const uae_u8* image, c
 	tmp_sprite_residual_y = 0;
 	tmp_sprite_chipset = 2;
 	tmp_sprite_monid = monid;
+	tmp_sprite_layout = layout;
 	for (int y = 0; y < height; ++y) {
 		memcpy(tmp_sprite_data + y * width, image + y * image_pitch, width);
 	}
@@ -2780,6 +2948,7 @@ void picasso_clear_external_host_cursor(const int monid)
 		tmp_sprite_residual_y = 0;
 		tmp_sprite_chipset = -1;
 		tmp_sprite_monid = -1;
+		tmp_sprite_layout = {};
 	}
 }
 #endif
@@ -2826,11 +2995,13 @@ static uae_u32 setspriteimage(TrapContext *ctx, uaecptr bi)
 	bpp = 4;
 	w = trap_get_byte(ctx, bi + PSSO_BoardInfo_MouseWidth);
 	h = trap_get_byte(ctx, bi + PSSO_BoardInfo_MouseHeight);
+#ifdef AMIBERRY
 	// P96 stores these fields as UBYTE but interprets them as signed BYTE
 	// displacements. Keep the raw byte here; hotspot conversion sign-extends it.
 	// Some versions leave them zero, in which case the live tracker can refine it.
 	cursorxoffset = trap_get_byte(ctx, bi + PSSO_BoardInfo_MouseXOffset);
 	cursoryoffset = trap_get_byte(ctx, bi + PSSO_BoardInfo_MouseYOffset);
+#endif
 	flags = trap_get_long(ctx, bi + PSSO_BoardInfo_Flags);
 	hiressprite = 1;
 	doubledsprite = 0;
@@ -2855,9 +3026,11 @@ static uae_u32 setspriteimage(TrapContext *ctx, uaecptr bi)
 		goto end;
 	}
 
-	cursordata = xmalloc (uae_u8, w * h);
+	// Build the full image, then keep what fits the cursor surface.
+	uae_u8 *image = xmalloc(uae_u8, w * h);
+	cursordata = nullptr;
 	for (y = 0, yy = 0; y < h; y++, yy++) {
-		uae_u8 *p = cursordata + w * y;
+		uae_u8 *p = image + w * y;
 		const uae_u8 *pprev = p;
 		const uaecptr img = iptr + 4 * hiressprite + yy * 4 * hiressprite;
 		x = 0;
@@ -2878,7 +3051,8 @@ static uae_u32 setspriteimage(TrapContext *ctx, uaecptr bi)
 				}
 			}
 		}
-		if (doubledsprite && y < h) {
+		// With an odd height the last row has no copy.
+		if (doubledsprite && y + 1 < h) {
 			y++;
 			memcpy(p, pprev, w);
 		}
@@ -2890,6 +3064,14 @@ static uae_u32 setspriteimage(TrapContext *ctx, uaecptr bi)
 	cursorheight = h;
 	if (cursorheight > CURSORMAXHEIGHT)
 		cursorheight = CURSORMAXHEIGHT;
+	// Readers walk rows of cursorwidth bytes, so store with that stride.
+	cursordata = xcalloc(uae_u8, cursorwidth * cursorheight);
+	if (cursordata) {
+		for (y = 0; y < cursorheight; y++) {
+			memcpy(cursordata + cursorwidth * y, image + w * y, cursorwidth);
+		}
+	}
+	xfree(image);
 
 	createwindowscursor(currprefs.rtgboards[0].monitor_id, 1, 0);
 
@@ -3146,9 +3328,9 @@ static int missmodes[] = {
 	640,  480,
 	640,  512,
 	800,  600,
-   1024,  768,
-   1280, 1024,
-   -1
+	1024,  768,
+	1280, 1024,
+	-1
 };
 
 static int AssignModeID (int w, int h, int *unkcnt)
@@ -3216,12 +3398,13 @@ void picasso_allocatewritewatch (int index, int gfxmemsize)
 
 	delete[] dirty_page_map[index];
 	const int pages = gwwbufsize[index];
-	dirty_page_map[index] = new bool[pages];
+	dirty_page_map[index] = new std::atomic<bool>[pages];
 	dirty_page_map_size[index] = pages;
-	// Initialize min/max to "empty" state
-	min_dirty_page_index[index] = pages;
-	max_dirty_page_index[index] = -1;
-	memset(dirty_page_map[index], 0, pages * sizeof(bool));
+	// Initialize the bounds to the "empty" state (min = pages, max = -1)
+	dirty_bounds[index].store(static_cast<uae_u64>(pages) << 32);
+	for (int i = 0; i < pages; i++) {
+		dirty_page_map[index][i].store(false, std::memory_order_relaxed);
+	}
 #endif
 }
 
@@ -3258,30 +3441,49 @@ int picasso_getwritewatch (int index, int offset, uae_u8 ***gwwbufp, uae_u8 **st
 	const int page_size = gwwpagesize[index];
 	int count = 0;
 
-	int start = min_dirty_page_index[index];
-	int end = max_dirty_page_index[index];
-
-	if (start > end) {
-		return 0;
+	// Claim the whole dirty range with a single compare_exchange. If a
+	// writer widened the bounds between our load and the exchange, the
+	// exchange fails and we retry against the wider range instead of
+	// resetting over the freshly published pages and losing them.
+	const uae_u64 empty = static_cast<uae_u64>(dirty_page_map_size[index]) << 32;
+	uae_u64 cur = dirty_bounds[index].load();
+	int start;
+	int end;
+	for (;;) {
+		start = static_cast<int>(cur >> 32);
+		end = static_cast<int32_t>(static_cast<uint32_t>(cur)) - 1;
+		if (start > end) {
+			return 0;
+		}
+		if (dirty_bounds[index].compare_exchange_weak(cur, empty)) {
+			break;
+		}
 	}
 
-	// Reset bounds immediately for next frame accumulation
-	min_dirty_page_index[index] = dirty_page_map_size[index];
-	max_dirty_page_index[index] = -1;
-
+	// Clear with a single read-modify-write: a plain load/store pair could
+	// let a concurrent writer set the bit between our load and our clear,
+	// erasing its mark even though it republished the bounds covering it.
 	for (int i = start; i <= end; ++i) {
-		if (dirty_page_map[index][i]) {
+		if (dirty_page_map[index][i].exchange(false, std::memory_order_relaxed)) {
 			if (count < gwwbufsize[index]) {
 				gwwbuf[index][count++] = const_cast<uae_u8*>(base) + i * page_size;
 			}
-			dirty_page_map[index][i] = false; // Reset after reading
 		}
 	}
 
 	if (gwwbufp)
 		*gwwbufp = (uae_u8**)gwwbuf[index];
 	if (startp) {
-		*startp = const_cast<uae_u8*>(base);
+		// Match the Windows semantics: the region base is the board base
+		// plus the screen offset, not the bare board base. Returning the
+		// bare base would widen the caller's range filter to pages below
+		// the visible screen (e.g. offscreen bitmaps, the split region).
+		// The returned page list is page-aligned, so round the base down
+		// too: with a panned (SetPanning) screen offset that is not
+		// page-aligned, an unaligned base would reject the page holding
+		// the top-left of the visible screen after its dirty bit was
+		// already cleared, leaving it stale.
+		*startp = const_cast<uae_u8*>(base) + (offset & ~gwwpagemask[index]);
 	}
 	return count;
 #endif
@@ -3327,7 +3529,7 @@ bool picasso_is_vram_dirty (int index, uaecptr addr, int size)
 	if (end_page >= dirty_page_map_size[index]) end_page = dirty_page_map_size[index] - 1;
 
 	for (int i = start_page; i <= end_page; ++i) {
-		if (dirty_page_map[index][i]) { return true; }
+		if (dirty_page_map[index][i].load(std::memory_order_relaxed)) { return true; }
 	}
 	return false;
 #endif
@@ -3477,33 +3679,54 @@ static int addresolutions(void)
 			template_mode.depth = newmodes[0].depth;
 			template_mode.refresh = newmodes[0].refresh[0];
 		}
+		const long long usable_vram = static_cast<long long>(gfxmem_bank.allocated_size) - 256;
+		auto emit = [&](const android_rtg_candidate* candidates, const int added) {
+			for (int k = 0; k < added; k++) {
+				if (android_rtg_mode_fits_existing(candidates[k].width, candidates[k].height,
+					newmodes, cnt))
+					continue;
+				struct PicassoResolution* pr = &newmodes[cnt];
+				if (cnt > 0)
+					memcpy(pr, &newmodes[0], sizeof(struct PicassoResolution));
+				else
+					memset(pr, 0, sizeof(struct PicassoResolution));
+				pr->inuse = true;
+				pr->rawmode = false;
+				pr->lace = false;
+				pr->res.width = candidates[k].width;
+				pr->res.height = candidates[k].height;
+				pr->depth = candidates[k].depth;
+				pr->refresh[0] = candidates[k].refresh;
+				pr->refreshtype[0] = 0;
+				pr->refresh[1] = 0;
+				_sntprintf(pr->name, sizeof pr->name, _T("%s"), candidates[k].name);
+				size += PSSO_LibResolution_sizeof;
+				size += PSSO_ModeInfo_sizeof * depths;
+				cnt++;
+			}
+		};
+
 		struct android_rtg_candidate candidates[android_virtual_rtg_mode_count];
-		const int budget = android_rtg_remaining_mode_budget(MAX_PICASSO_MODES, cnt);
-		const int added = android_rtg_build_modes(template_mode,
-			static_cast<long long>(gfxmem_bank.allocated_size) - 256,
-			budget, candidates);
-		for (int k = 0; k < added; k++) {
-			if (android_rtg_mode_fits_existing(candidates[k].width, candidates[k].height,
-				newmodes, cnt))
-				continue;
-			struct PicassoResolution* pr = &newmodes[cnt];
-			if (cnt > 0)
-				memcpy(pr, &newmodes[0], sizeof(struct PicassoResolution));
-			else
-				memset(pr, 0, sizeof(struct PicassoResolution));
-			pr->inuse = true;
-			pr->rawmode = false;
-			pr->lace = false;
-			pr->res.width = candidates[k].width;
-			pr->res.height = candidates[k].height;
-			pr->depth = candidates[k].depth;
-			pr->refresh[0] = candidates[k].refresh;
-			pr->refreshtype[0] = 0;
-			pr->refresh[1] = 0;
-			_sntprintf(pr->name, sizeof pr->name, _T("%s"), candidates[k].name);
-			size += PSSO_LibResolution_sizeof;
-			size += PSSO_ModeInfo_sizeof * depths;
-			cnt++;
+		emit(candidates, android_rtg_build_modes(template_mode, usable_vram,
+			android_rtg_remaining_mode_budget(MAX_PICASSO_MODES, cnt), candidates));
+
+		// Modes in the device's own shape, which fill its screen exactly.
+		// This runs on the extended-trap thread, so take the screen size that
+		// enumeratedisplays() cached on the main thread rather than asking SDL.
+		// The bounds are in points, not pixels, but only the shape matters.
+		const MultiDisplay* primary = nullptr;
+		for (int di = 0; di < MAX_DISPLAYS && Displays[di].monitorname; di++) {
+			if (Displays[di].primary) {
+				primary = &Displays[di];
+				break;
+			}
+		}
+		if (!primary && Displays[0].monitorname)
+			primary = &Displays[0];
+		if (primary) {
+			struct android_rtg_candidate shaped[android_rtg_screen_mode_count];
+			emit(shaped, android_rtg_build_screen_modes(template_mode, primary->rect.w, primary->rect.h,
+				usable_vram, android_rtg_remaining_mode_budget(MAX_PICASSO_MODES, cnt), shaped));
 		}
 	}
 #endif
@@ -4174,8 +4397,20 @@ static uae_u32 REGPARAM2 picasso_SetPanning (TrapContext *ctx)
 		oldscr = start_of_screen;
 	}
 
-	bme_width = trap_get_word(ctx, bmeptr + PSSO_BitMapExtra_Width);
-	bme_height = trap_get_word(ctx, bmeptr + PSSO_BitMapExtra_Height);
+	// Without a BitMapExtra the visible size is all there is.
+	if (bmeptr) {
+		bme_width = trap_get_word(ctx, bmeptr + PSSO_BitMapExtra_Width);
+		bme_height = trap_get_word(ctx, bmeptr + PSSO_BitMapExtra_Height);
+	} else {
+		bme_width = Width;
+		bme_height = state->Height;
+	}
+	if (!bme_width) {
+		bme_width = state->Width;
+	}
+	if (!bme_height) {
+		bme_height = state->Height;
+	}
 	rgbf = state->RGBFormat;
 
 	state->Address = start_of_screen; /* Amiga-side address */
@@ -4230,12 +4465,32 @@ static uae_u32 REGPARAM2 picasso_SetSplitPosition(TrapContext *ctx)
 	if (pos != vidinfo->splitypos) {
 		vidinfo->splitypos = pos;
 		vidinfo->full_refresh = 1;
+#ifdef AMIBERRY
+		// A split screen cannot be shown by a zero-copy surface, which is
+		// the board memory itself; rebind the host surface.
+		if (p96_is_zero_copy_enabled(monid)) {
+			adisplays[monid].picasso_zero_copy_update_needed = true;
+		}
+#endif
 	}
 	unlockrtg();
 	return 1;
 }
 
-#ifdef CPU_64_BIT
+// SetSplitPosition stores the split in BoardInfo, so this is the value
+// P96 expects to be shown. Used when the display is reopened and after
+// a state restore, both of which would otherwise drop the split.
+int picasso_get_splitypos(int monid)
+{
+	if (monid != currprefs.rtgboards[0].monitor_id || !boardinfo) {
+		return -1;
+	}
+	if (!trap_valid_address(nullptr, boardinfo + PSSO_BoardInfo_YSplit, 2)) {
+		return -1;
+	}
+	return static_cast<uae_s16>(trap_get_word(nullptr, boardinfo + PSSO_BoardInfo_YSplit)) - 1;
+}
+
 static void do_xor8(uae_u8 *p, int w, uae_u32 v)
 {
 	while (ALIGN_POINTER_TO32(p) != 7 && w) {
@@ -4257,28 +4512,6 @@ static void do_xor8(uae_u8 *p, int w, uae_u32 v)
 		w--;
 	}
 }
-#else
-static void do_xor8(uae_u8 *p, int w, uae_u32 v)
-{
-	while (ALIGN_POINTER_TO32(p) != 3 && w) {
-		*p ^= v;
-		p++;
-		w--;
-	}
-	while (w >= 2 * 4) {
-		*((uae_u32*)p) ^= v;
-		p += 4;
-		*((uae_u32*)p) ^= v;
-		p += 4;
-		w -= 2 * 4;
-	}
-	while (w) {
-		*p ^= v;
-		p++;
-		w--;
-	}
-}
-#endif
 /*
 * InvertRect:
 *
@@ -4316,7 +4549,7 @@ static uae_u32 REGPARAM2 picasso_InvertRect (TrapContext *ctx)
 
 	if (CopyRenderInfoStructureA2U(ctx, renderinfo, &ri)) {
 		P96TRACE((_T("InvertRect %dbpp 0x%02x\n"), Bpp, mask));
-		if (!validatecoords(ctx, &ri, ri.RGBFormat, &X, &Y, &Width, &Height))
+		if (!validatecoords(ctx, &ri, RGBFmt, &X, &Y, &Width, &Height))
 			return 1;
 #ifdef AMIBERRY
 		mark_dirty(rtg_index, ri.Memory + Y * ri.BytesPerRow + X * Bpp, Height * ri.BytesPerRow);
@@ -4443,15 +4676,17 @@ struct blitdata
 	uae_u32 height;
 	uae_u8 mask;
 	uae_u8 RGBFmt;
+	uae_u32 transparentcolor;
+	bool transparent;
 	BLIT_OPCODE opcode;
 } blitrectdata;
 
 static int BlitRectHelper(TrapContext *ctx)
 {
 	struct RenderInfo *ri = blitrectdata.ri;
-	const struct RenderInfo *dstri = blitrectdata.dstri;
-	const uae_u32 srcx = blitrectdata.srcx;
-	const uae_u32 srcy = blitrectdata.srcy;
+	struct RenderInfo *dstri = blitrectdata.dstri;
+	uae_u32 srcx = blitrectdata.srcx;
+	uae_u32 srcy = blitrectdata.srcy;
 	const uae_u32 dstx = blitrectdata.dstx;
 	const uae_u32 dsty = blitrectdata.dsty;
 	uae_u32 width = blitrectdata.width;
@@ -4459,10 +4694,13 @@ static int BlitRectHelper(TrapContext *ctx)
 	const uae_u8 RGBFmt = blitrectdata.RGBFmt;
 	const uae_u8 mask = blitrectdata.mask;
 	const BLIT_OPCODE opcode = blitrectdata.opcode;
+	bool transparent = blitrectdata.transparent;
+	uae_u32 transparentcolor = blitrectdata.transparentcolor;
 
 	if (!validatecoords(ctx, ri, RGBFmt, &srcx, &srcy, &width, &height))
 		return 1;
-	if (!validatecoords(ctx, dstri, RGBFmt, &dstx, &dsty, &width, &height))
+	// Without a destination RenderInfo the blit writes into the source.
+	if (!validatecoords(ctx, dstri ? dstri : ri, RGBFmt, &dstx, &dsty, &width, &height))
 		return 1;
 
 	uae_u8 Bpp = GetBytesPerPixel(RGBFmt);
@@ -4475,26 +4713,78 @@ static int BlitRectHelper(TrapContext *ctx)
 	* If we have a destination RenderInfo, then we've been called from picasso_BlitRectNoMaskComplete()
 	* and we need to put the results on the screen from the frame-buffer.
 	*/
-	if (dstri == nullptr || dstri->Memory == ri->Memory) {
+	if (dstri == nullptr || (dstri->Memory == ri->Memory && dstri->BytesPerRow == ri->BytesPerRow)) {
 		dstri = ri;
 	}
 	/* Do our virtual frame-buffer memory first */
 #ifdef AMIBERRY
-	mark_dirty(rtg_index, dstri->Memory + dsty * dstri->BytesPerRow + dstx * GetBytesPerPixel(RGBFmt), height * dstri->BytesPerRow);
+	{
+		const uae_u32 dirtysize = dstri->BytesPerRow ? height * dstri->BytesPerRow : width * GetBytesPerPixel(RGBFmt);
+		mark_dirty(rtg_index, dstri->Memory + dsty * dstri->BytesPerRow + dstx * GetBytesPerPixel(RGBFmt), dirtysize);
+		if (opcode == BLIT_SWAP) {
+			// A swap also writes its source rectangle.
+			const uae_u32 srcdirtysize = ri->BytesPerRow ? height * ri->BytesPerRow : width * GetBytesPerPixel(RGBFmt);
+			mark_dirty(rtg_index, ri->Memory + srcy * ri->BytesPerRow + srcx * GetBytesPerPixel(RGBFmt), srcdirtysize);
+		}
+	}
 #endif
-	do_blitrect_frame_buffer(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, RGBFmt, opcode);
+
+	// The blitters pick one traversal direction from the source pitch,
+	// which cannot protect overlapping rectangles with different pitches.
+	// Copy the source first in that case. A swap also writes its source,
+	// so leave that layout to the software fallback.
+	struct RenderInfo snapri;
+	uae_u8 *snapshot = nullptr;
+	if (dstri != ri && dstri->BytesPerRow != ri->BytesPerRow) {
+		uae_u32 rowbytes = width * Bpp;
+		uae_u8 *s0 = ri->Memory + srcx * Bpp + srcy * ri->BytesPerRow;
+		uae_u8 *d0 = dstri->Memory + dstx * Bpp + dsty * dstri->BytesPerRow;
+		uae_u8 *s1 = s0 + (height - 1) * ri->BytesPerRow + rowbytes;
+		uae_u8 *d1 = d0 + (height - 1) * dstri->BytesPerRow + rowbytes;
+		if (s0 < d1 && d0 < s1) {
+			if (opcode == BLIT_SWAP) {
+				return 0;
+			}
+			snapshot = xmalloc(uae_u8, rowbytes * height);
+			if (!snapshot) {
+				return 0;
+			}
+			for (uae_u32 y = 0; y < height; y++) {
+				memcpy(snapshot + y * rowbytes, s0 + y * ri->BytesPerRow, rowbytes);
+			}
+			snapri = *ri;
+			snapri.Memory = snapshot;
+			snapri.BytesPerRow = static_cast<uae_s16>(rowbytes);
+			ri = &snapri;
+			srcx = 0;
+			srcy = 0;
+		}
+	}
+	if (transparent) {
+		do_blitrect_frame_buffer_transparent(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, transparentcolor, RGBFmt, opcode);
+	} else {
+		do_blitrect_frame_buffer(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, RGBFmt, opcode);
+	}
+	xfree(snapshot);
 	return 1;
 }
 
 static int BlitRect(TrapContext *ctx, uaecptr ri, uaecptr dstri,
 	uae_u32 srcx, uae_u32 srcy, uae_u32 dstx, uae_u32 dsty,
-	uae_u32 width, uae_u32 height, uae_u8 mask, uae_u8 RGBFmt, BLIT_OPCODE opcode)
+	uae_u32 width, uae_u32 height, uae_u8 mask,
+	bool transparent, uae_u32 transparentcolor,
+	uae_u8 RGBFmt, BLIT_OPCODE opcode)
 {
-	/* Set up the params */
-	CopyRenderInfoStructureA2U(ctx, ri, &blitrectdata.ri_struct);
+	/* Set up the params. Without a valid RenderInfo, leave the blit to
+	 * the software fallback rather than using the previous call's. */
+	if (!CopyRenderInfoStructureA2U(ctx, ri, &blitrectdata.ri_struct)) {
+		return 0;
+	}
 	blitrectdata.ri = &blitrectdata.ri_struct;
 	if(dstri) {
-		CopyRenderInfoStructureA2U(ctx, dstri, &blitrectdata.dstri_struct);
+		if (!CopyRenderInfoStructureA2U(ctx, dstri, &blitrectdata.dstri_struct)) {
+			return 0;
+		}
 		blitrectdata.dstri = &blitrectdata.dstri_struct;
 	} else {
 		blitrectdata.dstri = nullptr;
@@ -4508,8 +4798,31 @@ static int BlitRect(TrapContext *ctx, uaecptr ri, uaecptr dstri,
 	blitrectdata.mask = mask;
 	blitrectdata.opcode = opcode;
 	blitrectdata.RGBFmt = RGBFmt;
+	blitrectdata.transparent = transparent;
+	blitrectdata.transparentcolor = transparentcolor;
 
 	return BlitRectHelper(ctx);
+}
+
+static uae_u32 REGPARAM2 picasso_BlitRectTransparent(TrapContext *ctx)
+{
+	uaecptr srcri = trap_get_areg(ctx, 1);
+	uaecptr dstri = trap_get_areg(ctx, 2);
+	uae_u32 srcx = (uae_u16)trap_get_dreg(ctx, 0);
+	uae_u32 srcy = (uae_u16)trap_get_dreg(ctx, 1);
+	uae_u32 dstx = (uae_u16)trap_get_dreg(ctx, 2);
+	uae_u32 dsty = (uae_u16)trap_get_dreg(ctx, 3);
+	uae_u32 width = (uae_u16)trap_get_dreg(ctx, 4);
+	uae_u32 height = (uae_u16)trap_get_dreg(ctx, 5);
+	uae_u32 color = trap_get_dreg(ctx, 6);
+	uae_u8  RGBFmt = (uae_u8)trap_get_dreg(ctx, 7);
+	uae_u32 result = 0;
+
+	if (NOBLITTER_BLIT)
+		return 0;
+	P96TRACE((_T("BlitRectTransparent(%d, %d, %d, %d, %d, %d, 0x%08x, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, color, RGBFmt));
+	result = BlitRect(ctx, srcri, dstri, srcx, srcy, dstx, dsty, width, height, 0xff, true, color, RGBFmt, BLIT_SRC);
+	return result;
 }
 
 /***********************************************************
@@ -4541,8 +4854,8 @@ static uae_u32 REGPARAM2 picasso_BlitRect (TrapContext *ctx)
 
 	if (NOBLITTER_BLIT)
 		return 0;
-	P96TRACE((_T("BlitRect(%d, %d, %d, %d, %d, %d, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, Mask));
-	result = BlitRect(ctx, renderinfo, 0, srcx, srcy, dstx, dsty, width, height, Mask, RGBFmt, BLIT_SRC);
+	P96TRACE((_T("BlitRect(%d, %d, %d, %d, %d, %d, 0x%02x, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, Mask, RGBFmt));
+	result = BlitRect(ctx, renderinfo, 0, srcx, srcy, dstx, dsty, width, height, Mask, false, 0, RGBFmt, BLIT_SRC);
 	return result;
 }
 
@@ -4584,7 +4897,7 @@ static uae_u32 REGPARAM2 picasso_BlitRectNoMaskComplete (TrapContext *ctx)
 	P96TRACE((_T("BlitRectNoMaskComplete() op 0x%02x, %08x:(%4d,%4d) --> %08x:(%4d,%4d), wh(%4d,%4d)\n"),
 		OpCode, trap_get_long(ctx, srcri + PSSO_RenderInfo_Memory), srcx, srcy,
 		trap_get_long(ctx, dstri + PSSO_RenderInfo_Memory), dstx, dsty, width, height));
-	result = BlitRect(ctx, srcri, dstri, srcx, srcy, dstx, dsty, width, height, 0xFF, RGBFmt, OpCode);
+	result = BlitRect(ctx, srcri, dstri, srcx, srcy, dstx, dsty, width, height, 0xFF, false, 0, RGBFmt, OpCode);
 	return result;
 }
 
@@ -4764,8 +5077,16 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 									break;
 								case 3:
 									{
-										auto *addr = reinterpret_cast<uae_u32*>(uae_mem2 + bits * 3);
-										*addr ^= rgbmask;
+										uae_u8 *addr = uae_mem2 + bits * 3;
+										if (cols + bits < W - 1) {
+											*reinterpret_cast<uae_u32*>(addr) ^= rgbmask;
+										} else {
+											// The fourth byte of a long is past
+											// the end of the row.
+											addr[0] ^= 0xff;
+											addr[1] ^= 0xff;
+											addr[2] ^= 0xff;
+										}
 									}
 									break;
 								case 4:
@@ -4865,20 +5186,31 @@ static uae_u32 REGPARAM2 picasso_BlitTemplate(TrapContext *ctx)
 		bgpen = tmp.BgPen;
 		endianswap (&bgpen, Bpp);
 
+		// One bit per pixel: each row uses the bytes from XOffset / 8 that
+		// cover XOffset % 8 + W bits.
+		if (!W || !H || tmp.BytesPerRow < 0) {
+			return 1;
+		}
+		const int tmpl_offset = tmp.XOffset / 8;
+		const int tmpl_rowbytes = (bitoffset + W + 7) / 8;
+		const int tmpl_size = tmpl_offset + (H - 1) * tmp.BytesPerRow + tmpl_rowbytes;
 		uae_u8 *tmpl_buffer = nullptr;
 		if (indirect) {
-			const int tmpl_offset = tmp.XOffset / 8;
-			const int tmpl_size = tmpl_offset + H * tmp.BytesPerRow;
 			tmpl_buffer = xcalloc(uae_u8, tmpl_size + 1);
 			trap_get_bytes(ctx, tmpl_buffer, tmp.AMemory, tmpl_size);
 			tmpl_base = tmpl_buffer + tmpl_offset;
 		} else {
-			tmpl_base = tmp.Memory + tmp.XOffset / 8;
+			if (!trap_valid_address(ctx, tmp.AMemory, tmpl_size)) {
+				write_log(_T("ERROR - Invalid Template memory region %08x (%d bytes)\n"), tmp.AMemory, tmpl_size);
+				return 0;
+			}
+			tmpl_base = tmp.Memory + tmpl_offset;
 		}
 
 		for (int rows = 0; rows < H; rows++, uae_mem += ri.BytesPerRow, tmpl_base += tmp.BytesPerRow) {
 			uae_u8 *uae_mem2 = uae_mem;
 			const uae_u8 *tmpl_mem = tmpl_base;
+			int tmpl_index = 0;
 			unsigned int data;
 
 			data = *tmpl_mem;
@@ -4890,7 +5222,11 @@ static uae_u32 REGPARAM2 picasso_BlitTemplate(TrapContext *ctx)
 				max = std::min(max, 8);
 
 				data <<= 8;
-				data |= *++tmpl_mem;
+				// The last byte of a row is not needed when the remaining
+				// bits fit in the previous one.
+				if (++tmpl_index < tmpl_rowbytes) {
+					data |= tmpl_mem[tmpl_index];
+				}
 
 				byte = data >> (8 - bitoffset);
 				byte ^= inversion;
@@ -4938,8 +5274,16 @@ static uae_u32 REGPARAM2 picasso_BlitTemplate(TrapContext *ctx)
 									break;
 								case 3:
 									{
-										const auto addr = reinterpret_cast<uae_u32*>(uae_mem2 + bits * 3);
-										*addr ^= rgbmask;
+										uae_u8 *addr = uae_mem2 + bits * 3;
+										if (cols + bits < W - 1) {
+											*reinterpret_cast<uae_u32*>(addr) ^= rgbmask;
+										} else {
+											// The fourth byte of a long is past
+											// the end of the row.
+											addr[0] ^= 0xff;
+											addr[1] ^= 0xff;
+											addr[2] ^= 0xff;
+										}
 									}
 									break;
 								case 4:
@@ -5236,7 +5580,7 @@ static uae_u32 getcim(uae_u8 v, int bpp, int *maxcp, uaecptr acim, uae_u32 *cim,
 		else if (vc < 15)
 			vc = 15;
 		else if (vc < 31)
-			vc = 32;
+			vc = 31;
 		else if (vc < 63)
 			vc = 63;
 		else
@@ -5276,7 +5620,7 @@ static uae_u32 REGPARAM2 picasso_BlitPlanar2Chunky (TrapContext *ctx)
 	const uae_u32 srcy = static_cast<uae_u16>(trap_get_dreg(ctx, 1));
 	const uae_u32 dstx = static_cast<uae_u16>(trap_get_dreg(ctx, 2));
 	const uae_u32 dsty = static_cast<uae_u16>(trap_get_dreg(ctx, 3));
-	const uae_u32 width = static_cast<uae_u16>(trap_get_dreg(ctx, 4));
+	uae_u32 width = static_cast<uae_u16>(trap_get_dreg(ctx, 4));
 	const uae_u32 height = static_cast<uae_u16>(trap_get_dreg(ctx, 5));
 	const uae_u8 minterm = static_cast<uae_u8>(trap_get_dreg(ctx, 6)) & 0xFF;
 	const uae_u8 mask = static_cast<uae_u8>(trap_get_dreg(ctx, 7)) & 0xFF;
@@ -5288,6 +5632,9 @@ static uae_u32 REGPARAM2 picasso_BlitPlanar2Chunky (TrapContext *ctx)
 		return 0;
 
 	if (CopyRenderInfoStructureA2U(ctx, ri, &local_ri) && CopyBitMapStructureA2U(ctx, bm, &local_bm)) {
+		if (!validatecoords(ctx, &local_ri, local_ri.RGBFormat, &dstx, &dsty, &width, &height)) {
+			return 1;
+		}
 		P96TRACE((_T("BlitPlanar2Chunky(%d, %d, %d, %d, %d, %d) Minterm 0x%x, Mask 0x%x, Depth %d\n"),
 			srcx, srcy, dstx, dsty, width, height, minterm, mask, local_bm.Depth));
 		P96TRACE((_T("P2C - BitMap has %d BPR, %d rows\n"), local_bm.BytesPerRow, local_bm.Rows));
@@ -5538,7 +5885,7 @@ static uae_u32 REGPARAM2 picasso_BlitPlanar2Direct(TrapContext *ctx)
 	const uae_u32 srcy = static_cast<uae_u16>(trap_get_dreg(ctx, 1));
 	const uae_u32 dstx = static_cast<uae_u16>(trap_get_dreg(ctx, 2));
 	const uae_u32 dsty = static_cast<uae_u16>(trap_get_dreg(ctx, 3));
-	const uae_u32 width = static_cast<uae_u16>(trap_get_dreg(ctx, 4));
+	uae_u32 width = static_cast<uae_u16>(trap_get_dreg(ctx, 4));
 	const uae_u32 height = static_cast<uae_u16>(trap_get_dreg(ctx, 5));
 	const auto minterm = static_cast<uae_u8>(trap_get_dreg(ctx, 6));
 	const auto Mask = static_cast<uae_u8>(trap_get_dreg(ctx, 7));
@@ -5550,6 +5897,9 @@ static uae_u32 REGPARAM2 picasso_BlitPlanar2Direct(TrapContext *ctx)
 		return 0;
 
 	if (CopyRenderInfoStructureA2U(ctx, ri, &local_ri) && CopyBitMapStructureA2U(ctx, bm, &local_bm)) {
+		if (!validatecoords(ctx, &local_ri, local_ri.RGBFormat, &dstx, &dsty, &width, &height)) {
+			return 1;
+		}
 		P96TRACE((_T("BlitPlanar2Direct(%d, %d, %d, %d, %d, %d) Minterm 0x%x, Mask 0x%x, Depth %d\n"),
 			srcx, srcy, dstx, dsty, width, height, minterm, Mask, local_bm.Depth));
 		PlanarToDirect(ctx, &local_ri, &local_bm, srcx, srcy, dstx, dsty, width, height, minterm, Mask, cim);
@@ -5598,7 +5948,9 @@ static void copyrow(int monid, uae_u8 *src, uae_u8 *dst, int x, int y, int width
 	int convert_mode = convert_modep[0];
 
 	if (y >= vidinfo->splitypos && vidinfo->splitypos >= 0) {
-		src = gfxmem_banks[monid]->start + natmem_offset;
+		// The split screen is a uaegfx feature and uaegfx is board 0,
+		// whichever monitor it is shown on.
+		src = gfxmem_banks[0]->start + natmem_offset;
 		if (state->dualclut) {
 			clut += 256;
 		}
@@ -5641,6 +5993,11 @@ static void copyrow(int monid, uae_u8 *src, uae_u8 *dst, int x, int y, int width
 		case RGBFB_A8R8G8B8_32:
 #else
 		case RGBFB_R8G8B8A8_32:
+			// Direct copy only when the host surface has the same byte order.
+			// libretro's XRGB8888 frame is B8G8R8A8, so convert it below.
+			if (vidinfo->host_mode != RGBFB_R8G8B8A8)
+				break;
+			[[fallthrough]];
 #endif
 		case RGBFB_R5G6B5PC_16:
 		memcpy(dst2 + dx * dstpix, src2 + x * srcpix, width * dstpix);
@@ -6143,26 +6500,79 @@ void fb_copyrow(int monid, uae_u8 *src, uae_u8 *dst, int x, int y, int width, in
 		vidinfo->picasso_convert, p96_rgbx16);
 }
 
-static void copyallinvert(int monid, uae_u8 *src, uae_u8 *dst, int pwidth, int pheight, int srcbytesperrow, int srcpixbytes, int dstbytesperrow, int dstpixbytes, const int *mode_convert)
+static uae_u32 vram_wrap(uae_s64 pos, uae_u32 vram_size)
+{
+	return (uae_u32)(((pos % vram_size) + vram_size) % vram_size);
+}
+
+// Copy part of display row y of a screen that starts at offset off in the
+// board memory. Like the address counter of an SVGA chip, the scanout
+// wraps from the end of the board memory to its start.
+static void copyrow_wrap(int monid, uae_u8 *vram, uae_u32 vram_size, int off, uae_u8 *dst, int x, int y, int width, int srcbytesperrow, int srcpixbytes, int dstbytesperrow, int dstpixbytes, const int *convert_modep, const uae_u32 *p96_rgbx16p)
 {
 	struct picasso_vidbuf_description *vidinfo = &picasso_vidinfo[monid];
 
-	const int w = pwidth * dstpixbytes;
-	uae_u8 *src2 = src;
-	for (int y = 0; y < pheight; y++) {
-		for (int x = 0; x < w; x++)
-			src2[x] ^= 0xff;
-		copyrow(monid, src, dst, 0, y, pwidth, srcbytesperrow, srcpixbytes, 0, y, dstbytesperrow, dstpixbytes, mode_convert, p96_rgbx16);
-		for (int x = 0; x < w; x++)
-			src2[x] ^= 0xff;
-		src2 += srcbytesperrow;
+	if (width <= 0) {
+		return;
+	}
+	if (vidinfo->splitypos >= 0 && y >= vidinfo->splitypos) {
+		// copyrow() reads the lower split screen from the start of the
+		// board memory itself.
+		copyrow(monid, vram, dst, x, y, width, srcbytesperrow, srcpixbytes, x, y, dstbytesperrow, dstpixbytes, convert_modep, p96_rgbx16p);
+		return;
+	}
+	uae_u32 start = vram_wrap((uae_s64)off + (uae_s64)y * srcbytesperrow + (uae_s64)x * srcpixbytes, vram_size);
+	uae_u32 len = width * srcpixbytes;
+	if (start + len <= vram_size) {
+		copyrow(monid, vram + start, dst, 0, 0, width, srcbytesperrow, srcpixbytes, x, y, dstbytesperrow, dstpixbytes, convert_modep, p96_rgbx16p);
+		return;
+	}
+	if (len > vram_size) {
+		return;
+	}
+	// The row crosses the end of the board memory. Copy the pixels before
+	// and after the end directly, and a pixel that the end splits through
+	// a small buffer.
+	uae_u32 first = vram_size - start;
+	int before = first / srcpixbytes;
+	uae_u32 split = first % srcpixbytes;
+	uae_u32 next = 0;
+	if (before > 0) {
+		copyrow(monid, vram + start, dst, 0, 0, before, srcbytesperrow, srcpixbytes, x, y, dstbytesperrow, dstpixbytes, convert_modep, p96_rgbx16p);
+	}
+	if (split) {
+		// Some conversions read a long per pixel.
+		uae_u8 pixel[8] = { 0 };
+		memcpy(pixel, vram + start + before * srcpixbytes, split);
+		memcpy(pixel + split, vram, srcpixbytes - split);
+		copyrow(monid, pixel, dst, 0, 0, 1, srcbytesperrow, srcpixbytes, x + before, y, dstbytesperrow, dstpixbytes, convert_modep, p96_rgbx16p);
+		before++;
+		next = srcpixbytes - split;
+	}
+	if (before < width) {
+		copyrow(monid, vram + next, dst, 0, 0, width - before, srcbytesperrow, srcpixbytes, x + before, y, dstbytesperrow, dstpixbytes, convert_modep, p96_rgbx16p);
 	}
 }
 
-static void copyall(int monid, uae_u8 *src, uae_u8 *dst, int pwidth, int pheight, int srcbytesperrow, int srcpixbytes, int dstbytesperrow, int dstpixbytes, const int *mode_convert)
+static void copyallinvert(int monid, uae_u8 *vram, uae_u32 vram_size, int off, uae_u8 *dst, int pwidth, int pheight, int srcbytesperrow, int srcpixbytes, int dstbytesperrow, int dstpixbytes, const int *mode_convert)
+{
+	const int w = pwidth * dstpixbytes;
+	for (int y = 0; y < pheight; y++) {
+		uae_u32 row = vram_wrap((uae_s64)off + (uae_s64)y * srcbytesperrow, vram_size);
+		for (int x = 0; x < w; x++) {
+			vram[(row + x) % vram_size] ^= 0xff;
+		}
+		copyrow_wrap(monid, vram, vram_size, off, dst, 0, y, pwidth, srcbytesperrow, srcpixbytes, dstbytesperrow, dstpixbytes, mode_convert, p96_rgbx16);
+		for (int x = 0; x < w; x++) {
+			vram[(row + x) % vram_size] ^= 0xff;
+		}
+	}
+}
+
+static void copyall(int monid, uae_u8 *vram, uae_u32 vram_size, int off, uae_u8 *dst, int pwidth, int pheight, int srcbytesperrow, int srcpixbytes, int dstbytesperrow, int dstpixbytes, const int *mode_convert)
 {
 	for (int y = 0; y < pheight; y++) {
-		copyrow(monid, src, dst, 0, y, pwidth, srcbytesperrow, srcpixbytes, 0, y, dstbytesperrow, dstpixbytes, mode_convert, p96_rgbx16);
+		copyrow_wrap(monid, vram, vram_size, off, dst, 0, y, pwidth, srcbytesperrow, srcpixbytes, dstbytesperrow, dstpixbytes, mode_convert, p96_rgbx16);
 	}
 }
 
@@ -6170,8 +6580,9 @@ uae_u8 *uaegfx_getrtgbuffer(const int monid, int *widthp, int *heightp, int *pit
 {
 	const struct picasso_vidbuf_description *vidinfo = &picasso_vidinfo[monid];
 	const struct picasso96_state_struct *state = &picasso96_state[monid];
-	uae_u8 *src = gfxmem_banks[monid]->start + natmem_offset;
-	const int off = state->XYOffset - gfxmem_banks[monid]->start;
+	// uaegfx is board 0, whichever monitor it is shown on.
+	uae_u8 *src = gfxmem_banks[0]->start + natmem_offset;
+	const int off = state->XYOffset - gfxmem_banks[0]->start;
 	int width, height, pixbytes;
 	uae_u8 *dst;
 	int convert[2];
@@ -6192,7 +6603,7 @@ uae_u8 *uaegfx_getrtgbuffer(const int monid, int *widthp, int *heightp, int *pit
 	convert[1] = convert[0];
 	alloc_colors_picasso(8, 8, 8, 0, 8, 16, state->RGBFormat, p96_rgbx16);
 
-	copyall (monid, src + off, dst, width, height, state->BytesPerRow, state->BytesPerPixel, width * pixbytes, pixbytes, convert);
+	copyall(monid, src, gfxmem_banks[0]->allocated_size, off, dst, width, height, state->BytesPerRow, state->BytesPerPixel, width * pixbytes, pixbytes, convert);
 	if (pixbytes == 1) {
 		for (int i = 0; i < 256; i++) {
 			palette[i * 3 + 0] = state->CLUT[i].Red;
@@ -6220,6 +6631,133 @@ void picasso_invalidate(int monid, int x, int y, int w, int h)
 	DX_Invalidate(&AMonitors[monid], x, y, w, h);
 }
 
+// Copy the display rows that a changed page of the board memory covers.
+// realoffset is the offset of the page from the first of those rows, and
+// y0 is the display row they start at. With copy false only the affected
+// row range is tracked, for the zero-copy path whose surface is the board
+// memory itself.
+static void flushrows(int monid, int index, uae_u8 *src, uae_u32 vram_size, int off, uae_u8 *dst, int realoffset, int y0, int pwidth, int pheight, int *miny, int *maxy, int *flushlines, bool copy)
+{
+	struct picasso96_state_struct *state = &picasso96_state[monid];
+	struct picasso_vidbuf_description *vidinfo = &picasso_vidinfo[monid];
+	int y = realoffset / state->BytesPerRow + y0;
+
+	if (y >= pheight) {
+		return;
+	}
+	int x = (realoffset % state->BytesPerRow) / state->BytesPerPixel;
+	if (x < pwidth) {
+		if (copy) {
+			copyrow_wrap(monid, src, vram_size, off, dst, x, y, pwidth - x,
+				state->BytesPerRow, state->BytesPerPixel,
+				vidinfo->rowbytes, vidinfo->pixbytes,
+				vidinfo->picasso_convert, p96_rgbx16);
+		}
+		(*flushlines)++;
+	}
+	int w = (gwwpagesize[index] - (state->BytesPerRow - x * state->BytesPerPixel) + state->BytesPerPixel - 1) / state->BytesPerPixel;
+	if (y < *miny) {
+		*miny = y;
+	}
+	y++;
+	while (y < pheight && w > 0) {
+		int maxw = w > pwidth ? pwidth : w;
+		if (copy) {
+			copyrow_wrap(monid, src, vram_size, off, dst, 0, y, maxw,
+				state->BytesPerRow, state->BytesPerPixel,
+				vidinfo->rowbytes, vidinfo->pixbytes,
+				vidinfo->picasso_convert, p96_rgbx16);
+		}
+		w -= maxw;
+		y++;
+		(*flushlines)++;
+	}
+	if (y > *maxy) {
+		*maxy = y;
+	}
+}
+
+#if !defined(_WIN32) || defined(AMIBERRY)
+// The emulated write-watch only sees VRAM writes that go through the gfxmem
+// put handlers (bank S_WRITE flag, host blits, picasso_mark_host_write). The
+// JIT picks a direct natmem store or a handler call per instruction from one
+// traced execution of the block, so a store traced while writing RAM stays a
+// direct store when the same code later writes VRAM. rtg.library's generic
+// rect copy does this when the software pointer restores its background
+// (#2318): the restore never reaches mark_dirty, so old pointer images stay on
+// the host surface. While direct JIT stores are possible, each drain compares
+// the visible pages against a shadow of what was last handed to the copy loop
+// and queues any changed page the dirty map missed.
+struct vram_shadow {
+	std::vector<uae_u8> data;
+	const uae_u8 *start = nullptr;
+};
+static vram_shadow vram_shadows[MAX_RTG_BOARDS][2];
+
+static bool jit_direct_vram_stores_possible()
+{
+#ifdef JIT
+	return currprefs.cachesize > 0 && canbang
+		&& (!currprefs.comptrustbyte || !currprefs.comptrustword
+			|| !currprefs.comptrustlong || !currprefs.comptrustnaddr);
+#else
+	return false;
+#endif
+}
+
+static void release_vram_shadows(int index)
+{
+	for (auto &shadow : vram_shadows[index]) {
+		std::vector<uae_u8>().swap(shadow.data);
+		shadow.start = nullptr;
+	}
+}
+
+// Appends pages of [start, end) that changed since the last call but are not
+// among the first 'drained' (address-ordered) entries of gwwbuf[index].
+// Returns the new entry count. The shadow is refreshed before the copy loop
+// reads VRAM, so it never holds data newer than the host surface: a write
+// racing with the copy shows up as a difference on the next drain.
+static int queue_unmarked_vram_pages(int index, int region, uae_u8 *start, uae_u8 *end, int drained, int count)
+{
+	vram_shadow &shadow = vram_shadows[index][region];
+	const size_t size = static_cast<size_t>(end - start);
+	const int page_size = gwwpagesize[index];
+	const bool resync = shadow.start != start || shadow.data.size() != size;
+	if (resync) {
+		shadow.data.resize(size);
+		shadow.start = start;
+	}
+	bool complete = true;
+	int next = 0;
+	for (size_t offset = 0; offset < size; offset += page_size) {
+		uae_u8 *page = start + offset;
+		uae_u8 *copy = shadow.data.data() + offset;
+		if (!resync && memcmp(page, copy, page_size) == 0) {
+			continue;
+		}
+		while (next < drained && static_cast<uae_u8*>(gwwbuf[index][next]) < page) {
+			next++;
+		}
+		const bool marked = next < drained && gwwbuf[index][next] == page;
+		if (!marked) {
+			if (count >= gwwbufsize[index]) {
+				// No room: keep the stale copy so the page is retried.
+				complete = false;
+				continue;
+			}
+			gwwbuf[index][count++] = page;
+		}
+		memcpy(copy, page, page_size);
+	}
+	if (resync && !complete) {
+		// Pages skipped during a resync hold no valid copy to compare against.
+		shadow.start = nullptr;
+	}
+	return count;
+}
+#endif
+
 static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 {
 	int monid = currprefs.rtgboards[index].monitor_id;
@@ -6234,17 +6772,40 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 	int pwidth = state->Width > state->VirtualWidth ? state->VirtualWidth : state->Width;
 	int pheight = state->Height > state->VirtualHeight ? state->VirtualHeight : state->Height;
 	int maxy = -1;
-	int miny = pheight - 1;
 	int flushlines = 0, matchcount = 0;
+	int partial_gwwcnt = -1; // dirty pages drained once, reused for both split regions
 	struct picasso_vidbuf_description *vidinfo = &picasso_vidinfo[monid];
 	bool overlay_updated = false;
 
+	// SetPanning can place the screen anywhere in the board memory. Like
+	// on SVGA chips, rows past its end wrap around to its start.
+	uae_u32 vram_size = gfxmem_banks[index]->allocated_size;
+	if (off < 0 || (uae_u32)off >= vram_size || state->BytesPerRow <= 0) {
+		return;
+	}
+	if (pheight > (int)(vram_size / state->BytesPerRow)) {
+		pheight = vram_size / state->BytesPerRow;
+	}
+	int miny = pheight - 1;
+	int upper = vidinfo->splitypos >= 0 && vidinfo->splitypos < pheight ? vidinfo->splitypos : pheight;
+	uae_u32 upper_end = off + state->BytesPerRow * upper;
+	uae_u32 wrap_end = 0;
+	if (upper_end > vram_size) {
+		wrap_end = upper_end - vram_size;
+		upper_end = vram_size;
+	}
+	uae_u32 lower_end = vidinfo->splitypos >= 0 ? state->BytesPerRow * (pheight - upper) : 0;
+	if (lower_end < wrap_end) {
+		lower_end = wrap_end;
+	}
+
 	src_start[0] = src + (off & ~gwwpagemask[index]);
-	src_end[0] = src + ((off + state->BytesPerRow * pheight + gwwpagesize[index] - 1) & ~gwwpagemask[index]);
-	if (vidinfo->splitypos >= 0) {
-		src_end[0] = src + ((off + state->BytesPerRow * vidinfo->splitypos + gwwpagesize[index] - 1) & ~gwwpagemask[index]);
+	src_end[0] = src + ((upper_end + gwwpagesize[index] - 1) & ~gwwpagemask[index]);
+	if (vidinfo->splitypos >= 0 || wrap_end) {
+		// The lower split screen and the wrapped rows both start at the
+		// beginning of the board memory.
 		src_start[1] = src;
-		src_end[1] = src + ((state->BytesPerRow * (pheight - vidinfo->splitypos) + gwwpagesize[index] - 1) & ~gwwpagemask[index]);
+		src_end[1] = src + ((lower_end + gwwpagesize[index] - 1) & ~gwwpagemask[index]);
 	} else {
 		src_start[1] = src_end[1] = nullptr;
 	}
@@ -6287,23 +6848,76 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 			if (vidinfo->full_refresh < 0 || overlay_updated) {
 				gwwcnt = regionsize / gwwpagesize[index] + 1;
 				vidinfo->full_refresh = 1;
+				// Synthesize the page list (WinUAE parity; this fill was lost
+				// in a refactor): the copy loop below consumes gwwbuf entries,
+				// so leaving stale pointers from the last drain here would
+				// filter most or all of them out and the forced full copy
+				// would not happen.
+				for (int i = 0; i < gwwcnt; i++) {
+					gwwbuf[index][i] = src_start[split] + i * gwwpagesize[index];
+				}
+				matchcount += (int)gwwcnt;
+
+				if (gwwcnt == 0) {
+					continue;
+				}
+				dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 			} else {
 #if defined(_WIN32) && !defined(AMIBERRY)
 				ULONG ps;
 				gwwcnt = gwwbufsize[index];
 				if (mman_GetWriteWatch(src_start[split], regionsize, gwwbuf[index], &gwwcnt, &ps))
 					continue;
+				matchcount += (int)gwwcnt;
+
+				if (gwwcnt == 0) {
+					continue;
+				}
+				dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 #else
-				gwwcnt = picasso_getwritewatch(index, off, (uae_u8***)&gwwbuf[index], &src_start[split]);
+				// The emulated write-watch drains the whole dirty map, so it
+				// must only be drained on the first region; the second
+				// (split) region reuses the same page list. Draining per
+				// region would clear pages that belong to the other region
+				// and leave it stale.
+				if (split == 0) {
+					partial_gwwcnt = picasso_getwritewatch(index, off, (uae_u8***)&gwwbuf[index], &src_start[split]);
+					if (partial_gwwcnt >= 0 && jit_direct_vram_stores_possible()) {
+						const int drained = partial_gwwcnt;
+						for (int region = 0; region < 2 && src_start[region]; region++) {
+							partial_gwwcnt = queue_unmarked_vram_pages(index, region, src_start[region], src_end[region], drained, partial_gwwcnt);
+						}
+					} else {
+						release_vram_shadows(index);
+					}
+				}
+				gwwcnt = partial_gwwcnt;
+
+				// The reused page list spans both split regions (and may
+				// contain pages outside the visible screen, e.g. offscreen
+				// bitmaps), so filter it down to this region when deciding
+				// between a full copy and partial rows. The copy loop below
+				// must keep iterating the FULL list: it range-checks each
+				// entry itself, and truncating the count here would hide
+				// matching pages that sit behind foreign (lower-split or
+				// offscreen) pages in the page-ordered list after their
+				// dirty bits have already been cleared.
+				int region_gwwcnt = 0;
+				for (int i = 0; i < gwwcnt; i++) {
+					const uae_u8* p = static_cast<uae_u8*>(gwwbuf[index][i]);
+					if (p >= src_start[split] && p < src_end[split]) {
+						region_gwwcnt++;
+					}
+				}
+				matchcount += region_gwwcnt;
+
+				if (region_gwwcnt == 0) {
+					continue;
+				}
+				dofull = region_gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 #endif
 			}
 
-			matchcount += (int)gwwcnt;
-
-			if (gwwcnt == 0) {
-				continue;
-			}
-			dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 
 			if (!dstp) {
 				dstp = gfx_lock_picasso(monid, dofull);
@@ -6356,12 +6970,12 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 			if (dofull) {
 				if (!zero_copy) {
 					if (flashscreen != 0) {
-						copyallinvert(monid, src + off, dst, pwidth, pheight,
+						copyallinvert(monid, src, vram_size, off, dst, pwidth, pheight,
 							state->BytesPerRow, state->BytesPerPixel,
 							vidinfo->rowbytes, vidinfo->pixbytes,
 							vidinfo->picasso_convert);
 					} else {
-						copyall(monid, src + off, dst, pwidth, pheight,
+						copyall(monid, src, vram_size, off, dst, pwidth, pheight,
 							state->BytesPerRow, state->BytesPerPixel,
 							vidinfo->rowbytes, vidinfo->pixbytes,
 							vidinfo->picasso_convert);
@@ -6373,59 +6987,25 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 				break;
 			}
 
-			if (split) {
-				off = 0;
-			}
-
 			for (int i = 0; i < gwwcnt; i++) {
 				uae_u8 *p = (uae_u8 *)gwwbuf[index][i];
 
-				if (p >= src_start[split] && p < src_end[split]) {
-					int y, x, realoffset;
-
-					if (p >= src + off) {
-						realoffset = (int)(p - (src + off));
-					} else {
-						realoffset = 0;
-					}
-
-					y = realoffset / state->BytesPerRow;
-					if (split) {
-						y += vidinfo->splitypos;
-					}
-					if (y < pheight) {
-						int w = (gwwpagesize[index] + state->BytesPerPixel - 1) / state->BytesPerPixel;
-						x = (realoffset % state->BytesPerRow) / state->BytesPerPixel;
-						if (x < pwidth) {
-							if (!zero_copy) {
-								copyrow(monid, src + off, dst, x, y, pwidth - x,
-									state->BytesPerRow, state->BytesPerPixel,
-									x, y, vidinfo->rowbytes, vidinfo->pixbytes,
-									vidinfo->picasso_convert, p96_rgbx16);
-							}
-							flushlines++;
-						}
-						w = (gwwpagesize[index] - (state->BytesPerRow - x * state->BytesPerPixel) + state->BytesPerPixel - 1) / state->BytesPerPixel;
-						if (y < miny) {
-							miny = y;
-						}
-						y++;
-						while (y < pheight && w > 0) {
-							int maxw = w > pwidth ? pwidth : w;
-							if (!zero_copy) {
-								copyrow(monid, src + off, dst, 0, y, maxw,
-									state->BytesPerRow, state->BytesPerPixel,
-									0, y, vidinfo->rowbytes, vidinfo->pixbytes,
-									vidinfo->picasso_convert, p96_rgbx16);
-							}
-							w -= maxw;
-							y++;
-							flushlines++;
-						}
-						if (y > maxy) {
-							maxy = y;
-						}
-					}
+				if (p < src_start[split] || p >= src_end[split]) {
+					continue;
+				}
+				int poff = (int)(p - src);
+				if (!split) {
+					flushrows(monid, index, src, vram_size, off, dst, poff > off ? poff - off : 0, 0,
+						pwidth, pheight, &miny, &maxy, &flushlines, !zero_copy);
+					continue;
+				}
+				if (vidinfo->splitypos >= 0) {
+					flushrows(monid, index, src, vram_size, off, dst, poff, vidinfo->splitypos,
+						pwidth, pheight, &miny, &maxy, &flushlines, !zero_copy);
+				}
+				if ((uae_u32)poff < wrap_end) {
+					flushrows(monid, index, src, vram_size, off, dst, (int)(poff + vram_size - off), 0,
+						pwidth, pheight, &miny, &maxy, &flushlines, !zero_copy);
 				}
 			}
 		}
@@ -6546,14 +7126,15 @@ MEMORY_XLATE(name);
 #define GFXMEM_MEMORY_FUNCTIONS(name, index) MEMORY_FUNCTIONS(name)
 #endif
 
-// On Amiberry, force JIT to route writes through the bank's *_put handlers
-// (by flagging the bank as special for writes via S_WRITE) so mark_dirty()
-// runs on every CPU poke to VRAM. WinUAE relies on GetWriteWatch() for this
-// instead, so leave its jit_write_flag at 0. Without S_WRITE, JIT blocks that
-// write directly to natmem (e.g. IconLib's WritePixelArrayAlpha loop during
-// an alpha drag) never mark the touched pages dirty and flushpixels uploads
-// nothing — the icon stays invisible until a boardinfo op (BltBitMap etc.)
-// re-marks the region.
+// On Amiberry, flag the bank as special for writes (S_WRITE) so JIT stores
+// traced against VRAM go through the bank's *_put handlers and mark_dirty().
+// WinUAE relies on GetWriteWatch() for this instead, so leave its
+// jit_write_flag at 0. Without S_WRITE, JIT blocks that write directly to
+// natmem (e.g. IconLib's WritePixelArrayAlpha loop during an alpha drag) never
+// mark the touched pages dirty and flushpixels uploads nothing — the icon stays
+// invisible until a boardinfo op (BltBitMap etc.) re-marks the region. The flag
+// only covers stores whose trace hit VRAM; queue_unmarked_vram_pages() catches
+// the rest.
 #if !defined(_WIN32) || defined(AMIBERRY)
 #define GFXMEM_JIT_WRITE_FLAG S_WRITE
 #else
@@ -6615,6 +7196,21 @@ uae_u8* p96_get_render_buffer_pointer(int monid)
 		return nullptr;
 	struct picasso96_state_struct *state = &picasso96_state[monid];
 	return state->XYOffset + natmem_offset;
+}
+
+// True if the RTG screen starting at XYOffset lies entirely inside the
+// uaegfx board memory. A zero-copy surface is that memory itself: it can
+// neither wrap the rows that SetPanning pushed past the end of the board
+// memory nor compose the lower half of a split screen, so only a screen
+// that fits and is unsplit may be bound zero-copy.
+bool p96_screen_fits_board_memory(int monid)
+{
+	if (monid < 0 || monid >= MAX_RTG_BOARDS || gfxmem_banks[0] == nullptr)
+		return false;
+	const struct picasso96_state_struct *state = &picasso96_state[monid];
+	const uae_u64 off = (uae_u64)(state->XYOffset - gfxmem_banks[0]->start);
+	return off < gfxmem_banks[0]->allocated_size && state->BytesPerRow > 0
+		&& off + (uae_u64)state->BytesPerRow * state->Height <= gfxmem_banks[0]->allocated_size;
 }
 
 /* Call this function first, near the beginning of code flow
@@ -6731,10 +7327,12 @@ static uae_u32 REGPARAM2 picasso_SetMemoryMode(TrapContext *ctx)
 #if USE_OVERLAY
 
 #define OVERLAY_COOKIE 0x12345678
+// Limit for a whole tag list walk, so a TAG_MORE loop cannot hang the emulator.
+#define OVERLAY_MAX_TAGS 4096
 
-static uaecptr gettag(TrapContext *ctx, uaecptr p, uae_u32 *tagp, uae_u32 *valp)
+static uaecptr gettag(TrapContext *ctx, uaecptr p, uae_u32 *tagp, uae_u32 *valp, int *budget)
 {
-	for (;;) {
+	while (p && (*budget)-- > 0) {
 		uae_u32 tag = trap_get_long(ctx, p);
 		uae_u32 val = trap_get_long(ctx, p + 4);
 #if OVERLAY_DEBUG > 2
@@ -6758,6 +7356,7 @@ static uaecptr gettag(TrapContext *ctx, uaecptr p, uae_u32 *tagp, uae_u32 *valp)
 		*valp = val;
 		return p + 8;
 	}
+	return 0;
 }
 static void settag(TrapContext *ctx, uaecptr p, uae_u32 v)
 {
@@ -6828,22 +7427,23 @@ static void overlaygettag(TrapContext *ctx, uae_u32 tag, uae_u32 val)
 		break;
 	case FA_Colors32:
 		{
+			// LoadRGB32() table: count/first header, count RGB triplets,
+			// repeated until a header with a zero count.
 			while(val) {
-				uae_u8 tmpbuf[256 * 3 * 4 + 4];
+				uae_u8 tmpbuf[256 * 3 * 4];
 				const uae_u32 v = trap_get_long(ctx, val);
 				val += 4;
 				const uae_u16 num = v >> 16;
-				if (num > 256)
+				if (num == 0 || num > 256) {
 					break;
+				}
 				const uae_u16 first = v & 0xffff;
-				trap_get_bytes(ctx, tmpbuf, val, num * 3 * 4 + 4);
+				trap_get_bytes(ctx, tmpbuf, val, num * 3 * 4);
 				for (int i = 0; i < num && (first + i) < 256; i++) {
 					overlay_clutc[first + i].Red = tmpbuf[i * 3 * 4 + 0];
 					overlay_clutc[first + i].Green = tmpbuf[i * 3 * 4 + 4];
 					overlay_clutc[first + i].Blue = tmpbuf[i * 3 * 4 + 8];
 				}
-				if (!tmpbuf[num])
-					break;
 				val += num * 3 * 4;
 			}
 			if (picasso_palette(overlay_clutc, overlay_clut))
@@ -6952,15 +7552,29 @@ static uae_u32 REGPARAM2 picasso_SetFeatureAttrs(TrapContext *ctx)
 #if OVERLAY_DEBUG > 1
 	write_log(_T("picasso_SetFeatureAttrs %08x %d\n"), tagp, type);
 #endif
+	const uae_u32 old_format = overlay_format;
+	const int old_src_width_in = overlay_src_width_in;
+	const int old_src_height_in = overlay_src_height_in;
+	int budget = OVERLAY_MAX_TAGS;
 	for (;;) {
 		uae_u32 tag, val;
-		tagp = gettag(ctx, tagp, &tag, &val);
+		tagp = gettag(ctx, tagp, &tag, &val, &budget);
 		if (!tagp)
 			break;
 #if OVERLAY_DEBUG > 1
 		write_log(_T("picasso_SetFeatureAttrs %08x tag %08x (%d) %08x\n"), tagp - 8, tag, tag & 0x7fffffff, val);
 #endif
 		overlaygettag(ctx, tag, val);
+	}
+	// The overlay bitmap was allocated for one format and size. Scanout
+	// reads FA_SourceWidth/Height pixels from it, so a different format
+	// or a larger source would read outside the bitmap.
+	if (overlay_bitmap && (overlay_format != old_format ||
+		overlay_src_width_in < 1 || overlay_src_width_in > overlay_src_width ||
+		overlay_src_height_in < 1 || overlay_src_height_in > overlay_src_height)) {
+		overlay_format = old_format;
+		overlay_src_width_in = old_src_width_in;
+		overlay_src_height_in = old_src_height_in;
 	}
 #if OVERLAY_DEBUG > 1
 	write_log(_T("RTG Overlay: X=%d Y=%d W=%d H=%d Act=%d SrcW=%d SrcH=%d BPP=%d VRAM=%08x\n"),
@@ -6982,9 +7596,10 @@ static uae_u32 REGPARAM2 picasso_GetFeatureAttrs(TrapContext *ctx)
 #if OVERLAY_DEBUG > 1
 	write_log(_T("picasso_GetFeatureAttrs %08x %d\n"), tagp, type);
 #endif
+	int budget = OVERLAY_MAX_TAGS;
 	for (;;) {
 		uae_u32 tag, val;
-		tagp = gettag(ctx, tagp, &tag, &val);
+		tagp = gettag(ctx, tagp, &tag, &val, &budget);
 		if (!tagp)
 			break;
 		overlaysettag(ctx, tag, val);
@@ -7036,9 +7651,10 @@ static uae_u32 REGPARAM2 picasso_CreateFeature(TrapContext *ctx)
 	overlay_src_width_in = -1;
 	overlay_src_height_in = -1;
 	overlay_format = 0;
+	int budget = OVERLAY_MAX_TAGS;
 	for (;;) {
 		uae_u32 tag, val;
-		tagp = gettag(ctx, tagp, &tag, &val);
+		tagp = gettag(ctx, tagp, &tag, &val, &budget);
 		if (!tagp)
 			break;
 #if OVERLAY_DEBUG
@@ -7093,9 +7709,33 @@ static uae_u32 REGPARAM2 picasso_CreateFeature(TrapContext *ctx)
 		return 0;
 	}
 	// probably should use GetBitMapAttr() but function is not documented enough.
-	overlay_src_width = trap_get_word(ctx, overlay_bitmap + 0) / overlay_pix;
-	overlay_src_height = trap_get_word(ctx, overlay_bitmap + 2);
-	overlay_vram = trap_get_long(ctx, overlay_bitmap + 8);
+	int src_width = 0, src_height = 0;
+	uaecptr vram = 0;
+	if (trap_valid_address(ctx, overlay_bitmap, 12)) {
+		src_width = trap_get_word(ctx, overlay_bitmap + 0) / overlay_pix;
+		src_height = trap_get_word(ctx, overlay_bitmap + 2);
+		vram = trap_get_long(ctx, overlay_bitmap + 8);
+	}
+	// Scanout reads the bitmap directly from VRAM, so it must be there and
+	// hold the requested source size.
+	const addrbank *ovl_bank = gfxmem_banks[0];
+	if (src_width < overlay_src_width_in || src_height < overlay_src_height_in ||
+		vram < ovl_bank->start || vram >= ovl_bank->start + ovl_bank->allocated_size ||
+		(uae_u64)(vram - ovl_bank->start) + (uae_u64)src_width * overlay_pix * src_height > ovl_bank->allocated_size) {
+#if OVERLAY_DEBUG
+		write_log(_T("picasso_CreateFeature overlay bitmap %08x unusable (vram %08x %dx%d)\n"), overlay_bitmap, vram, src_width, src_height);
+#endif
+		const uaecptr freefunc = trap_get_long(ctx, bi + PSSO_BoardInfo_FreeBitMap);
+		trap_call_add_areg(ctx, 0, bi);
+		trap_call_add_areg(ctx, 1, overlay_bitmap);
+		trap_call_add_areg(ctx, 2, 0);
+		trap_call_func(ctx, freefunc);
+		overlay_bitmap = 0;
+		return 0;
+	}
+	overlay_src_width = src_width;
+	overlay_src_height = src_height;
+	overlay_vram = vram;
 	overlay_vram_offset = static_cast<int>(overlay_vram - gfxmem_banks[0]->start);
 	overlay_convert = getconvert(static_cast<int>(overlay_format), picasso_vidinfo[0].pixbytes);
 	if (!p96_rgbx16_ovl)
@@ -7136,6 +7776,8 @@ static uae_u32 REGPARAM2 picasso_DeleteFeature(TrapContext *ctx)
 	overlay_bitmap = 0;
 	overlay_vram = 0;
 	overlay_active = 0;
+	// Redraw the screen without the overlay.
+	picasso_vidinfo[0].full_refresh = 1;
 	return 1;
 }
 
@@ -7278,6 +7920,7 @@ static void inituaegfxfuncs(TrapContext *ctx, uaecptr start, uaecptr ABI)
 	RTGCALL(PSSO_BoardInfo_BlitTemplate, PSSO_BoardInfo_BlitTemplateDefault, picasso_BlitTemplate);
 	RTGCALL(PSSO_BoardInfo_InvertRect, PSSO_BoardInfo_InvertRectDefault, picasso_InvertRect);
 	RTGCALL(PSSO_BoardInfo_BlitRectNoMaskComplete, PSSO_BoardInfo_BlitRectNoMaskCompleteDefault, picasso_BlitRectNoMaskComplete);
+	RTGCALL(PSSO_BoardInfo_BlitRectTransparent, PSSO_BoardInfo_BlitRectTransparentDefault, picasso_BlitRectTransparent);
 	RTGCALL(PSSO_BoardInfo_BlitPattern, PSSO_BoardInfo_BlitPatternDefault, picasso_BlitPattern);
 
 	RTGCALL2(PSSO_BoardInfo_SetSwitch, picasso_SetSwitch);
@@ -7422,7 +8065,7 @@ void uaegfx_install_code (uaecptr start)
 }
 
 #define UAEGFX_VERSION 3
-#define UAEGFX_REVISION 4
+#define UAEGFX_REVISION 5
 
 static uae_u32 REGPARAM2 gfx_open(TrapContext *ctx)
 {
@@ -7545,7 +8188,7 @@ uae_u32 picasso_demux (uae_u32 arg, TrapContext *ctx)
 	const uae_u32 num = trap_get_long(ctx, trap_get_areg(ctx, 7) + 4);
 
 	if (uaegfx_base) {
-		if (num >= 16 && num <= 39) {
+		if (num >= 16 && num <= 40) {
 			write_log (_T("uaelib: obsolete Picasso96 uaelib hook called, call ignored\n"));
 			return 0;
 		}
@@ -7579,7 +8222,8 @@ uae_u32 picasso_demux (uae_u32 arg, TrapContext *ctx)
 	 case 36: return picasso_SetSprite (ctx);
 	 case 37: return picasso_SetSpritePosition (ctx);
 	 case 38: return picasso_SetSpriteImage (ctx);
-	 case 39: return picasso_SetSpriteColor (ctx);
+	 case 39: return picasso_SetSpriteColor(ctx);
+	 case 40: return picasso_BlitRectTransparent(ctx);
 	default: return 0;
 	}
 
@@ -7614,6 +8258,9 @@ void restore_p96_finish ()
 		if (cursorvisible) {
 			setspriteimage(nullptr, boardinfo);
 		}
+		struct picasso_vidbuf_description *svidinfo = &picasso_vidinfo[currprefs.rtgboards[0].monitor_id];
+		svidinfo->splitypos = picasso_get_splitypos(currprefs.rtgboards[0].monitor_id);
+		svidinfo->full_refresh = 1;
 
 		set_config_changed();
 	}

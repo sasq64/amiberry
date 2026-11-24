@@ -5,6 +5,7 @@
   *
   */ 
 
+#include <vector>
 #include "sysconfig.h"
 #include "sysdeps.h"
 
@@ -1565,7 +1566,7 @@ struct romdata *getromdatabyname (const TCHAR *name)
 	int i = 0;
 	while (roms[i].name) {
 		if (!roms[i].group) {
-			getromname (&roms[i], tmp);
+			getromname (&roms[i], tmp, sizeof tmp / sizeof *tmp);
 			if (!_tcscmp (tmp, name) || !_tcscmp (roms[i].name, name))
 				return &roms[i];
 		}
@@ -1837,20 +1838,23 @@ struct romdata *getromdatabyzfile (struct zfile *f)
 	return rd;
 }
 
-void getromname	(const struct romdata *rd, TCHAR *name)
+void getromname (const struct romdata *rd, TCHAR *name, int namesize)
 {
+	if (namesize <= 0)
+		return;
 	name[0] = 0;
 	if (!rd)
 		return;
 	while (rd->group)
 		rd--;
-	_tcscat (name, rd->name);
+	_tcsncpy(name, rd->name, namesize - 1);
+	name[namesize - 1] = 0;
 	if ((rd->subrev || rd->subver) && rd->subver != rd->ver)
-		_sntprintf (name + _tcslen (name), sizeof name + _tcslen (name), _T(" rev %d.%d"), rd->subver, rd->subrev);
+		_sntprintf(name + _tcslen(name), namesize - _tcslen(name), _T(" rev %d.%d"), rd->subver, rd->subrev);
 	if (rd->size > 0)
-		_sntprintf (name + _tcslen (name), sizeof name + _tcslen (name), _T(" (%dk)"), (rd->size + 1023) / 1024);
+		_sntprintf(name + _tcslen(name), namesize - _tcslen(name), _T(" (%dk)"), (rd->size + 1023) / 1024);
 	if (rd->partnumber && rd->partnumber[0] != '\0')
-		_sntprintf (name + _tcslen (name), sizeof name + _tcslen (name), _T(" [%s]"), rd->partnumber);
+		_sntprintf(name + _tcslen(name), namesize - _tcslen(name), _T(" [%s]"), rd->partnumber);
 }
 
 struct romlist *getromlistbyromdata (const struct romdata *rd)
@@ -1977,7 +1981,7 @@ void romwarning(int romtype)
 	while (roms[i].name) {
 		struct romdata *rd = &roms[i];
 		if (rd->type == romtype) {
-			getromname (rd, tmp1);
+			getromname (rd, tmp1, sizeof tmp1 / sizeof *tmp1);
 			_tcscat (tmp2, _T("- "));
 			_tcscat (tmp2, tmp1);
 			_tcscat (tmp2, _T("\n"));
@@ -2004,7 +2008,7 @@ void romwarning (const int *ids)
 	while (ids[i] >= 0) {
 		struct romdata *rd = getromdatabyid (ids[i]);
 		if (!(rd->type & ROMTYPE_NONE)) {
-			getromname (rd, tmp1);
+			getromname (rd, tmp1, sizeof tmp1 / sizeof *tmp1);
 			_tcscat (tmp2, _T("- "));
 			_tcscat (tmp2, tmp1);
 			_tcscat (tmp2, _T("\n"));
@@ -2523,6 +2527,8 @@ static void clean_path(TCHAR *s)
 	}
 }
 
+configure_rom_probe *configure_rom_probing;
+
 int configure_rom (struct uae_prefs *p, const int *rom, int msg)
 {
 	struct romdata *rd;
@@ -2531,6 +2537,14 @@ int configure_rom (struct uae_prefs *p, const int *rom, int msg)
 
 	if (rom[0] < 0)
 		return 1;
+	if (configure_rom_probing) {
+		std::vector<int> ids;
+		for (i = 0; rom[i] >= 0; i++)
+			ids.push_back (rom[i]);
+		configure_rom_probing->lists.push_back (ids);
+		const size_t call = configure_rom_probing->calls++;
+		return call < configure_rom_probing->answers.size () && configure_rom_probing->answers[call] ? 1 : 0;
+	}
 	i = 0;
 	while (rom[i] >= 0) {
 		rd = getromdatabyid (rom[i]);
@@ -3233,7 +3247,7 @@ struct romdata *scan_single_rom_file(struct zfile *f)
 			zfile_getname(f), size, get_crc32(rombuf, size), get_sha1_txt(rombuf, size));
 	} else {
 		TCHAR tmp[MAX_DPATH];
-		getromname(rd, tmp);
+		getromname(rd, tmp, sizeof tmp / sizeof *tmp);
 		write_log(_T("*: %s:%d = %s\nCRC32=%08X SHA1=%s\n"),
 			zfile_getname(f), size, tmp, get_crc32(rombuf, size), get_sha1_txt(rombuf, size));
 	}

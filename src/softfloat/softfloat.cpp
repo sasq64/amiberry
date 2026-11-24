@@ -2363,7 +2363,10 @@ static floatx80 addFloatx80Sigs(floatx80 a, floatx80 b, flag zSign,
                 return propagateFloatx80NaN(a, b, status);
             }
 			if (inf_clear_intbit(status)) return packFloatx80(extractFloatx80Sign(a), aExp, 0);
-			return faddsub_swap_inf(status) ? b : a;
+			// 6888x: the result takes b's significand, but the sign of the
+			// operation (zSign): for a - b with opposite signs b carries
+			// the other sign, so +inf - -inf returned -inf
+			return faddsub_swap_inf(status) ? packFloatx80(zSign, bExp, bSig) : a;
         }
         zSig1 = 0;
         zSig0 = aSig + bSig;
@@ -2916,6 +2919,9 @@ floatx80 floatx80_rem(floatx80 a, floatx80 b, uint64_t *q, flag *s, float_status
     if (bExp == 0x7FFF) {
         if ((uint64_t)(bSig << 1)) return propagateFloatx80NaN(a, b, status);
         *s = (aSign != bSign);
+        // x mod/rem infinity is x; a zero needs no rounding (rounding its
+        // zero significand raised a false underflow)
+        if (aExp == 0 && aSig0 == 0) return a;
         return normalizeRoundAndPackFloatx80(status->floatx80_rounding_precision, aSign, aExp, aSig0, 0, status);
     }
     if (bExp == 0) {
@@ -3024,6 +3030,9 @@ floatx80 floatx80_mod(floatx80 a, floatx80 b, uint64_t *q, flag *s, float_status
     if (bExp == 0x7FFF) {
         if ((uint64_t)(bSig << 1)) return propagateFloatx80NaN(a, b, status);
         *s = (aSign != bSign);
+        // x mod/rem infinity is x; a zero needs no rounding (rounding its
+        // zero significand raised a false underflow)
+        if (aExp == 0 && aSig0 == 0) return a;
         return normalizeRoundAndPackFloatx80(status->floatx80_rounding_precision, aSign, aExp, aSig0, 0, status);
     }
     if (bExp == 0) {

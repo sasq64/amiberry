@@ -10,19 +10,13 @@
 #include <cstdlib>
 #include <utility>
 #include <cstring>
-#include <cstdio>
 
 #include "sysdeps.h"
 #include "options.h"
 #include "custom.h"
 #include "xwin.h"
-#include "drawing.h"
-#include "gui.h"
 #include "amiberry_gfx.h"
 #include "display_modes.h"
-#include "threaddep/thread.h"
-#include "registry.h"
-#include "fsdb_host.h"
 
 #include "gfx_platform_internal.h"
 
@@ -702,6 +696,34 @@ void enumeratedisplays()
 		return;
 	if (!enumeratedisplays2 (false))
 		enumeratedisplays2(true);
+}
+
+
+// --dump-config resolves currprefs through fixup_prefs() before the normal
+// display setup, and getdisplay() exits when no display was ever enumerated.
+// On hosts where SDL video is unavailable (headless servers, CI runners), seed
+// the list with one synthetic primary display so the resolution can proceed
+// offline. Real desktop sessions keep the enumerated displays instead.
+void install_headless_display_fallback()
+{
+	if (Displays[0].monitorname)
+		return;
+	auto* const md = &Displays[0];
+	const TCHAR* const name = _T("Headless display");
+	md->adaptername = my_strdup(name);
+	md->adapterid = my_strdup(name);
+	md->adapterkey = my_strdup(name);
+	md->monitorname = my_strdup(name);
+	md->monitorid = my_strdup(name);
+	md->fullname = my_strdup(name);
+	md->DisplayModes = xcalloc(struct PicassoResolution, 1);
+	md->rect.x = md->rect.y = 0;
+	md->rect.w = 1920;
+	md->rect.h = 1080;
+	md->workrect = md->rect;
+	md->primary = 1;
+	md->monitor = 0;
+	write_log(_T("No displays available; installed synthetic primary display for offline resolution.\n"));
 }
 
 // ---------------------------------------------------------------------------

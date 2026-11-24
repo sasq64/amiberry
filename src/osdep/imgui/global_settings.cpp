@@ -13,7 +13,7 @@
 #include "target.h"
 #include "gui/gui_handling.h"
 #include "gui_layout_scale.h"
-#include "shader_catalog.h"
+#include "display_catalog.h"
 
 namespace {
 
@@ -25,12 +25,20 @@ struct StringComboOption
 	const char* label;
 };
 
+// Every group is its own table, so the label column width is shared: each
+// frame measures the widest label and the next frame sizes all tables to it.
+// A fixed button-based width let long labels run under the value column.
+static float label_column_width = 0.0f;
+static float label_column_width_next = 0.0f;
+
 static bool begin_settings_table(const char* id)
 {
 	if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp))
 		return false;
 
-	ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, BUTTON_WIDTH * 2.1f);
+	const float width = std::max(BUTTON_WIDTH * 2.1f,
+		label_column_width + ImGui::GetStyle().ItemSpacing.x);
+	ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthFixed, width);
 	ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 	return true;
 }
@@ -41,6 +49,7 @@ static void next_setting_row(const char* label)
 	ImGui::TableSetColumnIndex(0);
 	ImGui::AlignTextToFramePadding();
 	ImGui::TextUnformatted(label);
+	label_column_width_next = std::max(label_column_width_next, ImGui::GetItemRectSize().x);
 	ImGui::TableSetColumnIndex(1);
 	ImGui::PushID(label);
 }
@@ -411,6 +420,8 @@ static void save_global_settings()
 void render_panel_global_settings()
 {
 	ImGui::Indent(4.0f);
+	label_column_width = label_column_width_next;
+	label_column_width_next = 0.0f;
 
 	if (AmigaButton(ICON_FA_FLOPPY_DISK " Save Global Settings", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT)))
 		save_global_settings();
@@ -479,8 +490,11 @@ void render_panel_global_settings()
 			"This enables richer display and grouping, but opens each .uae file and can be slower for large libraries.");
 		render_bool_row("GUI joystick control", &amiberry_options.gui_joystick_control,
 			"Allow joystick/gamepad navigation in the GUI.");
+#ifndef __APPLE__
+		// macOS/iOS: no host poweroff from Amiberry, so the button is never shown
 		render_bool_row("Disable shutdown button", &amiberry_options.disable_shutdown_button,
 			"Hide the GUI Shutdown button. Useful on systems where users should not power off the host from Amiberry.");
+#endif
 		render_combo_row("Quickstart compatibility", &amiberry_options.default_quickstart_compatibility,
 			compatibility_options, IM_ARRAYSIZE(compatibility_options),
 			"Default Quickstart compatibility level used when applying built-in model presets.");
@@ -489,8 +503,8 @@ void render_panel_global_settings()
 	render_group("Input defaults and hotkeys", "GlobalInputDefaults", [&]() {
 		render_bool_row("RCtrl as RAmiga", &amiberry_options.rctrl_as_ramiga,
 			"Map Right Control to the Right Amiga key by default.");
-		render_int_row("Mouse speed", &amiberry_options.input_default_mouse_speed,
-			"Default mouse input speed applied to new configurations.", 1, 1, 1000);
+		render_int_row("Default mouse speed", &amiberry_options.input_default_mouse_speed,
+			"Mouse speed applied to new configurations (100 = normal). Analog stick mouse movement uses the Analog joy-mouse speed setting instead.", 1, 1, 1000);
 		render_bool_row("Keyboard joystick stops keypresses",
 			&amiberry_options.input_keyboard_as_joystick_stop_keypresses,
 			"Stop keyboard-as-joystick mappings from also generating normal Amiga key presses.");
@@ -511,6 +525,9 @@ void render_panel_global_settings()
 		render_hotkey_row("Full-window toggle key", amiberry_options.default_fullscreen_toggle_key,
 			sizeof amiberry_options.default_fullscreen_toggle_key,
 			"Default keyboard shortcut for toggling Windowed and Full-window modes.");
+		render_hotkey_row("Screenshot key", amiberry_options.default_screenshot_key,
+			sizeof amiberry_options.default_screenshot_key,
+			"Default keyboard shortcut for saving a screenshot.");
 		render_bool_row("RetroArch quit", &amiberry_options.default_retroarch_quit,
 			"Enable RetroArch-style quit button mapping by default when a mapping exists.");
 		render_bool_row("RetroArch menu", &amiberry_options.default_retroarch_menu,
@@ -519,44 +536,48 @@ void render_panel_global_settings()
 			"Enable RetroArch-style reset button mapping by default when a mapping exists.");
 		render_input_device_row("Controller 1", amiberry_options.default_controller1,
 			sizeof amiberry_options.default_controller1,
-			"Default controller mapping for port 1.");
+			"Default device for Input Port 2 (joystick) in new configurations and autobooted content. "
+			"Does not change the current configuration; use the Input panel for that.");
 		render_input_device_row("Controller 2", amiberry_options.default_controller2,
 			sizeof amiberry_options.default_controller2,
-			"Default controller mapping for port 2.");
+			"Second controller, used on Input Port 1 by WHDLoad/CD32 autoboot.");
 		render_input_device_row("Controller 3", amiberry_options.default_controller3,
 			sizeof amiberry_options.default_controller3,
-			"Default controller mapping for port 3.");
+			"Default device for Input Port 3 (parallel joystick) in new configurations and WHDLoad autoboot.");
 		render_input_device_row("Controller 4", amiberry_options.default_controller4,
 			sizeof amiberry_options.default_controller4,
-			"Default controller mapping for port 4.");
+			"Default device for Input Port 4 (parallel joystick) in new configurations and WHDLoad autoboot.");
 		render_input_device_row("Mouse 1", amiberry_options.default_mouse1,
 			sizeof amiberry_options.default_mouse1,
-			"Default mouse mapping for mouse port 1.");
+			"Default device for Input Port 1 (mouse) in new configurations and mouse-controlled autobooted content.");
 		render_input_device_row("Mouse 2", amiberry_options.default_mouse2,
 			sizeof amiberry_options.default_mouse2,
-			"Default mouse mapping for mouse port 2.");
+			"Second mouse device, used on Input Port 2 for mouse-controlled WHDLoad content.");
 	});
 
 	render_group("Display defaults", "GlobalDisplayDefaults", [&]() {
 		render_combo_row("Line mode", &amiberry_options.default_line_mode,
 			line_mode_options, IM_ARRAYSIZE(line_mode_options),
 			"Default native display line mode for new configurations.");
+		// Auto crop overrides centering at config fixup, as in the Display panel.
+		ImGui::BeginDisabled(amiberry_options.default_auto_crop);
 		render_bool_row("Horizontal centering", &amiberry_options.default_horizontal_centering,
-			"Center the native display horizontally by default.");
+			"Center the native display horizontally by default. Ignored while Auto crop is on.");
 		render_bool_row("Vertical centering", &amiberry_options.default_vertical_centering,
-			"Center the native display vertically by default.");
+			"Center the native display vertically by default. Ignored while Auto crop is on.");
+		ImGui::EndDisabled();
 		render_combo_row("Scaling method", &amiberry_options.default_scaling_method,
 			scaling_method_options, scaling_method_option_count,
 			"Default image scaling method.");
 		render_combo_row("Auto resolution", &amiberry_options.default_gfx_autoresolution,
 			enabled_options, IM_ARRAYSIZE(enabled_options),
 			"Enable native display auto-resolution switching by default.");
-		render_bool_row("Frameskip", &amiberry_options.default_frameskip,
-			"Enable default frameskip for slower hosts.");
 		render_bool_row("Correct aspect ratio", &amiberry_options.default_correct_aspect_ratio,
 			"Preserve the Amiga display aspect ratio by default.");
 		render_bool_row("Auto crop", &amiberry_options.default_auto_crop,
 			"Enable automatic border crop by default.");
+		render_bool_row("Multithreaded Denise", &amiberry_options.default_multithreaded_denise,
+			"Run Denise graphics chip emulation on a separate thread by default.");
 		render_int_row("Default width", &amiberry_options.default_width,
 			"Default native display window width.", 1, 1, 16384);
 		render_int_row("Default height", &amiberry_options.default_height,
@@ -605,8 +626,9 @@ void render_panel_global_settings()
 			"Show virtual joystick controls by default on touchscreen devices.");
 		render_bool_row("On-screen keyboard", &amiberry_options.default_vkbd_enabled,
 			"Enable the on-screen Amiga keyboard by default.");
-		render_int_row("On-screen keyboard transparency", &amiberry_options.default_vkbd_transparency,
-			"Default on-screen keyboard transparency percentage.", 1, 0, 100);
+		render_int_row("On-screen keyboard opacity", &amiberry_options.default_vkbd_transparency,
+			"Opacity of the on-screen keyboard in new configurations (100% is opaque); 0 uses the default of 85%.",
+			1, 0, 100);
 		render_string_combo_row("On-screen keyboard layout", amiberry_options.default_vkbd_language,
 			sizeof amiberry_options.default_vkbd_language, vkbd_language_options, IM_ARRAYSIZE(vkbd_language_options),
 			"Default on-screen keyboard layout.");
@@ -709,9 +731,10 @@ void render_panel_global_settings()
 		render_path_row("NVRAM", "NVRAM", get_nvram_path(),
 			[](const std::string& path) { set_nvram_path(path); },
 			"Default folder for NVRAM files.");
-		render_path_row("Plugins", "Plugins", get_plugins_path(),
+		render_path_row("Plugins override", "Plugins", get_plugins_override_path(),
 			[](const std::string& path) { set_plugins_path(path); },
-			"Default folder for runtime plugins.");
+			"Optional folder searched after AMIBERRY_PLUGINS_DIR and before the user plugins folder.");
+
 		render_path_row("Videos", "Videos", get_video_path(),
 			[](const std::string& path) { set_video_path(path); },
 			"Default folder for video output files.");
@@ -725,6 +748,12 @@ void render_panel_global_settings()
 			[](const std::string& path) { set_bezels_path(path); },
 			"Folder containing bezel overlay assets.");
 	});
+
+	if (user_plugins_supported()) {
+		if (BeginGroupBox("Plugin locations", true, false))
+			render_plugin_paths_settings("GlobalPlugins");
+		EndGroupBox("Plugin locations");
+	}
 
 	render_group("Updates", "GlobalUpdates", [&]() {
 		render_combo_row("Startup update check", &amiberry_options.update_check,

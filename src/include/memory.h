@@ -10,6 +10,7 @@
 #define UAE_MEMORY_H
 
 extern void memory_reset(void);
+extern bool memory_address_space_rebuild_needed(void);
 extern void memory_restore(void);
 extern void a1000_reset(void);
 
@@ -31,6 +32,11 @@ void release_shm (void);
 extern bool rom_write_enabled;
 extern bool canbang;
 extern bool jit_direct_compatible_memory;
+// The configuration asks for JIT direct memory access.
+extern bool jit_direct_wanted(const struct uae_prefs *p);
+// Direct access is asked for but the memory is laid out for indirect access
+// until the next reset.
+extern bool jit_direct_pending(const struct uae_prefs *p);
 extern uaecptr highest_ram;
 
 #define Z3BASE_UAE 0x10000000
@@ -460,6 +466,9 @@ extern void rtarea_free(void);
 extern void rtarea_init_mem(void);
 extern void rtarea_setup(void);
 extern void expamem_reset(int);
+#ifdef AMIBERRY
+extern void expamem_bring_in_boards(void);
+#endif
 extern void expamem_next(addrbank *mapped, addrbank *next);
 extern void expamem_shutup(addrbank *mapped);
 extern bool expamem_z3hack(struct uae_prefs*);
@@ -522,6 +531,11 @@ extern addrbank *get_mem_bank_real(uaecptr);
 extern void memory_init (void);
 extern void memory_cleanup(void);
 extern void restore_banks(void);
+// Which banks the CPU's memory map uses: the plain ones, the CPU thread's
+// (hand-offs to the main thread), or counting ones on the main thread while a
+// request flood holds the CPU there (newcpu.cpp cpu_thread_check_flood()).
+enum { CPU_BANKS_PLAIN, CPU_BANKS_THREAD, CPU_BANKS_COUNT };
+extern void memory_set_cpu_thread_banks(int mode);
 extern void map_banks (addrbank *bank, int first, int count, int realsize);
 extern bool map_banks_z2(addrbank *bank, int first, int count);
 extern uae_u32 map_banks_z2_autosize(addrbank *bank, int first);
@@ -538,6 +552,12 @@ extern void free_fastmemory (int);
 extern void set_roms_modified (void);
 extern void reload_roms(void);
 extern bool read_kickstart_version(struct uae_prefs *p);
+// The built-in AROS Kickstart replacement: the ROM file name that selects it
+// (also as the end of an RP9's "<file>:AROS"), and the two files it loads
+// from a ROM directory.
+inline constexpr const char aros_rom_token[] = ":AROS";
+inline constexpr const char aros_main_rom_file[] = "aros-rom.bin";
+inline constexpr const char aros_ext_rom_file[] = "aros-ext.bin";
 extern void chipmem_setindirect(void);
 extern void initramboard(addrbank *ab, struct ramboard *rb);
 extern void loadboardfile(addrbank *ab, struct boardloadfile *lf);
@@ -660,10 +680,6 @@ STATIC_INLINE uae_u32 get_wordi_jit(uaecptr addr)
 /*
 * Read a host pointer from addr
 */
-#if SIZEOF_VOID_P == 4
-# define get_pointer(addr) ((void *)get_long (addr))
-#else
-# if SIZEOF_VOID_P == 8
 STATIC_INLINE void *get_pointer (uaecptr addr)
 {
 	const unsigned int n = SIZEOF_VOID_P / 4;
@@ -682,10 +698,6 @@ STATIC_INLINE void *get_pointer (uaecptr addr)
 	}
 	return p.ptr;
 }
-# else
-#  error "Unknown or unsupported pointer size."
-# endif
-#endif
 
 void dma_put_long(uaecptr addr, uae_u32 v);
 uae_u32 dma_get_long(uaecptr addr);
@@ -768,10 +780,6 @@ STATIC_INLINE void put_byte_jit(uaecptr addr, uae_u32 l)
 /*
 * Store host pointer v at addr
 */
-#if SIZEOF_VOID_P == 4
-# define put_pointer(addr, p) (put_long ((addr), (uae_u32)(p)))
-#else
-# if SIZEOF_VOID_P == 8
 STATIC_INLINE void put_pointer (uaecptr addr, void *v)
 {
 	const unsigned int n = SIZEOF_VOID_P / 4;
@@ -791,8 +799,6 @@ STATIC_INLINE void put_pointer (uaecptr addr, void *v)
 #endif
 	}
 }
-# endif
-#endif
 
 bool real_address_allowed(void);
 uae_u8 *memory_get_real_address(uaecptr);

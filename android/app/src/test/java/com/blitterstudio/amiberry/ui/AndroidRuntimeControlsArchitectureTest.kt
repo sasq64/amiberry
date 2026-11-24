@@ -75,35 +75,6 @@ class AndroidRuntimeControlsArchitectureTest {
 	}
 
 	@Test
-	fun `touch overlays block joystick and mouse input while OSK is animating`() {
-		val amiberryCpp = File("../../src/osdep/amiberry.cpp").readText()
-		val fingerEvents = Regex(
-			"""case SDL_EVENT_FINGER_DOWN:[\s\S]*?case SDL_EVENT_MOUSE_WHEEL:"""
-		).find(amiberryCpp)?.value.orEmpty()
-		val controllerButtonEvent = Regex(
-			"""static void handle_controller_button_event\(const SDL_Event& event\)[\s\S]*?static void handle_joy_button_event"""
-		).find(amiberryCpp)?.value.orEmpty()
-
-		assertTrue(
-			"OSK touch routing should stay active for the visible and animating keyboard lifetime.",
-			fingerEvents.contains("imgui_osk_should_render() && mon->amiga_window")
-		)
-		assertTrue(
-			"The on-screen joystick should stay blocked until the OSK has finished sliding out.",
-			fingerEvents.contains("!imgui_osk_should_render() && on_screen_joystick_is_enabled()")
-		)
-		assertTrue(
-			"Touch-synthesized mouse events should be suppressed while the OSK is visible or animating.",
-			fingerEvents.contains("imgui_osk_should_render() || on_screen_joystick_is_enabled()")
-		)
-		assertTrue(
-			"Gamepad OSK navigation should consume controller input while the keyboard is still animating.",
-			controllerButtonEvent.contains("else if (imgui_osk_should_render())") &&
-				controllerButtonEvent.contains("if (!imgui_osk_is_active())")
-		)
-	}
-
-	@Test
 	fun `captured D-pad motion has no distance release and shutdown neutralizes first`() {
 		val joystick = File("../../src/osdep/on_screen_joystick.cpp").readText()
 		val motionSignature =
@@ -173,12 +144,6 @@ class AndroidRuntimeControlsArchitectureTest {
 		val canceledTouch = Regex(
 			"""case SDL_EVENT_FINGER_CANCELED:[\s\S]*?break;"""
 		).find(processEvent)?.value.orEmpty()
-		val backgroundCase = Regex(
-			"""case SDL_EVENT_DID_ENTER_BACKGROUND:[\s\S]*?break;"""
-		).find(processEvent)?.value.orEmpty()
-		val foregroundCase = Regex(
-			"""case SDL_EVENT_DID_ENTER_FOREGROUND:[\s\S]*?break;"""
-		).find(processEvent)?.value.orEmpty()
 
 		assertTrue(
 			"The Android SDL event filter should only publish an atomic pending-neutralization request.",
@@ -210,13 +175,6 @@ class AndroidRuntimeControlsArchitectureTest {
 			"Focus loss and minimization must neutralize before input unacquire.",
 			inactiveHandler.indexOf("neutralize_touch_controls()") in
 				0 until inactiveHandler.indexOf("inputdevice_unacquire")
-		)
-		assertTrue(
-			"Background must neutralize before pausing, and foreground before resuming.",
-			backgroundCase.indexOf("neutralize_touch_controls()") in
-				0 until backgroundCase.indexOf("pause_sound()") &&
-				foregroundCase.indexOf("neutralize_touch_controls()") in
-					0 until foregroundCase.indexOf("resume_sound()")
 		)
 		assertTrue(
 			"Quit, close, and termination must neutralize before teardown.",

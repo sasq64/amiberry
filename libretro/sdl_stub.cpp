@@ -2,6 +2,7 @@
 #include "sdl_compat.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -267,6 +268,8 @@ Uint64 SDL_GetPerformanceFrequency(void)
 
 Uint64 SDL_GetTicks(void) { return (Uint64)GetTickCount64(); }
 void SDL_Delay(Uint32 ms) { Sleep(ms); }
+// Sleep() has millisecond granularity; shorter waits become Sleep(0), a yield.
+void SDL_DelayNS(Uint64 ns) { Sleep((DWORD)(ns / 1000000ull)); }
 #else
 Uint64 SDL_GetPerformanceCounter(void)
 {
@@ -277,11 +280,34 @@ Uint64 SDL_GetPerformanceCounter(void)
 Uint64 SDL_GetPerformanceFrequency(void) { return 1000000000ull; }
 Uint64 SDL_GetTicks(void) { return SDL_GetPerformanceCounter() / 1000000ull; }
 void SDL_Delay(Uint32 ms) { usleep((useconds_t)ms * 1000); }
+void SDL_DelayNS(Uint64 ns)
+{
+	struct timespec ts;
+	ts.tv_sec = (time_t)(ns / 1000000000ull);
+	ts.tv_nsec = (long)(ns % 1000000000ull);
+	while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+		;
+}
 #endif
 
 int SDL_GetVersion(void) { return (3 << 16); }
 const char* SDL_GetPlatform(void) { return "libretro"; }
 const char* SDL_GetBasePath(void) { return NULL; }
+Uint64 SDL_GetTicksNS(void)
+{
+	const Uint64 freq = SDL_GetPerformanceFrequency();
+	const Uint64 counter = SDL_GetPerformanceCounter();
+	if (freq == 1000000000ull || freq == 0)
+		return counter;
+	/* Split the division so a long uptime cannot overflow the scaling. */
+	return (counter / freq) * 1000000000ull + ((counter % freq) * 1000000000ull) / freq;
+}
+/* The frontend owns the paths and the input devices, so the Android helpers
+   report "nothing here" and the callers fall back to their generic paths. */
+char* SDL_GetPrefPath(const char* org, const char* app) { (void)org; (void)app; return NULL; }
+const char* SDL_GetAndroidExternalStoragePath(void) { return NULL; }
+SDL_TouchDeviceType SDL_GetTouchDeviceType(SDL_TouchID touchID) { (void)touchID; return SDL_TOUCH_DEVICE_INVALID; }
+bool SDL_HasJoystick(void) { return false; }
 const char* SDL_GetCurrentVideoDriver(void) { return "libretro"; }
 int SDL_GetNumVideoDisplays(void) { return 1; }
 SDL_DisplayID* SDL_GetDisplays(int* count)
@@ -971,6 +997,11 @@ bool SDL_GetWindowSize(SDL_Window* window, int* w, int* h)
 	if (h) *h = window ? window->h : 0;
 	return true;
 }
+float SDL_GetWindowPixelDensity(SDL_Window* window)
+{
+	(void)window;
+	return 1.0f;
+}
 void SDL_SetWindowGrab(SDL_Window* window, SDL_bool grabbed)
 {
 	(void)window;
@@ -1074,6 +1105,12 @@ SDL_Cursor* SDL_CreateColorCursor(SDL_Surface* surface, int hot_x, int hot_y)
 	(void)hot_x;
 	(void)hot_y;
 	return nullptr;
+}
+bool SDL_AddSurfaceAlternateImage(SDL_Surface* surface, SDL_Surface* image)
+{
+	(void)surface;
+	(void)image;
+	return false;
 }
 SDL_Cursor* SDL_CreateSystemCursor(SDL_SystemCursor id)
 {
@@ -1225,7 +1262,16 @@ Uint8 SDL_GetGamepadButton(SDL_Gamepad* gamepad, SDL_GamepadButton button)
 }
 SDL_GamepadButton SDL_GetGamepadButtonFromString(const char* str)
 {
-	(void)str;
+	if (!str)
+		return SDL_GAMEPAD_BUTTON_INVALID;
+	// Inverse of SDL_GetGamepadStringForButton(): case-insensitive forward
+	// lookup so config values like "leftstick" resolve the same as native
+	// SDL, for the libretro input paths that install configured toggles.
+	for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
+		const SDL_GamepadButton button = static_cast<SDL_GamepadButton>(i);
+		if (SDL_strcasecmp(str, SDL_GetGamepadStringForButton(button)) == 0)
+			return button;
+	}
 	return SDL_GAMEPAD_BUTTON_INVALID;
 }
 Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gamepad, SDL_GamepadAxis axis)
@@ -1342,6 +1388,12 @@ Sint16 SDL_GetJoystickAxis(SDL_Joystick* joystick, int axis)
 	(void)joystick;
 	(void)axis;
 	return 0;
+}
+Uint8 SDL_GetJoystickHat(SDL_Joystick* joystick, int hat)
+{
+	(void)joystick;
+	(void)hat;
+	return SDL_HAT_CENTERED;
 }
 Uint8 SDL_GetJoystickButton(SDL_Joystick* joystick, int button)
 {

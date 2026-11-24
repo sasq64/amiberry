@@ -35,6 +35,8 @@ extern uae_u32 restore_u32_func(uae_u8 **);
 extern uae_u16 restore_u16_func(uae_u8 **);
 extern uae_u8 restore_u8_func(uae_u8 **);
 
+extern bool restore_data_valid_func(uae_u8 **);
+
 extern void save_string_func(uae_u8 **, const TCHAR*);
 extern TCHAR *restore_string_func(uae_u8 **);
 
@@ -63,6 +65,8 @@ extern TCHAR *restore_path_full_func(uae_u8 **);
 #define restore_u16() restore_u16_func(&src)
 #define restore_u8() restore_u8_func(&src)
 #define restore_s8() ((uae_s8)restore_u8_func(&src))
+
+#define restore_data_valid() restore_data_valid_func(&src)
 
 #define save_string(x) save_string_func(&dst, (x))
 #define restore_string() restore_string_func(&src)
@@ -138,6 +142,9 @@ extern uae_u8 *restore_cia(int, uae_u8 *);
 extern uae_u8 *save_cia(int, size_t *, uae_u8 *);
 extern void restore_cia_finish(void);
 extern void restore_cia_start(void);
+extern uae_u8 *restore_rtc(uae_u8 *);
+extern uae_u8 *save_rtc(size_t *, uae_u8 *);
+extern void restore_rtc_start(void);
 
 extern uae_u8 *restore_expansion(uae_u8 *);
 extern uae_u8 *save_expansion(size_t *, uae_u8 *);
@@ -261,9 +268,10 @@ extern void restore_ar_finish(void);
 extern void savestate_initsave(const TCHAR *filename, int docompress, int nodialogs, bool save);
 extern int save_state(const TCHAR *filename, const TCHAR *description);
 extern void restore_state(const TCHAR *filename);
+extern bool savestate_is_state_file(const TCHAR *filename);
 #ifdef LIBRETRO
 extern int save_state_internal(struct zfile *f, const TCHAR *description, int comp, bool savepath);
-extern void restore_state_file(struct zfile *f);
+extern void savestate_restore_memory(const uae_u8 *data, size_t size);
 #endif
 extern bool savestate_restore_finish(void);
 extern void savestate_restore_final(void);
@@ -285,6 +293,7 @@ extern bool savestate_check(void);
 #define STATE_SAVE_DESCRIPTION _T("Description!")
 
 extern int savestate_state;
+extern int savestate_last_save_result;
 extern TCHAR savestate_fname[MAX_DPATH];
 extern TCHAR path_statefile[MAX_DPATH];
 extern struct zfile *savestate_file;
@@ -294,7 +303,10 @@ STATIC_INLINE bool isrestore(void)
 	return savestate_state == STATE_RESTORE || savestate_state == STATE_REWIND;
 }
 
-extern void savestate_quick(int slot, int save);
+/* Returns the save_state() result when saving (non-zero on success), 1 when
+   the restore was scheduled, and 0 when nothing was done (no usable state
+   file name, or the state file to load does not exist). */
+extern int savestate_quick(int slot, int save);
 
 extern void savestate_capture(int);
 extern void savestate_free(void);

@@ -1,5 +1,6 @@
 package com.blitterstudio.amiberry.ui
 
+import android.app.ActivityManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -14,10 +15,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
+import com.blitterstudio.amiberry.ui.viewmodel.SettingsViewModel
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.blitterstudio.amiberry.AmiberryActivity
+import com.blitterstudio.amiberry.R
+import com.blitterstudio.amiberry.data.model.SettingsSchema
+import com.blitterstudio.amiberry.data.AndroidAutosave
 import com.blitterstudio.amiberry.data.AppPreferences
 import com.blitterstudio.amiberry.data.AssetExtraction
 import com.blitterstudio.amiberry.data.AssetExtractionFailureActions
@@ -43,6 +50,8 @@ class MainActivity : ComponentActivity() {
 		private set
 	var emulatorCrashDetected by mutableStateOf(false)
 		private set
+	var emulatorRunning by mutableStateOf(false)
+		private set
 	var assetExtractionFailed by mutableStateOf(false)
 		private set
 	var assetExtractionFailureSummary by mutableStateOf<AssetExtraction.CopySummary?>(null)
@@ -56,6 +65,24 @@ class MainActivity : ComponentActivity() {
 	override fun onCreate(savedInstanceState: Bundle?) {
 		val splashScreen = installSplashScreen()
 		super.onCreate(savedInstanceState)
+		if (EmulatorResumeRecovery.isDuplicateLauncher(
+				isTaskRoot = isTaskRoot,
+				restoring = savedInstanceState != null,
+				emulatorRunning = isEmulatorRunning()
+			)
+		) {
+			// A second launcher over a paused game would show a false crash dialog and
+			// orphan the emulator on Back: return to the game instead.
+			if (intent?.action == Intent.ACTION_VIEW) {
+				Toast.makeText(this, R.string.msg_quit_emulation_to_open_file, Toast.LENGTH_LONG).show()
+			}
+			bringEmulatorToFront()
+			finish()
+			return
+		}
+		// The emulator's presets, option choices and CPU/chipset rules the
+		// launcher builds its screens and configurations from.
+		SettingsSchema.bundled(this)
 		enableEdgeToEdge()
 
 		// Keep the splash screen visible while assets are being extracted
@@ -138,12 +165,12 @@ class MainActivity : ComponentActivity() {
 		}
 	}
 
-	private fun launchPreparedImport(launch: IntentImportExecutor.Launch?) {
+	private suspend fun launchPreparedImport(launch: IntentImportExecutor.Launch?) {
 		when (launch) {
 			is IntentImportExecutor.Launch.SavedConfig -> EmulatorLauncher.launchWithConfig(
 				this,
 				launch.configPath,
-				controlSettings = launch.controlSettings
+				rememberedControls = launch.rememberedControls
 			)
 			is IntentImportExecutor.Launch.QuickStart -> EmulatorLauncher.launchQuickStart(
 				context = this,
@@ -157,7 +184,8 @@ class MainActivity : ComponentActivity() {
 				context = this,
 				lhaPath = launch.lhaPath,
 				configPath = launch.configPath,
-				shaderOverride = launch.shaderOverride
+				shaderOverride = launch.shaderOverride,
+				controlOverrides = launch.controlOverrides
 			)
 			is IntentImportExecutor.Launch.Rp9 -> EmulatorLauncher.launchRp9(
 				this,
@@ -341,6 +369,7 @@ class MainActivity : ComponentActivity() {
 	override fun onResume() {
 		super.onResume()
 		isActivityResumed = true
+		emulatorRunning = isEmulatorRunning()
 		processResumeRecovery()
 	}
 
@@ -357,7 +386,14 @@ class MainActivity : ComponentActivity() {
 		// before checking for crashes. Clean exit takes priority.
 		val hadTrackedSession = EmulatorLauncher.hasSessionMarker(this)
 		val wasCleanExit = EmulatorLauncher.checkAndClearCleanExit(this)
-		val wasCrash = !wasCleanExit && EmulatorLauncher.checkAndClearCrashMarker(this)
+		if (wasCleanExit) {
+			// target_quit removes the completed state. This also removes a partial
+			// save that Android started while the activity was being finished.
+			AndroidAutosave.discard(this)
+		}
+		// The session marker of an emulator that is still running is no crash: leave it.
+		val wasCrash = EmulatorResumeRecovery.shouldCheckForCrash(wasCleanExit, emulatorRunning) &&
+			EmulatorLauncher.checkAndClearCrashMarker(this)
 		val decision = EmulatorResumeRecovery.decide(
 			wasCleanExit = wasCleanExit,
 			wasCrash = wasCrash,
@@ -377,11 +413,33 @@ class MainActivity : ComponentActivity() {
 			}
 		}
 		emulatorWasLaunched = decision.keepLaunchTracked
+		// The on-screen controls turned in the in-game menu (the emulator
+		// records them only while its menu, not this activity, is in front).
+		ViewModelProvider(this)[SettingsViewModel::class.java].adoptInGameControls()
 	}
 
 	/** Called by EmulatorLauncher before starting the SDL activity. */
 	fun markEmulatorLaunched() {
 		emulatorWasLaunched = true
+		emulatorRunning = true
+	}
+
+	/** The emulator runs in its own process (":sdl", see the manifest). */
+	private fun isEmulatorRunning(): Boolean {
+		val activityManager = getSystemService(ActivityManager::class.java) ?: return false
+		val emulatorProcess = "$packageName$EMULATOR_PROCESS_SUFFIX"
+		return activityManager.runningAppProcesses.orEmpty().any { it.processName == emulatorProcess }
+	}
+
+	/** Bring the task the emulator runs in to the front when it is not this one. */
+	private fun bringEmulatorToFront() {
+		val activityManager = getSystemService(ActivityManager::class.java) ?: return
+		activityManager.appTasks
+			.firstOrNull { task ->
+				val info = runCatching { task.taskInfo }.getOrNull() ?: return@firstOrNull false
+				info.taskId != taskId && info.topActivity?.className == AmiberryActivity::class.java.name
+			}
+			?.moveToFront()
 	}
 
 	private fun requestInAppReview() {
@@ -468,5 +526,6 @@ class MainActivity : ComponentActivity() {
 
 	companion object {
 		private const val TAG = "Amiberry-Main"
+		private const val EMULATOR_PROCESS_SUFFIX = ":sdl"
 	}
 }

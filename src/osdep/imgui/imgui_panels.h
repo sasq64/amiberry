@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <vector>
 #include <string>
 #include "imgui.h"
@@ -18,7 +19,6 @@ extern ImTextureID about_logo_texture;
 // Shared catalogs used by panels that expose the same choices.
 const std::vector<std::string>& get_sound_device_names();
 const std::vector<std::string>& get_available_theme_names();
-const std::vector<std::string>& get_available_bezel_names();
 
 struct ComboOption
 {
@@ -81,6 +81,12 @@ bool AmigaRadioButton(const char* label, int* v, int v_button);
 
 // Delayed tooltip on the previous widget (shown after hover delay)
 void ShowHelpMarker(const char* desc);
+void RenderFloppyDriveResetNotice();
+
+// Status text colors from the active GUI theme
+ImVec4 GetWarningTextColor();
+ImVec4 GetErrorTextColor();
+ImVec4 GetSuccessTextColor();
 
 void render_panel_play();
 bool play_has_content_selection();
@@ -89,8 +95,10 @@ bool play_is_adjusting_selected_content_model();
 bool play_prepare_selected_content_for_start();
 void render_panel_about();
 void render_panel_paths();
+void render_plugin_paths_settings(const char* id);
 void render_panel_quickstart();
 void Quickstart_ApplyDefaults(); // Helper to apply quickstart model defaults
+void refresh_quickstart_config_list(); // Rebuild the Quickstart configuration list from the preset table
 void render_panel_configurations();
 void render_panel_cpu();
 void render_panel_chipset();
@@ -98,9 +106,23 @@ void render_panel_adv_chipset();
 void render_panel_rom();
 void render_panel_ram();
 void render_panel_floppy();
+void FloppyRecoveryDialog_Open(int drive, const char* initial_path);
+void FloppyRecoveryDialog_Render();
+bool FloppyRecoveryDialog_ConsumeResult(std::string& out_path);
+// A file requester over the GUI (media_request.cpp): done runs with the
+// chosen path and says whether it was used; close_gui leaves the GUI once
+// the requester is cancelled or its file used, as a hotkey's requester does
+// (a refused file keeps the GUI up to show its message).
+using MediaRequestDone = std::function<bool(const std::string& path)>;
+void MediaRequestDialog_Open(const char* title, const char* filters, const std::string& initial_path,
+	bool save, bool close_gui, MediaRequestDone done);
+void MediaRequestDialog_Render();
+// Drops an unanswered request when the GUI closes, so it does not come back
+// (and act on its old target) the next time the GUI opens.
+void MediaRequestDialog_Reset();
+extern const char* const floppy_file_filter;
 void render_panel_hd();
 void render_panel_expansions();
-void copycpuboardmem(bool tomem);
 void render_panel_rtg();
 void render_panel_hwinfo();
 void render_panel_display();
@@ -120,9 +142,10 @@ void HotkeyCapture_RenderPopup();
 bool HotkeyCapture_IsActive();
 void render_panel_prio();
 void render_panel_savestates();
-void render_panel_virtual_keyboard();
+void render_panel_onscreen();
 void render_panel_whdload();
 void render_panel_themes();
+void reset_themes_panel_state();
 void render_panel_filter();
 void ShaderParameters_Open(const char* shader_name, bool rtg);
 void ShaderParameters_RenderPopup();

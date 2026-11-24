@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <string>
 #include <filesystem>
-#include <array>
 #include <nlohmann/json.hpp>
+#include <cfloat>
 #include <SDL3_image/SDL_image.h>
 #include <dpi_handler.hpp>
 #include <unordered_map>
@@ -17,7 +17,6 @@
 
 #include "sysdeps.h"
 #include "options.h"
-#include "memory.h"
 #include "uae.h"
 #include "gui_handling.h"
 #include "amiberry_gfx.h"
@@ -26,22 +25,20 @@
 #include "opengl_renderer.h"
 #endif
 #include "fsdb_host.h"
-#include "autoconf.h"
-#include "blkdev.h"
-#include "inputdevice.h"
-#include "xwin.h"
-#include "custom.h"
+#ifdef USE_IPC_SOCKET
+#include "amiberry_ipc.h"
+#endif
 #include "disk.h"
 #include "zfile.h"
 #include "imgui_internal.h"
-#include "savestate.h"
 #include "target.h"
 #include "perf_monitor.h"
-#include "tinyxml2.h"
 #include "file_dialog.h"
 #include "macos_window.h"
 #include "amiberry_rp9.h"
 #include "amiberry_gui_pacing.h"
+#include "settings/amiberry_actions.h"
+#include "amiberry_actions_host.h"
 
 #ifdef USE_IMGUI
 #include "imgui.h"
@@ -50,6 +47,7 @@
 #ifdef USE_OPENGL
 #include "imgui_impl_opengl3.h"
 #include <SDL3/SDL_opengl.h>
+#include "gl_platform.h"
 #endif
 #ifdef USE_VULKAN
 #include "imgui_impl_vulkan.h"
@@ -60,6 +58,7 @@
 #include <iterator>
 #include <sstream>
 #include "imgui/imgui_panels.h"
+#include "osdep/settings/settings_definitions.h"
 #include "imgui/imgui_help_text.h"
 #include "imgui/play_setup.h"
 #include "icons_fa.h"
@@ -71,18 +70,25 @@ bool ctrl_state = false, shift_state = false, alt_state = false, win_state = fal
 int last_x = 0;
 int last_y = 0;
 
-bool gui_running = false;
 static int last_active_panel = 0;
-bool joystick_refresh_needed = false;
 
 // Touch-drag scrolling state (converts finger swipes to ImGui scroll wheel events)
 static bool touch_scrolling = false;
 static bool touch_scroll_on_widget = false;  // true when finger-down landed on an active ImGui widget (e.g. scrollbar)
 static float touch_scroll_accum = 0.0f;
 static SDL_FingerID touch_scroll_finger = 0;
+#if defined(__ANDROID__) && defined(USE_IMGUI)
+// SDL leaves its synthesized touch mouse at the last contact position after release.
+static bool clear_touch_hover_next_frame = false;
+// Where the D-pad/gamepad cursor goes next frame. ImGui only moves it Left or
+// Right onto an item level with it, which the sidebar rows and the page's
+// items rarely are, so run_gui() places it itself: on the open page's
+// sidebar row when the GUI opens or Left from the page finds nothing, and on
+// the page's first item when Right from the sidebar finds nothing.
+static bool focus_open_page_row = false;
+static bool focus_page_first_item = false;
+#endif
 
-static TCHAR startup_title[MAX_STARTUP_TITLE] = _T("");
-static TCHAR startup_message[MAX_STARTUP_MESSAGE] = _T("");
 
 // Config dirty tracking: fingerprint key fields from changed_prefs at load/save,
 // compare each frame to detect unsaved modifications.
@@ -469,11 +475,6 @@ void gui_destroy_texture(ImTextureID tex)
 	SDL_DestroyTexture((SDL_Texture*)tex);
 }
 
-void target_startup_msg(const TCHAR* title, const TCHAR* msg)
-{
-	_tcsncpy(startup_title, title, MAX_STARTUP_TITLE);
-	_tcsncpy(startup_message, msg, MAX_STARTUP_MESSAGE);
-}
 
 // Forward declaration
 void apply_imgui_theme();
@@ -507,6 +508,11 @@ static bool parse_rgb_csv(const std::string& s, int& r, int& g, int& b) {
 	r = clamp(r); g = clamp(g); b = clamp(b);
 	return true;
 }
+
+static ImVec4 gui_color_to_vec4(const amiberry_gui_color& c) { return rgb_to_vec4(c.r, c.g, c.b); }
+ImVec4 GetWarningTextColor() { return gui_color_to_vec4(gui_theme.warning_color); }
+ImVec4 GetErrorTextColor() { return gui_color_to_vec4(gui_theme.error_color); }
+ImVec4 GetSuccessTextColor() { return gui_color_to_vec4(gui_theme.success_color); }
 
 void apply_imgui_theme()
 {
@@ -819,65 +825,6 @@ static int gui_create_rtarea_flag(uae_prefs* p)
 	return flag;
 }
 
-std::string get_json_timestamp(const std::string& json_filename)
-{
-	std::ifstream f(json_filename);
-	if (!f.is_open())
-		return "";
-
-	try
-	{
-		// Read only enough to find the timestamp fields near the top
-		// Parse the full file since nlohmann doesn't support partial parsing easily
-		nlohmann::json doc = nlohmann::json::parse(f, nullptr, false);
-		f.close();
-		if (doc.is_discarded())
-			return "";
-
-		// Prefer upstream_timestamp, fall back to generated
-		if (doc.contains("upstream_timestamp") && doc["upstream_timestamp"].is_string())
-			return doc["upstream_timestamp"].get<std::string>();
-		if (doc.contains("generated") && doc["generated"].is_string())
-			return doc["generated"].get<std::string>();
-	}
-	catch (...)
-	{
-		// Parse failed
-	}
-	return "";
-}
-
-std::string get_xml_timestamp(const std::string& xml_filename)
-{
-	std::string result;
-	tinyxml2::XMLDocument doc;
-	auto error = false;
-
-	auto* f = fopen(xml_filename.c_str(), _T("rb"));
-	if (f)
-	{
-		auto err = doc.LoadFile(f);
-		if (err != tinyxml2::XML_SUCCESS)
-		{
-			write_log(_T("Failed to parse '%s':  %d\n"), xml_filename.c_str(), err);
-			error = true;
-		}
-		fclose(f);
-	}
-	else
-	{
-		error = true;
-	}
-	if (!error)
-	{
-		auto* whdbooter = doc.FirstChildElement("whdbooter");
-		result = whdbooter->Attribute("timestamp");
-	}
-	if (!result.empty())
-		return result;
-	return "";
-}
-
 void gui_force_rtarea_hdchange()
 {
 	gui_rtarea_flags_onenter |= 2;
@@ -918,6 +865,10 @@ int populate_diskswapper_from_archive(const TCHAR *path, struct uae_prefs *prefs
 		_tcsncpy(prefs->dfxlist[i], state.images[i].c_str(), MAX_DPATH - 1);
 		prefs->dfxlist[i][MAX_DPATH - 1] = '\0';
 	}
+	// DISK_check_change copies the pending list into the running
+	// configuration only on a change.
+	if (prefs == &changed_prefs)
+		set_config_changed();
 	return count;
 }
 
@@ -930,7 +881,7 @@ int disk_in_drive(int entry)
 	return -1;
 }
 
-int disk_swap(int entry, int mode)
+int disk_swap(int entry)
 {
 	int drv, i, drvs[4] = { -1, -1, -1, -1 };
 
@@ -940,11 +891,6 @@ int disk_swap(int entry, int mode)
 			drvs[drv] = i;
 	}
 	if ((drv = disk_in_drive(entry)) >= 0) {
-		if (mode < 0) {
-			changed_prefs.floppyslots[drv].df[0] = 0;
-			return 1;
-		}
-
 		if (_tcscmp(changed_prefs.floppyslots[drv].df, currprefs.floppyslots[drv].df)) {
 			_tcscpy(changed_prefs.floppyslots[drv].df, currprefs.floppyslots[drv].df);
 			disk_insert(drv, changed_prefs.floppyslots[drv].df);
@@ -975,10 +921,6 @@ int disk_swap(int entry, int mode)
 	return 1;
 }
 
-void gui_restart()
-{
-	gui_running = false;
-}
 
 #ifdef USE_IMGUI
 // IMGUI runtime state and helpers
@@ -1030,6 +972,17 @@ void AmigaCircularBevel(const ImVec2 center, const float radius, const bool rece
 	// -PI/4 (-45) to 3PI/4 (135)
 	draw_list->PathArcTo(center, radius, -IM_PI / 4.0f, 3.0f * IM_PI / 4.0f);
 	draw_list->PathStroke(col_bottom_right, 0, 1.0f);
+}
+
+void RenderFloppyDriveResetNotice()
+{
+	if (!emulating)
+		return;
+
+	ImGui::PushStyleColor(ImGuiCol_Text, GetWarningTextColor());
+	ImGui::TextWrapped(ICON_FA_CIRCLE_INFO " Changes to connected floppy drives require resetting the emulated Amiga before AmigaOS can detect them.");
+	ImGui::PopStyleColor();
+	ImGui::Spacing();
 }
 
 static bool g_groupbox_collapsed = false;
@@ -1147,12 +1100,40 @@ void EndGroupBox(const char* name)
 	ImGui::Dummy(ImVec2(0.0f, 10.0f));
 }
 
+#ifdef __ANDROID__
+// Width of the focus ring draw_nav_ring() puts over ImGui's own nav cursor.
+static float nav_ring_thickness()
+{
+	return std::max(3.0f, 2.0f * DPIHandler::get_layout_scale());
+}
+#endif
+
 void ShowHelpMarker(const char* desc)
 {
 	if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal | ImGuiHoveredFlags_NoSharedDelay))
 	{
+		float wrap_pos = ImGui::GetFontSize() * 35.0f;
+#ifdef __ANDROID__
+		// The D-pad/gamepad cursor "hovers" its item, and ImGui puts that
+		// tooltip over the item's lower half, hiding its label. Place it wholly
+		// above or below the item instead, towards the larger free area.
+		if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible) {
+			const ImVec2 item_min = ImGui::GetItemRectMin();
+			const ImVec2 item_max = ImGui::GetItemRectMax();
+			const ImGuiViewport* vp = ImGui::GetMainViewport();
+			const ImGuiStyle& style = ImGui::GetStyle();
+			const float gap = style.ItemSpacing.y + nav_ring_thickness() * 2.0f;
+			const bool below = item_min.y + item_max.y < vp->WorkPos.y * 2.0f + vp->WorkSize.y;
+			const bool from_left = item_min.x + item_max.x < vp->WorkPos.x * 2.0f + vp->WorkSize.x;
+			ImGui::SetNextWindowPos(ImVec2(from_left ? item_min.x : item_max.x, below ? item_max.y + gap : item_min.y - gap),
+				ImGuiCond_Always, ImVec2(from_left ? 0.0f : 1.0f, below ? 0.0f : 1.0f));
+			// An explicitly placed tooltip is not kept on screen, so wrap its text to fit.
+			const float room = from_left ? vp->WorkPos.x + vp->WorkSize.x - item_min.x : item_max.x - vp->WorkPos.x;
+			wrap_pos = std::clamp(room - style.WindowPadding.x * 2.0f, ImGui::GetFontSize() * 10.0f, wrap_pos);
+		}
+#endif
 		ImGui::BeginTooltip();
-		ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+		ImGui::PushTextWrapPos(wrap_pos);
 		ImGui::TextUnformatted(desc);
 		ImGui::PopTextWrapPos();
 		ImGui::EndTooltip();
@@ -1603,6 +1584,7 @@ void amiberry_gui_init()
 
 	// Load GUI theme (for font selection)
 	load_theme(amiberry_options.gui_theme);
+	reset_themes_panel_state();
 	// Apply theme colors to ImGui (map GUISAN theme fields)
 	apply_imgui_theme();
 
@@ -1732,10 +1714,11 @@ void amiberry_gui_init()
 		SDL_GLContext ctx = gl_renderer ? gl_renderer->get_gl_context() : nullptr;
 		SDL_GL_MakeCurrent(mon->gui_window, ctx);
 		ImGui_ImplSDL3_InitForOpenGL(mon->gui_window, ctx);
-		// Pass nullptr so the backend auto-picks "#version 300 es" when
-		// IMGUI_IMPL_OPENGL_ES3 is defined (Pi/GLES build) and "#version 130"
-		// on desktop GL.
-		ImGui_ImplOpenGL3_Init(nullptr);
+		// Pick the GLSL version from the context the ladder actually
+		// obtained: desktop GL 2.x (e.g. Raspberry Pi vc4 via KMSDRM) needs
+		// "#version 120" — the backend's "#version 130" default does not
+		// compile there and aborts the GUI. GLES tiers get their ES string.
+		ImGui_ImplOpenGL3_Init(get_imgui_glsl_version());
 	} else
 #endif
 	{
@@ -1752,15 +1735,12 @@ void amiberry_gui_init()
 		raise_gui_window(mon->gui_window);
 #endif
 
-	// Quickstart models and configs initialization
+	// Quickstart models and configs initialization (preset table in the
+	// shared settings layer)
 	qs_models.clear();
-	for (const auto & amodel : amodels) {
-		qs_models.push_back(amodel.name);
-	}
-	qs_configs.clear();
-	for (const auto & config : amodels[quickstart_model].configs) {
-		qs_configs.push_back(config);
-	}
+	for (size_t i = 0; i < amiberry_settings_preset_count(); i++)
+		qs_models.push_back(amiberry_settings_preset_at(i)->label);
+	refresh_quickstart_config_list();
 }
 
 void amiberry_gui_halt()
@@ -1987,6 +1967,97 @@ void gui_start_from_current_config()
 	gui_running = false;
 }
 
+// The panel the GUI falls back to when the active one is not offered.
+#ifdef __ANDROID__
+// Android's launcher owns content selection and first-run setup.
+static constexpr const char* gui_home_panel = "configurations";
+#else
+static constexpr const char* gui_home_panel = "play";
+#endif
+
+// Whether the panel is offered on this platform. On Android the launcher
+// replaces the Play panel (content picker and first-run setup).
+static bool gui_panel_available([[maybe_unused]] const int index)
+{
+#ifdef __ANDROID__
+	return strcmp(categories[index].id, "play") != 0;
+#else
+	return true;
+#endif
+}
+
+#ifdef __ANDROID__
+// Whether ImGui's cancel (Escape, or a gamepad's B) has something to step out
+// of: a field being edited or a held slider, a popup, combo or modal, or a
+// nested child region the cursor was taken into. Mirrors
+// NavUpdateCancelRequest(), so Back never waits on a cancel ImGui ignores.
+static bool gui_back_has_imgui_target()
+{
+	const ImGuiContext& g = *ImGui::GetCurrentContext();
+	if (g.ActiveId != 0 || g.NavLayer != ImGuiNavLayer_Main)
+		return true;
+	if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+		return true;
+	// After a touch the cursor is hidden and Back leaves the GUI at once.
+	const ImGuiWindow* nav = g.NavWindow;
+	return nav && g.NavCursorVisible && nav != nav->RootWindow
+		&& !(nav->RootWindowForNav->Flags & ImGuiWindowFlags_Popup)
+		&& nav->RootWindowForNav->ParentWindow;
+}
+
+// Android Back (SDL's AC_BACK key, or a gamepad's Back button) cancels what
+// ImGui has open, one level per press. A gamepad's B is already ImGui's
+// cancel, so for it this only adds the last step. With nothing open, both
+// leave the GUI the way its buttons do: Resume when an emulation runs, else
+// Quit, which returns to the launcher that opened the GUI without starting
+// anything.
+static void gui_android_back(const bool imgui_cancels_itself)
+{
+	if (gui_back_has_imgui_target()) {
+		if (imgui_cancels_itself)
+			return;
+		if (ImGui::GetCurrentContext()->ActiveId != 0) {
+			// Ends text entry keeping what was typed; Escape would revert it.
+			ImGui::ClearActiveID();
+		} else {
+			ImGuiIO& io = ImGui::GetIO();
+			io.AddKeyEvent(ImGuiKey_Escape, true);
+			io.AddKeyEvent(ImGuiKey_Escape, false);
+		}
+		return;
+	}
+	if (!emulating) {
+		uae_quit();
+		gui_running = false;
+	} else if (start_disabled) {
+		ShowMessageBox("Reboot needed", "This memory change needs a Reboot. Choose Reboot, or Quit.");
+	} else {
+		gui_running = false;
+	}
+}
+
+// ImGui's own cursor is a thin line in the accent colour, lost on accent
+// buttons and from across a room. Draw a thick two-tone ring over it.
+static void draw_nav_ring()
+{
+	ImGuiContext& g = *ImGui::GetCurrentContext();
+	ImGuiWindow* window = g.NavWindow;
+	if (!ImGui::GetIO().NavVisible || !window || !g.NavIdIsAlive)
+		return;
+	const float thickness = nav_ring_thickness();
+	ImRect ring = ImGui::WindowRectRelToAbs(window, window->NavRectRel[g.NavLayer]);
+	ring.Expand(thickness);
+	// Keep the ring of a part-scrolled item inside its region.
+	ImRect clip = window->OuterRectClipped;
+	clip.Expand(thickness * 2.0f);
+	ImDrawList* dl = ImGui::GetForegroundDrawList();
+	dl->PushClipRect(clip.Min, clip.Max);
+	dl->AddRect(ring.Min, ring.Max, IM_COL32(0, 0, 0, 220), thickness, 0, thickness + 2.0f);
+	dl->AddRect(ring.Min, ring.Max, IM_COL32(255, 196, 0, 255), thickness, 0, thickness);
+	dl->PopClipRect();
+}
+#endif
+
 void disable_resume()
 {
 	if (emulating)
@@ -2062,19 +2133,68 @@ void run_gui()
 		open_perf_warning_popup = true;
 
 	if (!emulating && strlen(last_loaded_config) == 0)
-		gui_show_panel(amiberry_options.quickstart_start ? "quickstart" : "play",
+		gui_show_panel(amiberry_options.quickstart_start ? "quickstart" : gui_home_panel,
 			amiberry_options.quickstart_start);
+#ifdef __ANDROID__
+	focus_open_page_row = true;
+#endif
 
 	// Main loop
 	while (gui_running) {
-		const uint64_t frame_start = SDL_GetPerformanceCounter();
+		// Runtime actions posted from other threads keep running (and the
+		// status snapshot stays fresh) while the GUI is open. A reset, quit
+		// or state load among them only marks the request (quit_program);
+		// the emulation loop carries it out after the GUI closes, so leave
+		// the loop the way the GUI's own Reboot, Quit and Load State
+		// buttons do. Only a request made by this drain counts (the GUI can
+		// open with one pending), counted rather than read from
+		// quit_program, which a second identical request leaves unchanged.
+		const unsigned long requests_before = amiberry_actions_emulation_requests();
+#ifdef USE_IPC_SOCKET
+		// IPC commands keep being answered while the GUI is open, as they
+		// are while the debugger has the CPU stopped; the actions they run
+		// count as requests made by this drain.
+		Amiberry::IPC::IPCHandle();
+#endif
+		amiberry_actions_run_pending();
+		if (amiberry_actions_emulation_requests() != requests_before)
+			gui_running = false;
+ 		const uint64_t frame_start = SDL_GetPerformanceCounter();
 		while (SDL_PollEvent(&gui_event)) {
 			if (ControllerMap_HandleEvent(gui_event)) {
 				continue;
 			}
 
+#ifdef __ANDROID__
+			// SDL sends no motion for a second tap on the same spot, so restore
+			// the position that was cleared after the previous touch release.
+			if (gui_event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+				&& gui_event.button.which == SDL_TOUCH_MOUSEID)
+				ImGui::GetIO().AddMousePosEvent(gui_event.button.x, gui_event.button.y);
+#endif
+
 			// Make sure ImGui sees all unconsumed events
 			ImGui_ImplSDL3_ProcessEvent(&gui_event);
+
+#ifdef __ANDROID__
+			if ((gui_event.type == SDL_EVENT_MOUSE_BUTTON_UP
+				&& gui_event.button.which == SDL_TOUCH_MOUSEID)
+				|| gui_event.type == SDL_EVENT_FINGER_UP
+				|| gui_event.type == SDL_EVENT_FINGER_CANCELED)
+				clear_touch_hover_next_frame = true;
+			// A TV remote's OK (DPAD_CENTER) arrives as SELECT, which ImGui does
+			// not map: pass it on as Space, ImGui's keyboard "activate" key.
+			if ((gui_event.type == SDL_EVENT_KEY_DOWN || gui_event.type == SDL_EVENT_KEY_UP)
+				&& gui_event.key.scancode == SDL_SCANCODE_SELECT)
+				ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, gui_event.type == SDL_EVENT_KEY_DOWN);
+			if (gui_event.type == SDL_EVENT_KEY_DOWN && gui_event.key.scancode == SDL_SCANCODE_AC_BACK
+				&& !gui_event.key.repeat)
+				gui_android_back(false);
+			else if (gui_event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN
+				&& (gui_event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK
+					|| gui_event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST))
+				gui_android_back(gui_event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST);
+#endif
 
 			if (gui_event.type == SDL_EVENT_QUIT)	{
 				uae_quit();
@@ -2116,6 +2236,9 @@ void run_gui()
 				|| gui_event.type == SDL_EVENT_JOYSTICK_REMOVED) {
 				handle_joy_device_event(gui_event.jdevice.which,
 					gui_event.type == SDL_EVENT_JOYSTICK_REMOVED);
+			}
+			else if (gui_event.type == SDL_EVENT_KEYBOARD_ADDED) {
+				install_fault_signal_handlers();
 			}
 			else if (gui_event.type == SDL_EVENT_WINDOW_MOVED
 				&& gui_event.window.windowID == SDL_GetWindowID(mon->gui_window)) {
@@ -2250,6 +2373,15 @@ void run_gui()
 
 		ImGui::NewFrame();
 
+#ifdef __ANDROID__
+		// Queue the leave after this frame has consumed the touch release, so the
+		// click still activates its target before its hover state is cleared.
+		if (clear_touch_hover_next_frame) {
+			ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+			clear_touch_hover_next_frame = false;
+		}
+#endif
+
 		// Update GUI window title with config name and dirty indicator
 		update_gui_window_title(mon->gui_window);
 
@@ -2262,13 +2394,26 @@ void run_gui()
 		}
 
 		const ImGuiStyle& style = ImGui::GetStyle();
-		// Compute button bar height from style
-		const auto button_bar_height = ImGui::GetFrameHeight() + style.WindowPadding.y * 2.0f;
-
 		// Make the main window occupies the full SDL window (no smaller inner window) and set its size
 		const ImGuiViewport* vp = ImGui::GetMainViewport();
 		ImVec2 work_pos = vp->WorkPos;
 		ImVec2 work_size = vp->WorkSize;
+#ifdef __ANDROID__
+		// A phone in portrait has no room for the sidebar beside the page: the
+		// sidebar goes above the page at full width and the footer takes two rows.
+		const bool narrow_layout = work_size.x < BUTTON_WIDTH * 6.0f;
+		// Flattened, so the one D-pad/gamepad cursor crosses between the
+		// sidebar, the page and the footer.
+		constexpr ImGuiChildFlags nav_child_flags = ImGuiChildFlags_NavFlattened;
+		ImGuiWindow* sidebar_window = nullptr;
+		ImGuiWindow* content_window = nullptr;
+#else
+		constexpr bool narrow_layout = false;
+		constexpr ImGuiChildFlags nav_child_flags = ImGuiChildFlags_None;
+#endif
+		// Compute button bar height from style
+		const auto button_bar_height = ImGui::GetFrameHeight() + style.WindowPadding.y * 2.0f
+			+ (narrow_layout ? BUTTON_HEIGHT + style.ItemSpacing.y : 0.0f);
 		ImGui::SetNextWindowPos(work_pos, ImGuiCond_Always);
 		ImGui::SetNextWindowSize(work_size, ImGuiCond_Always);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -2294,7 +2439,23 @@ void run_gui()
 		// Sidebar
 		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 1.0f);
 		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
-		ImGui::BeginChild("Sidebar", ImVec2(sidebar_width - 2.0f, -button_bar_height));
+		ImVec2 sidebar_size(sidebar_width - 2.0f, -button_bar_height);
+		ImGuiChildFlags sidebar_flags = nav_child_flags;
+		if (narrow_layout) {
+			// Full width above the page, as tall as its rows up to 40% of the height.
+			sidebar_size = ImVec2(content_width - 2.0f, 0.0f);
+			sidebar_flags |= ImGuiChildFlags_AutoResizeY;
+			ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, content_height * 0.4f));
+		}
+		ImGui::BeginChild("Sidebar", sidebar_size, sidebar_flags);
+#ifdef __ANDROID__
+		// One cursor: until it is in the sidebar only the open page's row takes
+		// it, so moving in from the page or the footer lands there instead of on
+		// whichever row is level with the item it left.
+		sidebar_window = ImGui::GetCurrentWindow();
+		const bool sidebar_entry_only = ImGui::GetCurrentContext()->NavWindow != sidebar_window;
+		ImGui::PushItemFlag(ImGuiItemFlags_NoNav, sidebar_entry_only);
+#endif
 		ImGui::Indent(4.0f);
 		ImGui::Dummy(ImVec2(0, 2.0f));
 
@@ -2308,12 +2469,18 @@ void run_gui()
 		if (AmigaCheckbox("Expert settings", &expert_mode)) {
 			play_set_expert_settings_enabled(expert_mode);
 			if (!expert_mode && last_active_panel >= 0 && categories[last_active_panel].expert_only)
-				gui_show_panel("play");
+				gui_show_panel(gui_home_panel);
 		}
+#ifdef __ANDROID__
+		ShowHelpMarker("Show all advanced emulator panels.");
+#else
 		ShowHelpMarker("Show all advanced emulator panels. Turn this off for the focused Play setup flow.");
-		if (!expert_mode && (last_active_panel < 0 || categories[last_active_panel].category == nullptr ||
-			categories[last_active_panel].expert_only || categories[last_active_panel].simple_order < 0)) {
-			gui_show_panel("play");
+#endif
+		if (last_active_panel < 0 || categories[last_active_panel].category == nullptr
+			|| !gui_panel_available(last_active_panel)
+			|| (!expert_mode && (categories[last_active_panel].expert_only
+				|| categories[last_active_panel].simple_order < 0))) {
+			gui_show_panel(gui_home_panel);
 		}
 		ImGui::Dummy(ImVec2(0, 4.0f));
 
@@ -2329,13 +2496,13 @@ void run_gui()
 
 		struct SidebarGroup { int first_index; const char* label; const char* key; };
 		static const SidebarGroup sidebar_groups[] = {
-			{ 0,  "General",    "General" },
-			{ 5,  "Hardware",   "Hardware" },
-			{ 10, "Storage",    "Storage" },
-			{ 12, "Expansion",  "Expansion" },
-			{ 15, "Output",     "Output" },
-			{ 18, "Input / IO", "InputIO" },
-			{ 21, "Utility",    "Utility" },
+		{ 0,  "General",    "General" },
+		{ 6,  "Hardware",   "Hardware" },
+		{ 11, "Storage",    "Storage" },
+		{ 13, "Expansion",  "Expansion" },
+		{ 16, "Output",     "Output" },
+		{ 19, "Input / IO", "InputIO" },
+		{ 23, "Utility",    "Utility" },
 		};
 		constexpr int num_groups = sizeof(sidebar_groups) / sizeof(sidebar_groups[0]);
 		int next_group = 0;
@@ -2392,7 +2559,7 @@ void run_gui()
 			return gg;
 		};
 		auto panel_matches_filter = [&](int idx) -> bool {
-			return !has_filter || icontains(categories[idx].category, sidebar_filter);
+			return gui_panel_available(idx) && (!has_filter || icontains(categories[idx].category, sidebar_filter));
 		};
 		auto panel_visible_for_nav = [&](int idx) -> bool {
 			if (idx < 0 || idx >= total_panels)
@@ -2426,7 +2593,10 @@ void run_gui()
 			return indices;
 		};
 
-		// Keyboard navigation (when filter box is not focused)
+		// Keyboard navigation (when filter box is not focused). On Android the
+		// sidebar rows take part in ImGui's own D-pad/gamepad cursor instead
+		// (see render_sidebar_row), which would otherwise be a second cursor.
+#ifndef __ANDROID__
 		if (!ImGui::GetIO().WantTextInput) {
 			const std::vector<int> visible_indices = build_visible_indices();
 			const auto current = std::find(visible_indices.begin(), visible_indices.end(), last_active_panel);
@@ -2446,6 +2616,7 @@ void run_gui()
 				}
 			}
 		}
+#endif
 
 		auto render_sidebar_row = [&](const int i) {
 			ImGui::Indent(6.0f);
@@ -2453,9 +2624,29 @@ void run_gui()
 			ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
 			ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
 			ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+#ifdef __ANDROID__
+			ImGui::PushItemFlag(ImGuiItemFlags_NoNav, sidebar_entry_only && !selected);
+#endif
 			if (ImGui::Selectable( (std::string("##cat_") + std::to_string(i)).c_str(), selected, 0, ImVec2(ImGui::GetContentRegionAvail().x, row_h))) {
 				last_active_panel = i;
 			}
+#ifdef __ANDROID__
+			ImGui::PopItemFlag();
+			if (focus_open_page_row && selected) {
+				// Takes the cursor this frame, so a later item that still holds
+				// it (the page item Left was pressed on) cannot keep it.
+				const bool cursor_was_visible = ImGui::GetCurrentContext()->NavCursorVisible;
+				ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
+				// Show the cursor at once unless a finger is the likely input.
+				if (cursor_was_visible || SDL_IsTV()
+					|| !(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_IsTouchScreen))
+					ImGui::SetNavCursorVisible(true);
+				focus_open_page_row = false;
+			}
+			// Moving the cursor along the sidebar opens each page in turn.
+			if (!selected && ImGui::IsItemFocused() && ImGui::GetIO().NavVisible)
+				last_active_panel = i;
+#endif
 			ImGui::PopStyleColor(3);
 			const bool item_hovered = ImGui::IsItemHovered();
 			ImVec2 sel_min = ImGui::GetItemRectMin();
@@ -2602,16 +2793,25 @@ void run_gui()
 			}
 		}
 		ImGui::Unindent(4.0f);
+#ifdef __ANDROID__
+		ImGui::PopItemFlag();
+#endif
 		ImGui::EndChild();
 		// Draw Sidebar bevel (outside child to avoid clipping)
 		const ImVec2 min = ImGui::GetItemRectMin();
 		const ImVec2 max = ImGui::GetItemRectMax();
 		AmigaBevel(ImVec2(min.x - 1, min.y - 1), ImVec2(max.x + 1, max.y + 1), false);
 
-		ImGui::SameLine();
-
-		{
+		if (!narrow_layout) {
+			ImGui::SameLine();
+#ifdef __ANDROID__
+			// The D-pad cursor skips the drag handle.
+			ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+#endif
 			ImGui::InvisibleButton("##splitter", ImVec2(splitter_thickness, content_height));
+#ifdef __ANDROID__
+			ImGui::PopItemFlag();
+#endif
 			const bool splitter_hovered = ImGui::IsItemHovered();
 			const bool splitter_active = ImGui::IsItemActive();
 
@@ -2641,12 +2841,24 @@ void run_gui()
 			sdl->AddLine(
 				ImVec2(cx, smin.y + 4.0f), ImVec2(cx, smax.y - 4.0f),
 				grip_col, 2.0f);
+
+			ImGui::SameLine();
+		} else {
+			// The pages are laid out for landscape; some of their rows clip at this width.
+			ImGui::TextDisabled("Rotate to landscape for full pages");
 		}
 
-		ImGui::SameLine();
-
 		// Content
-		ImGui::BeginChild("Content", ImVec2(0, -button_bar_height));
+		ImGui::BeginChild("Content", ImVec2(0, -button_bar_height), nav_child_flags);
+#ifdef __ANDROID__
+		content_window = ImGui::GetCurrentWindow();
+		if (focus_page_first_item) {
+			// Picks the page's first navigable item, without activating it.
+			ImGui::SetNavWindow(content_window);
+			ImGui::NavInitWindow(content_window, true);
+			focus_page_first_item = false;
+		}
+#endif
 
 		// Render the currently active panel
 		if (last_active_panel >= 0 && categories[last_active_panel].category != nullptr) {
@@ -2661,54 +2873,98 @@ void run_gui()
 		ImGui::Dummy(ImVec2(0, 2.0f));
 
 		// Button bar
-		// Left-aligned buttons (Shutdown, Reboot, Quit, Reload, Help)
-		if (!amiberry_options.disable_shutdown_button) {
-			if (AmigaButton(ICON_FA_POWER_OFF " Shutdown", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
+		// Left-aligned buttons (Shutdown, Reboot, Quit, Stop/Reload), then Start/Resume and Help on the right
+		enum class footer_action { none, shutdown, reboot, quit, reload };
+		auto run_footer_action = [&](const footer_action action) {
+			switch (action) {
+			case footer_action::shutdown:
 				uae_quit();
 				gui_running = false;
 				host_poweroff = true;
+				break;
+			case footer_action::reboot:
+				uae_reset(1, 1);
+				gui_running = false;
+				break;
+			case footer_action::quit:
+				uae_quit();
+				gui_running = false;
+				break;
+			case footer_action::reload: {
+				char tmp[MAX_DPATH] = {0};
+				if (!rp9_get_loaded_path().empty()) {
+					strncpy(tmp, rp9_get_loaded_path().c_str(), MAX_DPATH - 1);
+				} else {
+					get_configuration_path(tmp, sizeof tmp);
+					if (strlen(last_loaded_config) > 0) {
+						strncat(tmp, last_loaded_config, MAX_DPATH - 1);
+						strncat(tmp, ".uae", MAX_DPATH - 10);
+					} else {
+						strncat(tmp, OPTIONSFILENAME, MAX_DPATH - 1);
+						strncat(tmp, ".uae", MAX_DPATH - 10);
+					}
+				}
+				uae_restart(&changed_prefs, -1, tmp);
+				gui_running = false;
+				break;
 			}
-			if (ImGui::IsItemHovered())
+			case footer_action::none:
+				break;
+			}
+		};
+#ifdef __ANDROID__
+		// A remote's OK presses whatever has the cursor, so these ask first,
+		// and the cursor's "hover" puts no tooltip over their labels.
+		static footer_action footer_confirm = footer_action::none;
+		const auto footer_pressed = [](const footer_action action) { footer_confirm = action; };
+		constexpr ImGuiHoveredFlags footer_tooltip_flags = ImGuiHoveredFlags_NoNavOverride;
+#else
+		const auto& footer_pressed = run_footer_action;
+		constexpr ImGuiHoveredFlags footer_tooltip_flags = ImGuiHoveredFlags_None;
+#endif
+		// Shutdown runs "sudo poweroff", which cannot work on macOS/iOS
+		// (no poweroff command, no terminal for sudo), so it is never offered there.
+#ifdef __APPLE__
+		constexpr bool show_shutdown = false;
+#else
+		const bool show_shutdown = !amiberry_options.disable_shutdown_button;
+#endif
+		ImVec2 footer_button(BUTTON_WIDTH, BUTTON_HEIGHT);
+		if (narrow_layout) {
+			// The left-hand buttons share the first row; Start/Resume and Help go below.
+			const float left_count = show_shutdown ? 4.0f : 3.0f;
+			footer_button.x = std::min(BUTTON_WIDTH,
+				(ImGui::GetContentRegionAvail().x - style.ItemSpacing.x * (left_count - 1.0f)) / left_count);
+		}
+		if (show_shutdown) {
+			if (AmigaButton(ICON_FA_POWER_OFF " Shutdown", footer_button))
+				footer_pressed(footer_action::shutdown);
+			if (ImGui::IsItemHovered(footer_tooltip_flags))
 				ImGui::SetTooltip("Shut down the host system");
 			ImGui::SameLine();
 		}
-		if (AmigaButton(ICON_FA_ROTATE_RIGHT " Reboot", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
-			uae_reset(1, 1);
-			gui_running = false;
-		}
-		if (ImGui::IsItemHovered())
+		if (AmigaButton(ICON_FA_ROTATE_RIGHT " Reboot", footer_button))
+			footer_pressed(footer_action::reboot);
+		if (ImGui::IsItemHovered(footer_tooltip_flags))
 			ImGui::SetTooltip("Cold reset the emulated Amiga");
 		ImGui::SameLine();
-		if (AmigaButton(ICON_FA_RIGHT_FROM_BRACKET " Quit", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
-			uae_quit();
-			gui_running = false;
-		}
-		if (ImGui::IsItemHovered())
+		if (AmigaButton(ICON_FA_RIGHT_FROM_BRACKET " Quit", footer_button))
+			footer_pressed(footer_action::quit);
+		if (ImGui::IsItemHovered(footer_tooltip_flags))
 			ImGui::SetTooltip("Exit Amiberry");
 		ImGui::SameLine();
-		if (AmigaButton(ICON_FA_ARROWS_ROTATE " Reload", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
-			char tmp[MAX_DPATH] = {0};
-			if (!rp9_get_loaded_path().empty()) {
-				strncpy(tmp, rp9_get_loaded_path().c_str(), MAX_DPATH - 1);
-			} else {
-				get_configuration_path(tmp, sizeof tmp);
-				if (strlen(last_loaded_config) > 0) {
-					strncat(tmp, last_loaded_config, MAX_DPATH - 1);
-					strncat(tmp, ".uae", MAX_DPATH - 10);
-				} else {
-					strncat(tmp, OPTIONSFILENAME, MAX_DPATH - 1);
-					strncat(tmp, ".uae", MAX_DPATH - 10);
-				}
-			}
-			uae_restart(&changed_prefs, -1, tmp);
-			gui_running = false;
-		}
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Reload current configuration and restart emulation");
+		// Stop and Reload are one action: the reload always stops a running emulation.
+		if (AmigaButton(emulating ? ICON_FA_STOP " Stop" : ICON_FA_ARROWS_ROTATE " Reload", footer_button))
+			footer_pressed(footer_action::reload);
+		if (ImGui::IsItemHovered(footer_tooltip_flags))
+			ImGui::SetTooltip(emulating
+				? "Stop emulation and reload the configuration from disk. Unsaved changes are lost."
+				: "Reload the configuration from disk. Unsaved changes are lost.");
 
 		// Right-aligned buttons
-		float right_buttons_width = (BUTTON_WIDTH * 2) + style.ItemSpacing.x;
-		ImGui::SameLine();
+		float right_buttons_width = (footer_button.x * 2) + style.ItemSpacing.x;
+		if (!narrow_layout)
+			ImGui::SameLine();
 		float cursor_x = ImGui::GetWindowWidth() - right_buttons_width - style.WindowPadding.x;
 		if (cursor_x < ImGui::GetCursorPosX()) cursor_x = ImGui::GetCursorPosX(); // Prevent overlap
 		ImGui::SetCursorPosX(cursor_x);
@@ -2720,11 +2976,11 @@ void run_gui()
 		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, lighten(ImGui::GetStyle().Colors[ImGuiCol_TitleBgActive], 0.05f));
 		ImGui::PushStyleColor(ImGuiCol_ButtonActive, lighten(ImGui::GetStyle().Colors[ImGuiCol_TitleBgActive], 0.10f));
 		if (emulating) {
-			if (AmigaButton(ICON_FA_PLAY " Resume", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
+			if (AmigaButton(ICON_FA_PLAY " Resume", footer_button)) {
 				gui_running = false;
 			}
 		} else {
-			if (AmigaButton(ICON_FA_PLAY " Start", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
+			if (AmigaButton(ICON_FA_PLAY " Start", footer_button)) {
 				gui_start_from_current_config();
 			}
 		}
@@ -2733,13 +2989,65 @@ void run_gui()
 		if (start_disabled)
 			ImGui::EndDisabled();
 		ImGui::SameLine();
-		if (AmigaButton(ICON_FA_CIRCLE_QUESTION " Help", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
+		if (AmigaButton(ICON_FA_CIRCLE_QUESTION " Help", footer_button)) {
 			const char* help_ptr = nullptr;
 			if (last_active_panel >= 0 && categories[last_active_panel].category != nullptr && categories[last_active_panel].HelpText != nullptr)
 				help_ptr = categories[last_active_panel].HelpText;
 			if (help_ptr && *help_ptr)
 				ShowMessageBox("Help", help_ptr);
 		}
+
+#ifdef __ANDROID__
+		if (footer_confirm != footer_action::none) {
+			const char* title = "Quit###footer_confirm";
+			const char* question = emulating ? "Stop the emulation and return to the launcher?"
+				: "Return to the launcher?";
+			const char* confirm_label = ICON_FA_RIGHT_FROM_BRACKET " Quit";
+			switch (footer_confirm) {
+			case footer_action::shutdown:
+				title = "Shut down###footer_confirm";
+				question = "Shut down this device?";
+				confirm_label = ICON_FA_POWER_OFF " Shut down";
+				break;
+			case footer_action::reboot:
+				title = "Reboot###footer_confirm";
+				question = "Reset the emulated Amiga?";
+				confirm_label = ICON_FA_ROTATE_RIGHT " Reboot";
+				break;
+			case footer_action::reload:
+				title = emulating ? "Stop###footer_confirm" : "Reload###footer_confirm";
+				question = emulating ? "Stop emulation and reload the configuration?\nUnsaved changes are lost."
+					: "Reload the configuration?\nUnsaved changes are lost.";
+				confirm_label = emulating ? ICON_FA_STOP " Stop" : ICON_FA_ARROWS_ROTATE " Reload";
+				break;
+			default:
+				break;
+			}
+			if (!ImGui::IsPopupOpen("###footer_confirm"))
+				ImGui::OpenPopup("###footer_confirm");
+			ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+			if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize
+				| ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings)) {
+				ImGui::TextUnformatted(question);
+				ImGui::Spacing();
+				// Escape, Back or a gamepad's B cancels, as Cancel does.
+				bool answered = AmigaButton(ICON_FA_XMARK " Cancel", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))
+					|| ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight);
+				// Cancel takes the cursor, so a second stray OK changes nothing.
+				ImGui::SetItemDefaultFocus();
+				ImGui::SameLine();
+				if (AmigaButton(confirm_label, ImVec2(BUTTON_WIDTH * 1.2f, BUTTON_HEIGHT))) {
+					run_footer_action(footer_confirm);
+					answered = true;
+				}
+				if (answered) {
+					footer_confirm = footer_action::none;
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::EndPopup();
+			}
+		}
+#endif
 
 		if (show_message_box) {
 			// Size short notices to their content while keeping long help and error text scrollable.
@@ -2826,7 +3134,7 @@ void run_gui()
 			ImGui::Spacing();
 			if (!legacy_cleanup_error_message.empty())
 			{
-				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.10f, 0.10f, 1.0f));
+				ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 				ImGui::TextWrapped("%s", legacy_cleanup_error_message.c_str());
 				ImGui::PopStyleColor();
 				ImGui::Spacing();
@@ -2963,10 +3271,31 @@ void run_gui()
 
 		ImGui::End();
 
+		// Runtime requests, such as replacing a missing floppy referenced by a
+		// restored state, must be rendered independently of the active panel.
+		FloppyRecoveryDialog_Render();
+		MediaRequestDialog_Render();
+
 		// Pop touch-scrolling hover suppression colors
 		if (touch_scrolling) {
 			ImGui::PopStyleColor(3);
 		}
+
+#ifdef __ANDROID__
+		{
+			// A Left/Right press whose scoring found nothing this frame: cross
+			// between the sidebar and the page here (see focus_open_page_row).
+			const ImGuiContext& g = *ImGui::GetCurrentContext();
+			const bool move_found_nothing = g.NavMoveScoringItems
+				&& !(g.NavMoveFlags & ImGuiNavMoveFlags_IsTabbing)
+				&& g.NavMoveResultLocal.ID == 0 && g.NavMoveResultOther.ID == 0;
+			if (move_found_nothing && g.NavMoveDir == ImGuiDir_Right && g.NavWindow == sidebar_window)
+				focus_page_first_item = true;
+			else if (move_found_nothing && g.NavMoveDir == ImGuiDir_Left && g.NavWindow == content_window)
+				focus_open_page_row = true;
+		}
+		draw_nav_ring();
+#endif
 
 		// Rendering
 		ImGui::Render();
@@ -3018,6 +3347,7 @@ void run_gui()
 		}
 	}
 
+	MediaRequestDialog_Reset();
 	amiberry_gui_halt();
 
 	// Reset counter for access violations

@@ -23,10 +23,22 @@
 struct crtemu_t;
 class ShaderPreset;
 
+// GL runtime identity captured at context creation. Cached as strings so
+// diagnostics (About panel, support reports) can show them without a
+// current GL context.
+struct GLRuntimeInfo {
+	std::string vendor;      // GL_VENDOR
+	std::string renderer;    // GL_RENDERER
+	std::string version;     // GL_VERSION
+	std::string glsl_version; // GL_SHADING_LANGUAGE_VERSION
+	bool valid = false;
+};
+
 struct ShaderParameterCache {
 	std::string shader_name;
 	std::vector<ShaderParameter> parameters;
 };
+
 
 // Shader lifecycle and caching state (owned by OpenGLRenderer)
 struct ShaderState {
@@ -45,6 +57,15 @@ struct ShaderState {
 	GLuint resolve_texture = 0;
 	int resolve_width = 0;
 	int resolve_height = 0;
+};
+
+// What the external shader path last uploaded into, so a frame of the same
+// size only updates the texture; reset with the shaders and the context.
+struct ExternalUploadCache {
+	GLuint program = 0;
+	int width = 0;
+	int height = 0;
+	GLuint texture = 0;
 };
 
 // OpenGL overlay resources: OSD, bezel, software cursor (owned by OpenGLRenderer)
@@ -139,6 +160,12 @@ public:
 	// Access the GL context for ImGui GUI integration
 	SDL_GLContext get_gl_context() const;
 
+	// GL runtime info captured at context creation (GL_RENDERER /
+	// GL_VERSION / GL_SHADING_LANGUAGE_VERSION). Cached as strings so the
+	// About panel and diagnostics can show them without a current GL
+	// context. vendor is GL_VENDOR.
+	const GLRuntimeInfo& get_gl_runtime_info() const { return m_gl_info; }
+
 	// Access shader state for filter.cpp parameter editing
 	ShaderState& shader_state();
 	const ShaderState& shader_state() const;
@@ -156,9 +183,13 @@ public:
 private:
 	SDL_GLContext m_gl_context = nullptr;
 	ShaderState m_shader;
+	ExternalUploadCache m_external_upload;
 	GLOverlayState m_overlay;
 	bool m_integer_scaling = false; // Integer scaling for native Amiga modes (scaling_method == 2)
 	bool m_stretch_to_fill = false; // Fill the render area, ignoring aspect (scaling_method == 3)
+
+	// GL identity captured at context creation (About panel / diagnostics)
+	GLRuntimeInfo m_gl_info;
 
 	// Cached GL pixel format info (resolved once from pixel_format, reused per frame)
 	struct GLFormatInfo {
@@ -175,7 +206,7 @@ private:
 	void restore_shader_parameters(const char* shader_name, bool rtg);
 	bool ensure_shader_resolve_target(int width, int height);
 	void destroy_shader_resolve_target();
-	void render_shader_resolve(int x, int y, int width, int height);
+	void render_shader_resolve(int x, int y, int width, int height, GLuint target_framebuffer);
 	void update_texture_filter(GLenum texture_filter);
 
 	// Private helper for external shader rendering
@@ -183,6 +214,41 @@ private:
 		const uae_u8* pixels, int width, int height, int pitch,
 		int viewport_x, int viewport_y, int viewport_width, int viewport_height,
 		GLuint target_framebuffer);
+	// Zero-copy MiniGL display: composite the plugin's exported frame.
+	bool render_minigl_dmabuf(const int viewport_x, const int viewport_y,
+		const int viewport_width, const int viewport_height, const GLuint target_framebuffer);
+
+	// Imported dma-buf state for the MiniGL zero-copy path.
+	void destroy_minigl_import();
+	bool m_minigl_probed = false;  // per context: rebuilds must re-publish capability
+	bool m_minigl_importer_ref = false;  // this instance holds a registry reference
+	GLuint m_minigl_texture = 0;
+	void* m_minigl_egl_display = nullptr;
+	void* m_minigl_egl_image = nullptr;  // EGLImageKHR
+	uint64_t m_minigl_seq = 0;
+	uint64_t m_minigl_failed_seq = 0;  // import rejected: never retried, never logged twice
+
+	// Native frames from a dma-buf backed surface (dmabuf_surface.h): the GPU
+	// samples the CPU-written pixels directly instead of a per-frame upload.
+	// begin returns the texture holding the presented rectangle (0 = use
+	// uploads); end submits the GPU read, and the next frame writer reclaims
+	// the pixels before writing.
+	GLuint begin_dmabuf_frame(SDL_Surface* surface, int x, int y, int width, int height);
+	void end_dmabuf_frame(SDL_Surface* surface);
+	bool import_frame_image(const struct DmabufSurfaceInfo* info);
+	bool ensure_frame_copy_target(int width, int height);
+	void copy_frame_rect(const SDL_Rect& rect, int surface_width, int surface_height);
+	void destroy_frame_image();
+	void destroy_frame_import();
+	void* m_frame_egl_display = nullptr;
+	void* m_frame_egl_image = nullptr;  // EGLImageKHR over the surface's dma-buf
+	GLuint m_frame_import_texture = 0;
+	GLuint m_frame_texture = 0;  // GPU copy of a cropped presentation area
+	GLuint m_frame_fbo = 0;
+	int m_frame_texture_w = 0;
+	int m_frame_texture_h = 0;
+	uint64_t m_frame_generation = 0;  // DmabufSurfaceInfo::generation of the live import
+	uint64_t m_frame_failed_generation = 0;  // import rejected: never retried, never logged twice
 };
 
 // Helper to get the OpenGL renderer from the global g_renderer.

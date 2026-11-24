@@ -3,6 +3,39 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         ${CMAKE_SOURCE_DIR}/controllers
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/controllers)
 
+# The privacy manifest the Mac App Store requires.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_SOURCE_DIR}/packaging/PrivacyInfo.xcprivacy
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/PrivacyInfo.xcprivacy)
+
+# Third-party licences and the GPL source offer. The offer is generated at
+# build time (always-run target, rewritten only when it changes) so it names
+# the revision this binary was built from even when HEAD moved without a
+# reconfigure; the bundle copy is its own always-run target so it also
+# refreshes when the executable does not relink. Both run before the
+# POST_BUILD codesign because the app target depends on them.
+set(AMIBERRY_LICENCES_DIR $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/licences)
+# Computed here, not through $<BOOL:${VERSION_PRE_RELEASE}>: a non-numeric
+# pre-release string ("beta1") would make that generator expression false.
+if(VERSION_PRE_RELEASE)
+    set(AMIBERRY_PRERELEASE_FLAG 1)
+else()
+    set(AMIBERRY_PRERELEASE_FLAG 0)
+endif()
+add_custom_target(amiberry_licences_offer
+        COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR=${CMAKE_SOURCE_DIR}
+        -DOUT_FILE=${CMAKE_BINARY_DIR}/amiberry-source-offer.json
+        -DAMIBERRY_PRODUCT_VERSION=${AMIBERRY_PRODUCT_VERSION}
+        -DPRERELEASE=${AMIBERRY_PRERELEASE_FLAG}
+        -DAMIBERRY_DISTRIBUTION=${AMIBERRY_DISTRIBUTION}
+        -P ${CMAKE_SOURCE_DIR}/cmake/SourceOffer.cmake
+        VERBATIM)
+# The bundle copy target is defined after the codesign settings below: when
+# its copy changes a signed bundle it re-signs in the same step, so it needs
+# the codesign identity and entitlements.
+
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/data
@@ -18,30 +51,59 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         ${CMAKE_SOURCE_DIR}/whdboot
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/whdboot)
 
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:CAPSImage>
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/$<TARGET_FILE_NAME:CAPSImage>)
+# CAPSImage's licence is non-commercial: Mac App Store builds (a paid app)
+# leave the IPF plugin out.
+if(NOT MACOS_APP_STORE)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:CAPSImage>
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/$<TARGET_FILE_NAME:CAPSImage>)
+endif()
+
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:floppybridge>
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/$<TARGET_FILE_NAME:floppybridge>)
 
-set(_amiberry_dylibbundler_search_args
-        -s /usr/local/lib
-        -s /usr/local/opt/glib/lib
-        -s /usr/local/opt/gettext/lib
-        -s /usr/local/opt/pcre2/lib
-        -s /opt/homebrew/lib
-        -s /opt/homebrew/opt/glib/lib
-        -s /opt/homebrew/opt/gettext/lib
-        -s /opt/homebrew/opt/pcre2/lib)
+# Search paths used by dylibbundler, chosen per architecture so Homebrew and
+# MacPorts libraries are not mixed. Homebrew wins when both are installed;
+# /opt/local/lib is the MacPorts location.
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    if(EXISTS "/opt/homebrew")
+        # Apple Silicon: prefer Homebrew.
+        set(_amiberry_dylibbundler_search_args
+            -s /opt/homebrew/lib
+            -s /opt/homebrew/opt/glib/lib
+            -s /opt/homebrew/opt/gettext/lib
+            -s /opt/homebrew/opt/pcre2/lib)
+    elseif(EXISTS "/opt/local")
+        # Apple Silicon: fall back to MacPorts.
+        set(_amiberry_dylibbundler_search_args
+            -s /opt/local/lib)
+    else()
+        set(_amiberry_dylibbundler_search_args)
+    endif()
+else()
+    # Intel Macs.
+    if(EXISTS "/usr/local/Cellar")
+        set(_amiberry_dylibbundler_search_args
+            -s /usr/local/lib
+            -s /usr/local/opt/glib/lib
+            -s /usr/local/opt/gettext/lib
+            -s /usr/local/opt/pcre2/lib)
+    elseif(EXISTS "/opt/local")
+        set(_amiberry_dylibbundler_search_args
+            -s /opt/local/lib)
+    else()
+        set(_amiberry_dylibbundler_search_args)
+    endif()
+endif()
 
 if(QEMU_UAE_PLUGIN)
     get_filename_component(_amiberry_qemu_uae_plugin_name "${QEMU_UAE_PLUGIN}" NAME)
     set(_amiberry_qemu_uae_plugin_output
             "$<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/${_amiberry_qemu_uae_plugin_name}")
-
     set(_amiberry_qemu_uae_plugin_arches ${CMAKE_OSX_ARCHITECTURES})
     if(NOT _amiberry_qemu_uae_plugin_arches)
         set(_amiberry_qemu_uae_plugin_arches "${CMAKE_SYSTEM_PROCESSOR}")
@@ -66,19 +128,42 @@ if(QEMU_UAE_PLUGIN)
             VERBATIM)
 endif()
 
-# Gather all dependencies with dylibbundler
+# Gather all dependencies with dylibbundler.
+#
+# Use @rpath instead of @executable_path/../Frameworks.
+#
+# This is important because many system/package-manager dylibs do not
+# have enough Mach-O header padding to accommodate the much longer
+# @executable_path/../Frameworks/... install names.
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND dylibbundler -od -b -x $<TARGET_FILE:${PROJECT_NAME}> -d $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Frameworks/ -p @executable_path/../Frameworks/ ${_amiberry_dylibbundler_search_args})
+        COMMAND dylibbundler
+            -od
+            -b
+            -x $<TARGET_FILE:${PROJECT_NAME}>
+            -d $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Frameworks/
+            -p @rpath/
+            ${_amiberry_dylibbundler_search_args})
 
 if(QEMU_UAE_PLUGIN)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND dylibbundler -of -cd -b -x "${_amiberry_qemu_uae_plugin_output}" -d $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Frameworks/ -p @executable_path/../Frameworks/ ${_amiberry_dylibbundler_search_args}
+            COMMAND dylibbundler
+                -of
+                -cd
+                -b
+                -x "${_amiberry_qemu_uae_plugin_output}"
+                -d $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Frameworks/
+                -p @rpath/
+                ${_amiberry_dylibbundler_search_args}
             COMMENT "Bundling QEMU-UAE PPC plugin dependencies"
             VERBATIM)
 endif()
 
+# Ensure the application has exactly one Frameworks rpath.
+# The rpath points to Contents/Frameworks.
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -DAPP_BINARY=$<TARGET_FILE:${PROJECT_NAME}> -P ${CMAKE_SOURCE_DIR}/cmake/macos/dedupe_frameworks_rpath.cmake)
+        COMMAND ${CMAKE_COMMAND}
+            -DAPP_BINARY=$<TARGET_FILE:${PROJECT_NAME}>
+            -P ${CMAKE_SOURCE_DIR}/cmake/macos/dedupe_frameworks_rpath.cmake)
 
 # Codesign local/intermediate bundles after dylibbundler and install_name_tool
 # have finished mutating load commands. CI re-signs the final universal bundle
@@ -86,16 +171,22 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 option(MACOS_CODESIGN_BUNDLE
     "Codesign local/intermediate macOS app bundles after copying dependencies"
     ON)
+
 string(CONCAT _amiberry_codesign_identity_help
     "Code signing identity for local/intermediate macOS bundles "
     "(empty for non-App Store ad-hoc, '-' for explicit ad-hoc, "
     "or 'Developer ID Application: Name (TEAMID)')")
+
 set(MACOS_CODESIGN_IDENTITY "" CACHE STRING "${_amiberry_codesign_identity_help}")
+
 string(CONCAT _amiberry_codesign_options_help
     "Additional codesign --options value for local/intermediate macOS bundles (for example: runtime,hard)")
+
 set(MACOS_CODESIGN_OPTIONS "" CACHE STRING "${_amiberry_codesign_options_help}")
+
 if(MACOS_CODESIGN_BUNDLE)
     find_program(CODESIGN_EXECUTABLE codesign)
+
     if(NOT CODESIGN_EXECUTABLE)
         message(FATAL_ERROR
             "codesign executable not found; "
@@ -111,6 +202,7 @@ if(MACOS_CODESIGN_BUNDLE)
     endif()
 
     set(_amiberry_codesign_identity "${MACOS_CODESIGN_IDENTITY}")
+
     if(_amiberry_codesign_identity STREQUAL "")
         set(_amiberry_codesign_identity "-")
     endif()
@@ -125,13 +217,50 @@ if(MACOS_CODESIGN_BUNDLE)
             -P "${CMAKE_SOURCE_DIR}/cmake/macos/codesign_bundle.cmake"
         COMMENT "Codesigning Amiberry app bundle"
         VERBATIM)
+
+    # The licences bundle copy. It runs even when the executable does not
+    # relink (so the POST_BUILD codesign above can be skipped while the
+    # signed bundle changed) and re-signs through the same script whenever
+    # its copy actually changed something.
+    add_custom_target(amiberry_licences_bundle ALL
+        COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR=${CMAKE_SOURCE_DIR}/packaging/licences
+        -DDEST_DIR=${AMIBERRY_LICENCES_DIR}
+        -DDISTRIBUTION=${AMIBERRY_DISTRIBUTION}
+        -DOFFER_FILE=${CMAKE_BINARY_DIR}/amiberry-source-offer.json
+        -DCODESIGN_HELPER=${CMAKE_SOURCE_DIR}/cmake/macos/codesign_bundle.cmake
+        -DCODESIGN_APP=$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>
+        -DCODESIGN_EXECUTABLE=${CODESIGN_EXECUTABLE}
+        -DCODESIGN_IDENTITY=${_amiberry_codesign_identity}
+        -DCODESIGN_OPTIONS=${MACOS_CODESIGN_OPTIONS}
+        -DCODESIGN_ENTITLEMENTS=${AMIBERRY_ENTITLEMENTS}
+        -P ${CMAKE_SOURCE_DIR}/cmake/LicencesBundle.cmake
+        VERBATIM)
+    add_dependencies(amiberry_licences_bundle amiberry_licences_offer)
+    add_dependencies(${PROJECT_NAME} amiberry_licences_bundle)
+else()
+    # Signing disabled: the same bundle step without the re-sign arguments.
+    add_custom_target(amiberry_licences_bundle ALL
+        COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR=${CMAKE_SOURCE_DIR}/packaging/licences
+        -DDEST_DIR=${AMIBERRY_LICENCES_DIR}
+        -DDISTRIBUTION=${AMIBERRY_DISTRIBUTION}
+        -DOFFER_FILE=${CMAKE_BINARY_DIR}/amiberry-source-offer.json
+        -P ${CMAKE_SOURCE_DIR}/cmake/LicencesBundle.cmake
+        VERBATIM)
+    add_dependencies(amiberry_licences_bundle amiberry_licences_offer)
+    add_dependencies(${PROJECT_NAME} amiberry_licences_bundle)
 endif()
 
 if (NOT "${CMAKE_GENERATOR}" MATCHES "Xcode")
-    install(FILES $<TARGET_FILE:CAPSImage>
-            DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/)
+    if(NOT MACOS_APP_STORE)
+        install(FILES $<TARGET_FILE:CAPSImage>
+                DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/)
+    endif()
+
     install(FILES $<TARGET_FILE:floppybridge>
             DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/)
+
     if(QEMU_UAE_PLUGIN)
         install(FILES "${_amiberry_qemu_uae_plugin_output}"
                 DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources/plugins/)
@@ -141,14 +270,17 @@ if (NOT "${CMAKE_GENERATOR}" MATCHES "Xcode")
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/controllers
             DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources
             ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
+
     # This one contains the data files
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/data
             DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources
             ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
+
     # This one contains the AROS kickstart files
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/roms
             DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources
             ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
+
     # This one contains the whdboot files
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/whdboot
             DESTINATION $<TARGET_FILE_DIR:${PROJECT_NAME}>/../Resources

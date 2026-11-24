@@ -1,8 +1,10 @@
 package com.blitterstudio.amiberry.data
 
 import android.content.Context
-import com.blitterstudio.amiberry.data.model.StoragePaths
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
+import com.blitterstudio.amiberry.data.model.LauncherChoices
+import com.blitterstudio.amiberry.data.model.SettingsSchema
+import com.blitterstudio.amiberry.data.model.installedMemory
 import java.io.File
 import java.io.IOException
 
@@ -10,25 +12,56 @@ data class ConfigInfo(
 	val path: String,
 	val name: String,
 	val lastModified: Long,
-	val description: String
+	val description: String,
+	/** The group the file declares itself part of (config_category); the Library filters by it. */
+	val category: String = "",
+	/** The machine the configuration describes, for its card; null when the file could not be read. */
+	val machine: ConfigMachine? = null
 )
+
+/**
+ * What a configuration's card says about its machine: the model, the CPU, the RAM
+ * it fits in total and the first medium it inserts ("DF0: Lost Pixel.adf"), if any.
+ */
+data class ConfigMachine(val model: String, val cpu: Int, val memoryKb: Int, val firstMedium: String?) {
+	companion object {
+		fun of(settings: EmulatorSettings, schema: SettingsSchema? = SettingsSchema.current): ConfigMachine {
+			val media = listOf(
+				"DF0" to settings.floppy0,
+				"DF1" to settings.floppy1,
+				"CD" to settings.cdImage
+			) + settings.hardDrives.map { "HD" to it.path.trimEnd('/', '\\') }
+			val firstMedium = media.firstNotNullOfOrNull { (drive, path) ->
+				LauncherChoices.fileName(path).takeIf { it.isNotBlank() }?.let { "$drive: $it" }
+			}
+			return ConfigMachine(
+				model = settings.baseModel.displayName,
+				cpu = settings.cpuModel,
+				memoryKb = schema?.let { installedMemory(settings, it).sumOf { memory -> memory.kb } } ?: 0,
+				firstMedium = firstMedium
+			)
+		}
+	}
+}
 
 class ConfigRepository(private val context: Context) {
 
 	private val confDir: File
-		get() = File(context.getExternalFilesDir(null), StoragePaths.CONFIGURATIONS).also {
+		get() = ContentFolders.configurationsDir(context).also {
 			if (!it.exists()) it.mkdirs()
 		}
 
 	fun listConfigs(): List<ConfigInfo> {
 		return ConfigFiles.listUserConfigFiles(confDir)
 			.map { file ->
-				val parsed = ConfigParser.parse(file)
+				val parsed = runCatching { ConfigParser.parse(file) }.getOrNull()
 				ConfigInfo(
 					path = file.absolutePath,
 					name = file.nameWithoutExtension,
 					lastModified = file.lastModified(),
-					description = parsed.description
+					description = parsed?.description.orEmpty(),
+					category = parsed?.category.orEmpty(),
+					machine = parsed?.let { ConfigMachine.of(it.settings) }
 				)
 			}
 			.sortedByDescending { it.lastModified }
@@ -42,8 +75,8 @@ class ConfigRepository(private val context: Context) {
 		return ConfigSettingsResolver.parse(File(path), globalSettingsFile)
 	}
 
-	fun saveConfig(settings: EmulatorSettings, name: String, unknownLines: List<String> = emptyList(), description: String = ""): File? {
-		return when (val result = saveConfigResult(settings, name, unknownLines, description)) {
+	fun saveConfig(settings: EmulatorSettings, name: String, unknownLines: List<String> = emptyList(), description: String = "", category: String = ""): File? {
+		return when (val result = saveConfigResult(settings, name, unknownLines, description, category)) {
 			is ConfigurationSaveActions.SaveResult.Saved -> result.file
 			ConfigurationSaveActions.SaveResult.AlreadyExists,
 			ConfigurationSaveActions.SaveResult.Failed,
@@ -55,14 +88,15 @@ class ConfigRepository(private val context: Context) {
 		settings: EmulatorSettings,
 		name: String,
 		unknownLines: List<String> = emptyList(),
-		description: String = ""
+		description: String = "",
+		category: String = ""
 	): ConfigurationSaveActions.SaveResult {
 		val target = when (val saveTarget = ConfigurationSaveActions.targetForName(confDir, name)) {
 			is ConfigurationSaveActions.SaveTarget.Ready -> saveTarget.file
 			ConfigurationSaveActions.SaveTarget.InvalidName -> return ConfigurationSaveActions.SaveResult.InvalidName
 			ConfigurationSaveActions.SaveTarget.AlreadyExists -> return ConfigurationSaveActions.SaveResult.AlreadyExists
 		}
-		return writeConfigFile(target, settings, unknownLines, description)
+		return writeConfigFile(target, settings, unknownLines, description, category)
 	}
 
 	/**
@@ -73,12 +107,13 @@ class ConfigRepository(private val context: Context) {
 	fun saveResolved(
 		settings: EmulatorSettings,
 		requestedName: String,
-		currentConfigName: String?,
+		currentConfigPath: String?,
 		unknownLines: List<String> = emptyList(),
 		description: String = "",
+		category: String = "",
 		allowOverwrite: Boolean = false
 	): ConfigurationSaveActions.SaveResult {
-		val target = when (val resolution = ConfigSaveResolver.resolve(confDir, requestedName, currentConfigName)) {
+		val target = when (val resolution = ConfigSaveResolver.resolve(confDir, requestedName, currentConfigPath)) {
 			ConfigSaveResolver.Resolution.InvalidName -> return ConfigurationSaveActions.SaveResult.InvalidName
 			is ConfigSaveResolver.Resolution.WriteNew -> resolution.file
 			is ConfigSaveResolver.Resolution.OverwriteTracked -> resolution.file
@@ -86,7 +121,7 @@ class ConfigRepository(private val context: Context) {
 				if (allowOverwrite) resolution.file
 				else return ConfigurationSaveActions.SaveResult.AlreadyExists
 		}
-		return writeConfigFile(target, settings, unknownLines, description)
+		return writeConfigFile(target, settings, unknownLines, description, category)
 	}
 
 	/**
@@ -98,27 +133,33 @@ class ConfigRepository(private val context: Context) {
 		path: String,
 		settings: EmulatorSettings,
 		unknownLines: List<String> = emptyList(),
-		description: String = ""
+		description: String = "",
+		category: String = ""
 	): ConfigurationSaveActions.SaveResult {
 		val target = ConfigFiles.userConfigFile(confDir, path)
 			?: return ConfigurationSaveActions.SaveResult.InvalidName
-		return writeConfigFile(target, settings, unknownLines, description)
+		return writeConfigFile(target, settings, unknownLines, description, category)
 	}
 
 	private fun writeConfigFile(
 		target: File,
 		settings: EmulatorSettings,
 		unknownLines: List<String>,
-		description: String
+		description: String,
+		category: String
 	): ConfigurationSaveActions.SaveResult {
 		return try {
 			target.writeText(ConfigGenerator.generate(settings))
 			if (description.isNotBlank()) {
 				target.appendText("config_description=$description\n")
 			}
-			if (unknownLines.isNotEmpty()) {
+			if (category.isNotBlank()) {
+				target.appendText("config_category=$category\n")
+			}
+			val preserved = ConfigGenerator.preservedLines(settings, unknownLines)
+			if (preserved.isNotEmpty()) {
 				target.appendText("\n; Preserved settings from original config\n")
-				unknownLines.forEach { target.appendText("$it\n") }
+				preserved.forEach { target.appendText("$it\n") }
 			}
 			ConfigurationSaveActions.SaveResult.Saved(target)
 		} catch (_: IOException) {
@@ -138,11 +179,11 @@ class ConfigRepository(private val context: Context) {
 		return ConfigFiles.deleteConfig(confDir, path)
 	}
 
-	fun renameConfig(path: String, newName: String): File? {
+	fun renameConfig(path: String, newName: String): ConfigFiles.EditResult {
 		return ConfigFiles.renameConfig(confDir, path, newName)
 	}
 
-	fun duplicateConfig(path: String, newName: String): File? {
+	fun duplicateConfig(path: String, newName: String): ConfigFiles.EditResult {
 		return ConfigFiles.duplicateConfig(confDir, path, newName)
 	}
 

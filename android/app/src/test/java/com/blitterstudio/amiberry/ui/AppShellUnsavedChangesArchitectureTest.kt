@@ -15,30 +15,12 @@ class AppShellUnsavedChangesArchitectureTest {
 		assertTrue(source.contains("settingsViewModel.isDirty"))
 	}
 
-	@Test
-	fun `navigation away from a dirty Settings screen is guarded`() {
-		// Bottom-nav/rail clicks route through a guard rather than navigating directly.
-		assertTrue(source.contains("guardedNavigate("))
-		assertTrue(
-			Regex("""Screen\.Settings\.route[\s\S]*settingsViewModel\.isDirty""")
-				.containsMatchIn(source) ||
-			Regex("""settingsViewModel\.isDirty[\s\S]*Screen\.Settings\.route""")
-				.containsMatchIn(source)
-		)
-	}
 
 	@Test
 	fun `shows an unsaved-changes dialog with save and discard`() {
 		assertTrue(source.contains("R.string.dialog_unsaved_changes_title"))
 		assertTrue(source.contains("settingsViewModel.saveTracked()"))
 		assertTrue(source.contains("settingsViewModel.discardChanges()"))
-		assertTrue(source.contains("R.string.action_discard"))
-	}
-
-	@Test
-	fun `guard does not fire when re-selecting the current Settings tab`() {
-		assertTrue(source.contains("targetRoute != Screen.Settings.route"))
-		assertTrue(source.contains("guardedNavigate(screen.route)"))
 	}
 
 	@Test

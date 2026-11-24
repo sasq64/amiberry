@@ -2,7 +2,7 @@
  * compiler/codegen_arm.cpp - AARCH64 code generator
  *
  * Copyright (c) 2019 TomB
- * 
+ *
  * This file is part of the UAE4ARM project.
  *
  * JIT compiler m68k -> ARMv8.0
@@ -109,7 +109,7 @@ STATIC_INLINE void SIGNED8_IMM_2_REG(W4 r, IM8 v) {
 	if (v16 & 0x8000) {
 		// Use 32-bit MOVN to keep upper 32 bits clean.
 		// MOVN_xi produces a 64-bit result with dirty upper bits for negative values
-		// (e.g., MOVN_xi for byte -1 → 0xFFFFFFFFFFFFFFFF).
+		// (e.g., MOVN_xi for byte -1 -> 0xFFFFFFFFFFFFFFFF).
 		MOVN_wi(r, (uae_u16) ~v16);
 	} else {
 		MOV_wi(r, (uae_u16) v16);
@@ -137,7 +137,7 @@ STATIC_INLINE void UNSIGNED8_REG_2_REG(W4 d, RR4 s) {
 STATIC_INLINE void SIGNED8_REG_2_REG(W4 d, RR4 s) {
 	// Use 32-bit sign extension to keep upper 32 bits clean.
 	// SXTB_xx sign-extends to 64 bits, leaving dirty upper 32 bits
-	// for negative values (e.g., SXTB_xx of 0xFF → 0xFFFFFFFFFFFFFFFF).
+	// for negative values (e.g., SXTB_xx of 0xFF -> 0xFFFFFFFFFFFFFFFF).
 	SXTB_ww(d, s);
 }
 
@@ -148,7 +148,7 @@ STATIC_INLINE void UNSIGNED16_REG_2_REG(W4 d, RR4 s) {
 STATIC_INLINE void SIGNED16_REG_2_REG(W4 d, RR4 s) {
 	// Use 32-bit sign extension to keep upper 32 bits clean.
 	// SXTH_xx sign-extends to 64 bits, leaving dirty upper 32 bits
-	// for negative values (e.g., SXTH_xx of 0xFFFF → 0xFFFFFFFFFFFFFFFF).
+	// for negative values (e.g., SXTH_xx of 0xFFFF -> 0xFFFFFFFFFFFFFFFF).
 	SXTH_ww(d, s);
 }
 
@@ -243,18 +243,38 @@ LENDFUNC(WRITE,READ,1,compemu_raw_cmp_pc,(IMPTR s))
 
 STATIC_INLINE void compemu_raw_store_pc_state_from_work1(void)
 {
-	uintptr idx = (uintptr)&regs.pc_p - (uintptr)&regs;
-	STR_xXi(REG_WORK1, R_REGSTRUCT, idx);
-	idx = (uintptr)&regs.pc_oldp - (uintptr)&regs;
-	STR_xXi(REG_WORK1, R_REGSTRUCT, idx);
+	uintptr idx;
 
 #ifdef NATMEM_OFFSET
+	uae_u32 *branchadd = NULL;
+	uae_u32 *branchdone = NULL;
+	idx = (uintptr)&regs.pc_oldp - (uintptr)&regs;
+
+	LOAD_U64(REG_WORK2, (uintptr)&canbang);
+	LDRB_wXi(REG_WORK2, REG_WORK2, 0);
+	CBZ_wi(REG_WORK2, 0);
+	branchadd = (uae_u32 *)get_target() - 1;
 	SUB_xxx(REG_WORK2, REG_WORK1, R_MEMSTART);
+	B_i(0);
+	branchdone = (uae_u32 *)get_target() - 1;
+
+	write_jmp_target(branchadd, (uintptr)get_target());
+	LDR_xXi(REG_WORK2, R_REGSTRUCT, idx);
+	SUB_xxx(REG_WORK2, REG_WORK1, REG_WORK2);
 	idx = (uintptr)&regs.pc - (uintptr)&regs;
+	LDR_wXi(REG_WORK3, R_REGSTRUCT, idx);
+	ADD_www(REG_WORK2, REG_WORK3, REG_WORK2);
+
+	write_jmp_target(branchdone, (uintptr)get_target());
 	STR_wXi(REG_WORK2, R_REGSTRUCT, idx);
 	idx = (uintptr)&regs.instruction_pc - (uintptr)&regs;
 	STR_wXi(REG_WORK2, R_REGSTRUCT, idx);
 #endif
+
+	idx = (uintptr)&regs.pc_p - (uintptr)&regs;
+	STR_xXi(REG_WORK1, R_REGSTRUCT, idx);
+	idx = (uintptr)&regs.pc_oldp - (uintptr)&regs;
+	STR_xXi(REG_WORK1, R_REGSTRUCT, idx);
 }
 
 LOWFUNC(NONE,WRITE,1,compemu_raw_set_pc_i,(IMPTR s))
@@ -276,7 +296,7 @@ LOWFUNC(NONE,WRITE,2,compemu_raw_mov_l_mi,(MEMW d, IMPTR s))
 		LOAD_U32(REG_WORK2, (uae_u32)s);
 		STR_wXi(REG_WORK2, R_REGSTRUCT, idx);
 	} else {
-		// Address too far from R_REGSTRUCT — use absolute address.
+		// Address too far from R_REGSTRUCT - use absolute address.
 		LOAD_U64(REG_WORK1, d);
 		LOAD_U32(REG_WORK2, (uae_u32)s);
 		STR_wXi(REG_WORK2, REG_WORK1, 0);
@@ -294,7 +314,7 @@ LOWFUNC(NONE,WRITE,2,compemu_raw_mov_l_mr,(MEMW d, RR4 s))
 		// globals like regflags that the linker places close by).
 		STR_wXi(s, R_REGSTRUCT, idx);
 	} else {
-		// Address too far from R_REGSTRUCT — use absolute address.
+		// Address too far from R_REGSTRUCT - use absolute address.
 		LOAD_U64(REG_WORK1, d);
 		STR_wXi(s, REG_WORK1, 0);
 	}
@@ -316,7 +336,7 @@ LOWFUNC(NONE,READ,2,compemu_raw_mov_l_rm,(W4 d, MEMR s))
 		// Within R_REGSTRUCT unsigned-offset range.
 		LDR_wXi(d, R_REGSTRUCT, idx);
 	} else {
-		// Address too far from R_REGSTRUCT — use absolute address.
+		// Address too far from R_REGSTRUCT - use absolute address.
 		LOAD_U64(REG_WORK1, s);
 		LDR_wXi(d, REG_WORK1, 0);
 	}
@@ -344,20 +364,119 @@ LOWFUNC(WRITE,RMW,1,compemu_raw_dec_m,(MEMRW d))
 }
 LENDFUNC(WRITE,RMW,1,compemu_raw_dec_m,(MEMRW ds))
 
+#define FPU_JIT_HOST_FPSR_OFFS ((int)offsetof(struct regstruct, fpu_jit_host_fpsr))
+#define FPU_JIT_HOST_STATE_OFFS ((int)offsetof(struct regstruct, fpu_jit_host_state))
+static_assert(offsetof(struct regstruct, fpu_jit_host_state) < 16384,
+	"fpu_jit_host_state is in reach of LDR w, [x28, #imm]");
+
+/* regs.fpu_jit_host_fpsr |= host FPSR: the exceptions compiled host FPU code
+   raised since an FPU block was entered or last called C code. x9-x10
+   (caller-saved, neither arguments nor call targets here) */
+STATIC_INLINE void compemu_raw_fpsr_collect(void)
+{
+	MRS_FPSR_x(9);
+	LDR_wXi(10, R_REGSTRUCT, FPU_JIT_HOST_FPSR_OFFS);
+	ORR_www(10, 10, 9);
+	STR_wXi(10, R_REGSTRUCT, FPU_JIT_HOST_FPSR_OFFS);
+}
+
+/* if live (regs.fpu_jit_host_state bit 0) { clear it; collect } - code
+   without host FPU instructions is about to run C code, which may clear the
+   host FPSR or add its own exceptions. x9-x11 */
+STATIC_INLINE void compemu_raw_fpsr_settle(void)
+{
+	LDR_wXi(11, R_REGSTRUCT, FPU_JIT_HOST_STATE_OFFS);
+	uae_u32* branchadd = (uae_u32*)get_target();
+	TBZ_wii(11, 0, 0);
+	SUB_wwi(11, 11, 1);
+	STR_wXi(11, R_REGSTRUCT, FPU_JIT_HOST_STATE_OFFS);
+	compemu_raw_fpsr_collect();
+	write_jmp_target(branchadd, (uintptr)get_target());
+}
+
+/* Entry of a block with host FPU instructions compiled for FPU JIT mode
+   <mode> (-1: any mode, no FPCR check): the hot path is one compare of
+   regs.fpu_jit_host_state with live in that mode, and the rest is out of line
+   (compemu_raw_fpu_enter_stub()). Unless the host FPSR still holds the
+   uncollected exceptions of compiled FPU code, it holds those of C code, which
+   do not count: clear it. Entered with an FPCR of another mode, recompile
+   the block. Leaves NZCV alone. */
+STATIC_INLINE uae_u32* compemu_raw_fpu_enter(int mode)
+{
+	LDR_wXi(REG_WORK1, R_REGSTRUCT, FPU_JIT_HOST_STATE_OFFS);
+	uae_u32* branchadd;
+	if (mode < 0) {
+		UBFX_wwii(REG_WORK2, REG_WORK1, 0, 1);
+		branchadd = (uae_u32*)get_target();
+		CBZ_wi(REG_WORK2, 0);
+	} else {
+		SUB_wwi(REG_WORK2, REG_WORK1, mode * 2 + 1);
+		branchadd = (uae_u32*)get_target();
+		CBNZ_wi(REG_WORK2, 0);
+	}
+	return branchadd;
+}
+
+STATIC_INLINE void compemu_raw_fpu_enter_stub(uae_u32* branch, uae_u32* resume, int mode, uintptr pc)
+{
+	write_jmp_target(branch, (uintptr)get_target());
+	uae_u32* branch_mode = NULL;
+	if (mode >= 0) {
+		ADD_wwi(REG_WORK2, REG_WORK2, 1);	// zero: in the mode, not live
+		branch_mode = (uae_u32*)get_target();
+		CBNZ_wi(REG_WORK2, 0);
+	}
+	MSR_FPSR_x(31);
+	MOV_wi(REG_WORK2, 1);
+	ORR_www(REG_WORK1, REG_WORK1, REG_WORK2);
+	STR_wXi(REG_WORK1, R_REGSTRUCT, FPU_JIT_HOST_STATE_OFFS);
+	uae_u32* branchadd = (uae_u32*)get_target();
+	B_i(0);
+	write_jmp_target(branchadd, (uintptr)resume);
+	if (branch_mode) {
+		write_jmp_target(branch_mode, (uintptr)get_target());
+		compemu_raw_set_pc_i(pc);
+		branchadd = (uae_u32*)get_target();
+		B_i(0);
+		write_jmp_target(branchadd, (uintptr)popall_fpu_mode_recompile);
+	}
+}
+
+/* C code must not clear the exceptions of compiled host FPU code (the host
+   FPU core's fp_clear_status()), nor add its own to them. A block without
+   host FPU instructions only settles those of the blocks that ran before. */
+STATIC_INLINE void compemu_raw_call_fpsr_before(void)
+{
+	if (jit_fpu_host_flags)
+		compemu_raw_fpsr_collect();
+	else if (jit_fpu_host_settle)
+		compemu_raw_fpsr_settle();
+}
+
+STATIC_INLINE void compemu_raw_call_fpsr_after(void)
+{
+	if (jit_fpu_host_flags)
+		MSR_FPSR_x(31);
+}
+
 STATIC_INLINE void compemu_raw_call(uintptr t)
 {
+	compemu_raw_call_fpsr_before();
 	LOAD_U64(REG_WORK1, t);
 
 	STR_xXpre(RLR_INDEX, RSP_INDEX, -16);
 	BLR_x(REG_WORK1);
 	LDR_xXpost(RLR_INDEX, RSP_INDEX, 16);
+	compemu_raw_call_fpsr_after();
 }
 
 STATIC_INLINE void compemu_raw_call_r(RR4 r)
 {
+	compemu_raw_call_fpsr_before();
 	STR_xXpre(RLR_INDEX, RSP_INDEX, -16);
 	BLR_x(r);
 	LDR_xXpost(RLR_INDEX, RSP_INDEX, 16);
+	compemu_raw_call_fpsr_after();
 }
 
 STATIC_INLINE void compemu_raw_jcc_l_oponly(int cc)
@@ -858,6 +977,22 @@ LOWFUNC(NONE,NONE,2,raw_fsub_rr,(FRW d, FR s))
 	FSUB_ddd(d, d, s);
 }
 LENDFUNC(NONE,NONE,2,raw_fsub_rr,(FRW d, FR s))
+// FCMP: r = d - s, but equal infinities compare equal although their
+// difference is NaN. They give a zero with the sign of d instead.
+LOWFUNC(NONE,NONE,3,raw_fcmp_result_rrr,(FW r, FR d, FR s))
+{
+	FSUB_ddd(r, d, s);
+	FCMP_dd(r, r);
+	BVC_i(7);		// result is a number
+	FCMP_dd(d, s);
+	BNE_i(5);		// not equal or unordered
+	FMOV_xd(REG_WORK1, d);
+	LSR_xxi(REG_WORK1, REG_WORK1, 63);
+	LSL_xxi(REG_WORK1, REG_WORK1, 63);
+	FMOV_dx(r, REG_WORK1);
+}
+LENDFUNC(NONE,NONE,3,raw_fcmp_result_rrr,(FW r, FR d, FR s))
+
 
 LOWFUNC(NONE,NONE,2,raw_frndint_rr,(FW d, FR s))
 {
@@ -870,14 +1005,6 @@ LOWFUNC(NONE,NONE,2,raw_frndintz_rr,(FW d, FR s))
 	FRINTZ_dd(d, s);
 }
 LENDFUNC(NONE,NONE,2,raw_frndintz_rr,(FW d, FR s))
-
-LOWFUNC(NONE,NONE,2,raw_fmod_rr,(FRW d, FR s))
-{
-	FDIV_ddd(SCRATCH_F64_1, d, s);
-	FRINTZ_dd(SCRATCH_F64_1, SCRATCH_F64_1);
-	FMSUB_dddd(d, SCRATCH_F64_1, s, d);
-}
-LENDFUNC(NONE,NONE,2,raw_fmod_rr,(FRW d, FR s))
 
 LOWFUNC(NONE,NONE,2,raw_fsgldiv_rr,(FRW d, FR s))
 {
@@ -894,14 +1021,6 @@ LOWFUNC(NONE,NONE,1,raw_fcuts_r,(FRW r))
 	FCVT_ds(r, SCRATCH_F64_1);
 }
 LENDFUNC(NONE,NONE,1,raw_fcuts_r,(FRW r))
-
-LOWFUNC(NONE,NONE,2,raw_frem1_rr,(FRW d, FR s))
-{
-	FDIV_ddd(SCRATCH_F64_2, d, s);
-	FRINTA_dd(SCRATCH_F64_2, SCRATCH_F64_2);
-	FMSUB_dddd(d, SCRATCH_F64_2, s, d);
-}
-LENDFUNC(NONE,NONE,2,raw_frem1_rr,(FRW d, FR s))
 
 LOWFUNC(NONE,NONE,2,raw_fsglmul_rr,(FRW d, FR s))
 {
@@ -977,7 +1096,7 @@ LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
 	ORR_xxxLSLi(REG_WORK2, REG_WORK3, REG_WORK2, 16); // merge sign and exponent
 
 	REV32_xx(REG_WORK2, REG_WORK2);
-	STRH_wXi(REG_WORK2, REG_WORK4, 0);         	// write exponent
+	STR_wXi(REG_WORK2, REG_WORK4, 0);         	// write exponent and the zero padding word
 	ADD_xxi(REG_WORK4, REG_WORK4, 4);
 
 	LSL_xxi(REG_WORK1, REG_WORK1, 11);          // shift mantissa to correct position
@@ -987,10 +1106,15 @@ LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
 	uae_u32* branchadd_end = (uae_u32*)get_target();
 	B_i(0);            // end_of_op
 
-	// isnan
+	// isnan or infinity: keep the sign, mantissa all ones for NaN, zero for infinity
 	write_jmp_target(branchadd_isnan, (uintptr)get_target());
-	MOV_xish(REG_WORK1, 0x7fff, 16);
-	MOVN_xi(REG_WORK2, 0);
+	LSL_xxi(REG_WORK2, REG_WORK1, 12);          // fraction
+	CMP_xi(REG_WORK2, 0);
+	CSETM_wc(REG_WORK2, NATIVE_CC_NE);
+	UBFX_xxii(REG_WORK1, REG_WORK1, 63, 1);     // extract sign
+	LSL_xxi(REG_WORK1, REG_WORK1, 31);
+	MOV_xish(REG_WORK3, 0x7fff, 16);
+	ORR_xxx(REG_WORK1, REG_WORK1, REG_WORK3);
 	B_i(4);
 
 	// iszero
@@ -1010,47 +1134,170 @@ LENDFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
 
 LOWFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
 {
+	/* Rounded once, in the FPCR rounding mode, after the sign is applied.
+	 * The mantissa is normalised: value = M * 2^K, M in [2^63, 2^64).
+	 * Normal result: SCVTF rounds M to a double (the low bit made sticky as
+	 * one bit is shifted out to fit a signed integer) and the scale 2^(K+1)
+	 * is applied exactly in two multiplications; k is clamped where the
+	 * result overflows whatever its exact value is.
+	 * Denormal result (value < 2^-1022): the multiple N of 2^-1074 below it
+	 * and two rounding bits (the second one sticky) are formed in integers,
+	 * and N_even * 2^-1074 + (N & 1, rounding bits) * 2^-1076 is rounded by
+	 * one fused multiply-add. */
 	ADD_xxx(REG_WORK3, adr, R_MEMSTART);
 
 	ADD_xxi(REG_WORK1, REG_WORK3, 4);
 	LDR_xXi(REG_WORK1, REG_WORK1, 0);
-	CLEAR_xxbit(REG_WORK1, REG_WORK1, 7); 	// clear explicit 1
-	REV_xx(REG_WORK1, REG_WORK1);
+	REV_xx(REG_WORK1, REG_WORK1);				// mantissa with the explicit bit
 
 	LDRH_wXi(REG_WORK4, REG_WORK3, 0);
-	REV16_xx(REG_WORK4, REG_WORK4);				// exponent now in lower half
+	REV16_xx(REG_WORK4, REG_WORK4);				// sign and exponent
 
 	ANDS_xx7fff(REG_WORK2, REG_WORK4);
-	uae_u32* branchadd_notzero = (uae_u32*)get_target();
-	BNE_i(0);				// not_zero
 
-	uae_u32* branchadd_notzero2 = (uae_u32*)get_target();
-	CBNZ_xi(REG_WORK1, 0);          // not zero
+	/* exact in a double (as FMOVEM.X saved it): normalised, the low 11 bits of
+	   the mantissa zero and the exponent in the range of normal doubles */
+	UBFX_xxii(REG_WORK3, REG_WORK1, 0, 11);
+	uae_u32* branch_inexact = (uae_u32*)get_target();
+	CBNZ_xi(REG_WORK3, 0);
+	uae_u32* branch_unnormal = (uae_u32*)get_target();
+	TBZ_xii(REG_WORK1, 63, 0);
+	MOV_xi(REG_WORK3, 15361);
+	SUB_xxx(REG_WORK3, REG_WORK2, REG_WORK3);
+	CMP_xi(REG_WORK3, 2045);
+	uae_u32* branch_range = (uae_u32*)get_target();
+	BHI_i(0);
+	ADD_xxi(REG_WORK3, REG_WORK3, 1);			// double exponent
+	UBFX_xxii(REG_WORK1, REG_WORK1, 11, 52);	// fraction
+	BFI_xxii(REG_WORK1, REG_WORK3, 52, 11);
+	UBFX_xxii(REG_WORK3, REG_WORK4, 15, 1);
+	BFI_xxii(REG_WORK1, REG_WORK3, 63, 1);
+	FMOV_dx(d, REG_WORK1);
+	uae_u32* branch_end5 = (uae_u32*)get_target();
+	B_i(0);
 
-	// zero
+	write_jmp_target(branch_inexact, (uintptr)get_target());
+	write_jmp_target(branch_unnormal, (uintptr)get_target());
+	write_jmp_target(branch_range, (uintptr)get_target());
+	MOV_xi(REG_WORK3, 0x7fff);
+	CMP_xx(REG_WORK2, REG_WORK3);
+	uae_u32* branch_special = (uae_u32*)get_target();
+	BEQ_i(0);				// infinity or NaN
+	uae_u32* branch_zero = (uae_u32*)get_target();
+	CBZ_xi(REG_WORK1, 0);			// zero mantissa
+
+	MOV_xi(REG_WORK3, 1);
+	CMP_xi(REG_WORK2, 1);
+	CSEL_xxxc(REG_WORK2, REG_WORK2, REG_WORK3, NATIVE_CC_CS);	// denormals have exponent 1
+	CLZ_xx(REG_WORK3, REG_WORK1);
+	LSL_xxx(REG_WORK1, REG_WORK1, REG_WORK3);	// M
+	SUB_xxx(REG_WORK2, REG_WORK2, REG_WORK3);
+	MOV_xi(REG_WORK3, 16446);
+	SUB_xxx(REG_WORK2, REG_WORK2, REG_WORK3);	// K
+	MOV_xi(REG_WORK3, 1086);
+	NEG_xx(REG_WORK3, REG_WORK3);
+	CMP_xx(REG_WORK2, REG_WORK3);
+	uae_u32* branch_denormal = (uae_u32*)get_target();
+	BLE_i(0);				// value < 2^-1022
+
+	UBFX_xxii(REG_WORK3, REG_WORK1, 0, 1);
+	LSR_xxi(REG_WORK1, REG_WORK1, 1);
+	ORR_xxx(REG_WORK1, REG_WORK1, REG_WORK3);	// M >> 1, sticky
+	uae_u32* branch_positive = (uae_u32*)get_target();
+	TBZ_xii(REG_WORK4, 15, 0);
+	NEG_xx(REG_WORK1, REG_WORK1);
+	write_jmp_target(branch_positive, (uintptr)get_target());
+
+	ADD_xxi(REG_WORK2, REG_WORK2, 1);			// k
+	MOV_xi(REG_WORK3, 2000);
+	CMP_xx(REG_WORK2, REG_WORK3);
+	CSEL_xxxc(REG_WORK2, REG_WORK2, REG_WORK3, NATIVE_CC_LE);
+	ASR_xxi(REG_WORK3, REG_WORK2, 1);			// k1
+	SUB_xxx(REG_WORK2, REG_WORK2, REG_WORK3);	// k2
+
+	SCVTF_dx(d, REG_WORK1);
+	ADD_xxi(REG_WORK3, REG_WORK3, 1023);
+	LSL_xxi(REG_WORK3, REG_WORK3, 52);
+	FMOV_dx(SCRATCH_F64_1, REG_WORK3);
+	FMUL_ddd(d, d, SCRATCH_F64_1);
+	ADD_xxi(REG_WORK2, REG_WORK2, 1023);
+	LSL_xxi(REG_WORK2, REG_WORK2, 52);
+	FMOV_dx(SCRATCH_F64_1, REG_WORK2);
+	FMUL_ddd(d, d, SCRATCH_F64_1);
+	uae_u32* branch_end = (uae_u32*)get_target();
+	B_i(0);
+
+	// denormal or zero result: s = -(K + 1074) bits below the last place
+	write_jmp_target(branch_denormal, (uintptr)get_target());
+	ADD_xxi(REG_WORK2, REG_WORK2, 1074);
+	NEG_xx(REG_WORK2, REG_WORK2);				// s >= 12
+	MOV_xi(REG_WORK3, 65);
+	CMP_xx(REG_WORK2, REG_WORK3);
+	CSEL_xxxc(REG_WORK2, REG_WORK2, REG_WORK3, NATIVE_CC_LE);	// below half the last place either way
+	MOV_xi(REG_WORK3, 66);
+	SUB_xxx(REG_WORK3, REG_WORK3, REG_WORK2);
+	LSL_xxx(REG_WORK3, REG_WORK1, REG_WORK3);
+	CMP_xi(REG_WORK3, 0);
+	CSET_xc(REG_WORK3, NATIVE_CC_NE);			// sticky: bits below s - 2
+	SUB_xxi(REG_WORK4, REG_WORK2, 2);
+	LSR_xxx(REG_WORK4, REG_WORK1, REG_WORK4);
+	UBFX_xxii(REG_WORK4, REG_WORK4, 0, 2);
+	ORR_xxx(REG_WORK4, REG_WORK4, REG_WORK3);	// rounding bits
+	LSR_xxx(REG_WORK3, REG_WORK1, REG_WORK2);
+	CMP_xi(REG_WORK2, 64);
+	CSEL_xxxc(REG_WORK3, REG_WORK3, 31, NATIVE_CC_LT);	// N
+	UBFX_xxii(REG_WORK1, REG_WORK3, 0, 1);
+	ORR_xxxLSLi(REG_WORK4, REG_WORK4, REG_WORK1, 2);	// N & 1, rounding bits
+	LSR_xxi(REG_WORK3, REG_WORK3, 1);
+	LSL_xxi(REG_WORK3, REG_WORK3, 1);			// N_even
+	ADD_xxx(REG_WORK1, adr, R_MEMSTART);
+	LDRB_wXi(REG_WORK1, REG_WORK1, 0);
+	uae_u32* branch_dpositive = (uae_u32*)get_target();
+	TBZ_xii(REG_WORK1, 7, 0);
+	NEG_xx(REG_WORK3, REG_WORK3);
+	NEG_xx(REG_WORK4, REG_WORK4);
+	write_jmp_target(branch_dpositive, (uintptr)get_target());
+
+	SCVTF_dx(d, REG_WORK3);
+	MOV_xish(REG_WORK1, 0x1E60, 48);			// 2^-537
+	FMOV_dx(SCRATCH_F64_1, REG_WORK1);
+	FMUL_ddd(d, d, SCRATCH_F64_1);
+	FMUL_ddd(d, d, SCRATCH_F64_1);				// N_even * 2^-1074, exact
+	SCVTF_dx(SCRATCH_F64_2, REG_WORK4);
+	MOV_xish(REG_WORK1, 0x1E50, 48);			// 2^-538
+	FMOV_dx(SCRATCH_F64_1, REG_WORK1);
+	FMUL_ddd(SCRATCH_F64_2, SCRATCH_F64_2, SCRATCH_F64_1);
+	FMADD_dddd(d, SCRATCH_F64_2, SCRATCH_F64_1, d);	// the only rounding
+	uae_u32* branch_end4 = (uae_u32*)get_target();
+	B_i(0);
+
+	// zero, keeping the sign
+	write_jmp_target(branch_zero, (uintptr)get_target());
 	MOVI_di(d, 0);
-	uae_u32* branchadd_end = (uae_u32*)get_target();
-	TBZ_xii(REG_WORK4, 15, 0); // end_of_op
+	uae_u32* branch_end2 = (uae_u32*)get_target();
+	TBZ_xii(REG_WORK4, 15, 0);
 	MOV_xish(REG_WORK1, 0x8000, 48);
 	FMOV_dx(d, REG_WORK1);
-	uae_u32* branchadd_end2 = (uae_u32*)get_target();
-	B_i(0);					// end_of_op
+	uae_u32* branch_end3 = (uae_u32*)get_target();
+	B_i(0);
 
-	// not_zero
-	write_jmp_target(branchadd_notzero, (uintptr)get_target());
-	write_jmp_target(branchadd_notzero2, (uintptr)get_target());
-	MOV_xi(REG_WORK3, 15360);                 // diff of bias between double and long double
-	SUB_xxx(REG_WORK2, REG_WORK2, REG_WORK3);	// exponent done, ToDo: check for carry -> result gets Inf in double
+	// infinity, or NaN if the fraction is not zero
+	write_jmp_target(branch_special, (uintptr)get_target());
+	LSL_xxi(REG_WORK1, REG_WORK1, 1);			// without the explicit bit
+	MOV_xish(REG_WORK3, 0x7ff0, 48);
+	uae_u32* branch_inf = (uae_u32*)get_target();
+	CBZ_xi(REG_WORK1, 0);
+	MOV_xish(REG_WORK3, 0x7ff8, 48);			// NaN
+	write_jmp_target(branch_inf, (uintptr)get_target());
 	UBFX_xxii(REG_WORK4, REG_WORK4, 15, 1);		// extract sign
-	BFI_xxii(REG_WORK2, REG_WORK4, 11, 1);		// insert sign
-	LSR_xxi(REG_WORK1, REG_WORK1, 11);				// shift mantissa to correct position
-	LSL_xxi(REG_WORK2, REG_WORK2, 52);
-	ORR_xxx(REG_WORK1, REG_WORK1, REG_WORK2);
-	FMOV_dx(d, REG_WORK1);
+	ORR_xxxLSLi(REG_WORK3, REG_WORK3, REG_WORK4, 63);
+	FMOV_dx(d, REG_WORK3);
 
-	// end_of_op
-	write_jmp_target(branchadd_end, (uintptr)get_target());
-	write_jmp_target(branchadd_end2, (uintptr)get_target());
+	write_jmp_target(branch_end, (uintptr)get_target());
+	write_jmp_target(branch_end2, (uintptr)get_target());
+	write_jmp_target(branch_end3, (uintptr)get_target());
+	write_jmp_target(branch_end4, (uintptr)get_target());
+	write_jmp_target(branch_end5, (uintptr)get_target());
 }
 LENDFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
 
@@ -1073,11 +1320,16 @@ STATIC_INLINE void raw_fflags_into_flags(int r)
 	FCMP_d0(r);
 }
 
+
 LOWFUNC(NONE,NONE,2,raw_fp_fscc_ri,(RW4 d, int cc))
 {
 	switch (cc) {
 		case NATIVE_CC_F_NEVER:
 			CLEAR_LOW8_xx(d, d);
+			break;
+
+		case NATIVE_CC_AL: // FST/ST: always set (emitted nothing before)
+			SET_LOW8_xx(d, d);
 			break;
 
 		case NATIVE_CC_NE: // Set if not equal

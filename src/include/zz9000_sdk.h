@@ -1,0 +1,166 @@
+/*
+ * ZZ9000 SDK v2 mailbox subset used by installed AmigaOS clients.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+#ifndef AMIBERRY_ZZ9000_SDK_H
+#define AMIBERRY_ZZ9000_SDK_H
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace zz9000_sdk {
+
+class ConsoleEncoder;
+
+class Engine {
+public:
+	Engine(uint8_t *board_memory, uint32_t board_size);
+	Engine(uint8_t *io_memory, uint8_t *vram_memory, uint32_t board_size);
+	~Engine();
+	void reset();
+	// Primary CLUT shadow for QUERY_PALETTE (0x0205). The RTG driver calls
+	// this when it writes a primary entry, and again for all 256 entries
+	// after reset(), which clears the table. The index is masked to 256
+	// entries, as the card's sdk_palette_set() does.
+	void set_palette_entry(uint32_t index, uint8_t red, uint8_t green,
+	                       uint8_t blue);
+	bool poll(); // True when a visible framebuffer or PIP frame changed.
+	uint16_t read_register(uint32_t offset) const;
+	bool write_register(uint32_t offset, uint16_t value);
+	// Offsets are within board_memory, including the 64 KiB register aperture.
+	// Presentation-path facts reported on media status page 4, mirroring the
+	// card's overlay_path_info: the PIP source and destination geometry plus
+	// the screen mode it was configured against.
+	struct OverlayGeometry {
+		int32_t dst_x = 0, dst_y = 0;
+		int32_t dst_w = 0, dst_h = 0;
+		uint32_t screen_w = 0, screen_h = 0;
+	};
+	void set_framebuffer(uint32_t offset, uint32_t width, uint32_t height,
+	                     uint32_t pitch, uint32_t format);
+	void set_overlay(uint32_t offset, uint32_t width, uint32_t height,
+	                 uint32_t pitch, uint32_t variant, bool configured,
+	                 bool active, const OverlayGeometry &geometry);
+	uint8_t *buffer_data(uint32_t handle);
+	uint32_t buffer_length(uint32_t handle) const;
+
+
+private:
+	struct Buffer {
+		uint32_t handle = 0;
+		uint32_t board_offset = 0;
+		uint32_t length = 0;
+		uint32_t flags = 0;
+		uint16_t owner = 0; // The client that allocated it (CLIENT_RELEASE).
+		// Card-only storage, shared so a session that resolved it keeps
+		// valid storage after the guest frees the buffer, like the card's
+		// cached ring addresses.
+		std::shared_ptr<std::vector<uint8_t>> card_only;
+	};
+	struct Audio;
+	struct Image;
+	struct Media;
+	struct Surface {
+		uint32_t handle = 0;
+		uint16_t owner = 0; // The client that allocated it (CLIENT_RELEASE).
+		uint32_t width = 0, height = 0, pitch = 0, format = 0;
+		uint32_t flags = 0; // As reported: CPU_VISIBLE (1) or ARM_LOCAL (16).
+		// CPU-visible surfaces live in board memory, like the card's
+		// surface_allocator, so the guest reads and writes them through
+		// the Zorro window; ARM-local ones keep host-only storage.
+		uint32_t board_offset = 0;
+		uint32_t length = 0;
+		std::vector<uint8_t> pixels;
+	};
+	struct Framebuffer {
+		uint32_t offset = 0, width = 0, height = 0, pitch = 0, format = 0;
+	};
+
+	static constexpr uint32_t memory_base = 0x10000;
+	uint8_t *io_memory_;
+	uint8_t *vram_memory_;
+	uint32_t board_size_;
+	// Board offset and ring length of the mailbox; see the placement
+	// constants in zz9000_sdk_internal.h.
+	uint32_t mailbox_offset_;
+	uint32_t ring_entries_;
+	bool aperture_acked_ = false;
+	std::array<Buffer, 16> buffers_{};
+	uint32_t next_handle_ = 1;
+	uint16_t last_status_ = 0;
+	uint16_t client_id_ = 0; // The entry being dispatched's client id.
+	// The card runs SDK_MAX_AUDIO_STREAMS (4) concurrent audio stream
+	// sessions, keyed by session id; a fifth BEGIN/BEGIN_EX answers
+	// NO_MEMORY. One session at a time may be bound to playback (PLAY).
+	std::array<std::unique_ptr<Audio>, 4> audios_{};
+	uint32_t audio_playing_session_ = 0;
+	uint32_t next_audio_session_ = 1;
+	std::unique_ptr<Image> image_;
+	uint32_t next_image_session_ = 1;
+	std::unique_ptr<Media> media_;
+	uint32_t next_media_session_ = 1;
+	std::unique_ptr<ConsoleEncoder> console_;
+	struct Overlay {
+		uint32_t offset = 0, width = 0, height = 0, pitch = 0, variant = 0;
+		int32_t dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+		uint32_t screen_w = 0, screen_h = 0;
+		uint32_t presenting_session = 0;
+		bool configured = false;
+		bool active = false;
+	} overlay_{};
+	std::array<Surface, 4> surfaces_{};
+	Framebuffer framebuffer_{};
+	// 0x00RRGGBB words, as the card's sdk_palette shadow.
+	std::array<uint32_t, 256> palette_{};
+	uint32_t next_surface_handle_ = 1;
+	uint8_t *memory_at(uint32_t offset) const;
+	Buffer *find_buffer(uint32_t handle);
+	const Buffer *find_buffer(uint32_t handle) const;
+	Surface *find_surface(uint32_t handle);
+	// A free, aligned board range in [start, end) clear of every guest-
+	// visible buffer and surface, or 0.
+	uint32_t place_in_board(uint32_t start, uint32_t end, uint32_t length,
+	                        uint32_t alignment) const;
+	uint16_t scale_surface(uint32_t src_handle, uint32_t dst_handle,
+	                       uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+	                       uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+	                       uint32_t cx, uint32_t cy, uint32_t cw, uint32_t ch,
+	                       uint32_t filter, uint32_t flags);
+	uint16_t decode_jpeg_to_surface(const uint8_t *request, uint8_t *reply,
+	                                uint16_t *reply_length);
+	uint8_t *surface_pixels(uint32_t handle);
+	uint32_t surface_width(uint32_t handle) const;
+	uint32_t surface_height(uint32_t handle) const;
+	uint32_t surface_pitch(uint32_t handle) const;
+	uint32_t surface_format(uint32_t handle) const;
+	Audio *find_audio(uint32_t session);
+	void close_audio();
+	void close_audio(Audio *audio);
+	void decode_audio(Audio &audio, const uint8_t *input, uint32_t length);
+	void pump_audio();
+	void pump_audio(Audio &audio);
+	void audio_result(const Audio &audio, uint8_t *reply, uint16_t *reply_length);
+	void close_media();
+	void release_client(uint16_t client);
+	void media_result(uint8_t *reply, uint16_t *reply_length,
+	                  uint32_t bytes_written = 0, uint32_t event_flags = 0);
+	void media_audio_result(uint8_t *reply, uint16_t *reply_length);
+	void pump_media_audio();
+	uint16_t dispatch_media(uint16_t opcode, const uint8_t *request,
+	                        uint16_t request_length, uint8_t *reply,
+	                        uint16_t *reply_length);
+	uint16_t dispatch_console(const uint8_t *request, uint16_t request_length,
+	                         uint8_t *reply, uint16_t *reply_length);
+	uint32_t supported_capabilities() const;
+	uint16_t dispatch(uint16_t opcode, const uint8_t *request,
+	                  uint16_t request_length, uint8_t *reply,
+	                  uint16_t *reply_length);
+	uint16_t decode_mp3(const uint8_t *request, uint16_t request_length,
+	                    uint8_t *reply, uint16_t *reply_length);
+};
+
+} // namespace zz9000_sdk
+
+#endif

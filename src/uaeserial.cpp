@@ -108,6 +108,7 @@ int log_uaeserial = 0;
 */
 
 
+namespace {
 struct asyncreq {
 	struct asyncreq *next;
 	uaecptr arequest;
@@ -129,6 +130,7 @@ struct devstruct {
 
 	void *sysdata;
 };
+}
 
 static int uniq;
 static uae_u32 nscmd_cmd;
@@ -889,7 +891,7 @@ void uaeserialdev_start_threads (void)
 
 void uaeserialdev_reset (void)
 {
-	if (!currprefs.uaeserial)
-		return;
+	// Not only while uaeserial.device is on: a reset that turned it off
+	// (virtualdevice_init) still has to close the units the guest had open.
 	dev_reset ();
 }

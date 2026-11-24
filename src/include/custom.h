@@ -77,7 +77,7 @@ extern uae_u32 hsync_counter, vsync_counter;
 extern uae_u16 dmacon;
 extern uae_u16 intena, intreq, intreqr;
 
-extern int vpos, linear_display_vpos;
+extern int vpos, linear_vpos_start;
 extern int linear_vpos_vb_start, linear_vpos_vb_end;
 extern uae_u8 agnus_hpos;
 extern bool lof_store, lof_display;
@@ -98,6 +98,7 @@ extern void INTREQ(uae_u16);
 extern bool INTREQ_0(uae_u16);
 extern void INTREQ_f(uae_u16);
 extern void INTREQ_INT(int num, int delay);
+extern void INTREQ_INT_clear(int num, int delay);
 extern void rethink_uae_int(void);
 extern uae_u16 INTREQR(void);
 
@@ -242,6 +243,7 @@ void custom_cpuchange(void);
 void custom_dumpstate(int);
 bool get_ras_cas(uaecptr, int*, int*);
 void get_mode_blanking_limits(int *phbstop, int *phbstrt, int *pvbstop, int *pvbstrt);
+uaecptr copper_blitter_conflict(struct rgabuf *rga);
 
 #define CYCLE_PIPE_CPUFREE 0x4000
 #define CYCLE_PIPE_BLITTER 0x100
@@ -312,8 +314,7 @@ struct rgabuf {
 	uae_u32 mwmask;
 	int alloc;
 	bool write;
-	uae_u32 *conflict;
-	uaecptr conflictaddr;
+	uae_u32 *conflict, *conflict2;
 	uae_u32 bpldat, sprdat, bltdat, auddat, refdat, dskdat;
 	uae_s16 bplmod, bltmod, bltadd;
 };
@@ -327,8 +328,19 @@ bool check_rga(int slot);
 bool check_rga_free_slot_in(void);
 struct rgabuf *read_rga(int slot);
 struct rgabuf *write_rga(int slot, int type, uae_u16 v, uae_u32 *p);
-extern uae_u16 clxdat;
+// The Denise thread ORs collision bits into CLXDAT for every pixel. A main
+// thread variable sharing its cache line pays for those writes on every
+// chipset cycle, so CLXDAT owns a whole cache line.
+struct alignas(64) clxdat_reg {
+	uae_u16 v;
+	operator uae_u16() const { return v; }
+	clxdat_reg &operator=(uae_u32 n) { v = (uae_u16)n; return *this; }
+	clxdat_reg &operator|=(uae_u32 n) { v |= (uae_u16)n; return *this; }
+};
+extern clxdat_reg clxdat;
+#ifdef AMIBERRY
 extern uae_u32 magic_sprite_mask;
+#endif
 
 void custom_end_drawing(void);
 void resetfulllinestate(void);
@@ -337,11 +349,6 @@ extern int current_linear_vpos, current_linear_hpos;
 extern uae_u8 agnus_hpos;
 
 void vsync_event_done(void);
-#ifdef WITH_THREADED_CPU
-extern void REGPARAM3 custom_lput(uaecptr, uae_u32) REGPARAM;
-extern void REGPARAM3 custom_wput(uaecptr, uae_u32) REGPARAM;
-extern void REGPARAM3 custom_bput(uaecptr, uae_u32) REGPARAM;
-#endif
 bool get_custom_color_reg(int colreg, uae_u8 *r, uae_u8 *g, uae_u8 *b);
 void event_doint_delay_do_ext(uae_u32 v);
 

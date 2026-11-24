@@ -40,55 +40,37 @@ using namespace std;
 #define UAE
 #endif
 
-#if defined(__arm__) || defined(_M_ARM)
-#define CPU_arm 1
-#define ARM_ASSEMBLY 1
-#define ARMV6_ASSEMBLY 1
-#elif defined(CPU_AARCH64) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__aarch64__)
-#define CPU_arm 1
+#include "host_arch.h"
+
+#define CPU_64_BIT 1
+
+#if defined(CPU_AARCH64) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__aarch64__)
 #ifndef CPU_AARCH64
 #define CPU_AARCH64 1
 #endif
-#define CPU_64_BIT 1
-#define ARM_ASSEMBLY 1
-#define ARMV6_ASSEMBLY 1
 #elif defined(__x86_64__) || defined(_M_AMD64)
 #define CPU_x86_64 1
-#define CPU_64_BIT 1
 #define X86_64_ASSEMBLY 1
 #define SAHF_SETO_PROFITABLE
-#elif defined(__i386__) || defined(_M_IX86)
-#define CPU_i386 1
-#define X86_ASSEMBLY 1
-#define SAHF_SETO_PROFITABLE
-#elif defined(__powerpc__) || defined(_M_PPC)
+#elif defined(__powerpc64__)
 #define CPU_powerpc 1
 #elif defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64
 #define CPU_riscv64 1
-#define CPU_64_BIT 1
 #elif defined(__loongarch__) && (__loongarch_grlen == 64)
 #define CPU_loongarch64 1
-#define CPU_64_BIT 1
 #else
 #error unrecognized CPU type
 #endif
 
 #ifdef _WIN32
-/* Parameters are passed in ECX, EDX for both x86 and x86-64 (RCX, RDX).
- * For x86-64, __fastcall is the default, so it isn't really required. */
+/* The platform's default 64-bit calling convention is used. */
 #define JITCALL __fastcall
 #elif defined(CPU_x86_64)
 /* Parameters are passed in RDI, RSI by default (System V AMD64 ABI). */
 #define JITCALL
-#elif defined(CPU_arm) || defined(CPU_AARCH64)
-/* ARM/ARM64: parameters passed in R0-R7 by default (AAPCS/AAPCS64). */
+#elif defined(CPU_AARCH64)
+/* AAPCS64 passes parameters in registers. */
 #define JITCALL
-#elif defined(HAVE_FUNC_ATTRIBUTE_REGPARM)
-/* Parameters are passed in EAX, EDX on x86 with regparm(2). */
-#define JITCALL __attribute__((regparm(2)))
-/* This was originally regparm(3), but as far as I can see only two register
- * params are supported by the JIT code. It probably just worked anyway
- * if all functions used max two arguments. */
 #elif !defined(JIT)
 #define JITCALL
 #endif
@@ -102,11 +84,7 @@ using namespace std;
 #define REGPARAM3 JITCALL
 #endif
 
-#if CPU_64_BIT
 #define addrdiff(a, b) ((int)((a) - (b)))
-#else
-#define addrdiff(a, b) ((a) - (b))
-#endif
 
 #ifndef __STDC__
 #ifndef _MSC_VER
@@ -146,6 +124,20 @@ using namespace std;
 #include <sys/stat.h>
 #ifndef STAT
 typedef struct stat STAT;
+#endif
+#if defined(LIBRETRO)
+/* Capture the CRT stat() before the function-like stat() macro below
+   shadows it, so posixemu_stat()'s native fallback can call the real
+   one (a plain ::stat() there would expand to posixemu_stat itself).
+   The buffer stays spelled STAT, which matches whatever struct stat
+   the toolchain's headers use: mingw-w64 up to v10 with
+   _FILE_OFFSET_BITS=64 maps stat to _stat64 (STAT becomes
+   struct _stat64), while newer mingw-w64 (MSYS2 CLANG64, llvm-mingw)
+   declares stat() taking a distinct struct stat. */
+static inline int uae_native_stat(const char* name, STAT* st)
+{
+	return stat(name, st);
+}
 #endif
 #endif
 
@@ -398,12 +390,7 @@ extern void mallocemu_free (void *ptr);
 
 #endif
 
-#ifdef X86_ASSEMBLY
-//#define ASM_SYM_FOR_FUNC(a) __asm__(a)
 #define ASM_SYM_FOR_FUNC(a)
-#else
-#define ASM_SYM_FOR_FUNC(a)
-#endif
 
 extern void write_log (const TCHAR *,...);
 extern int read_log(void);
@@ -427,6 +414,7 @@ extern void f_out(FILE*, const TCHAR*, ...);
 extern TCHAR* buf_out (TCHAR *buffer, int *bufsize, const TCHAR *format, ...);
 extern void gui_message (const TCHAR *,...);
 extern TCHAR* write_log_get_ts(void);
+
 
 #ifndef O_BINARY
 #define O_BINARY 0

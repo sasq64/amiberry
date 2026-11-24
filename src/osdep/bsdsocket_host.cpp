@@ -1327,6 +1327,16 @@ uae_u32 host_shutdown(SB, uae_u32 sd, uae_u32 how)
 	return -1;
 }
 
+/*
+ * struct in_addr (IP_MULTICAST_IF) and struct ip_mreq (IP_ADD_MEMBERSHIP,
+ * IP_DROP_MEMBERSHIP) hold addresses in network byte order, so they are
+ * copied byte for byte, not as 32-bit integers.
+ */
+static bool is_ip_multicast_address_option(uae_u32 level, uae_u32 optname)
+{
+	return level == IPPROTO_IP && (optname == IP_MULTICAST_IF || optname == IP_ADD_MEMBERSHIP || optname == IP_DROP_MEMBERSHIP);
+}
+
 void host_setsockopt(SB, uae_u32 sd, uae_u32 level, uae_u32 optname, uae_u32 optval, uae_u32 len)
 {
 	TrapContext *ctx = NULL;
@@ -1347,13 +1357,18 @@ void host_setsockopt(SB, uae_u32 sd, uae_u32 level, uae_u32 optname, uae_u32 opt
 			sb->resultval = 0;
 			return;
 		}
-		for (i = 0; (uae_u32)i < len / 4; i++) {
-			((long*)buf)[i] = get_long(optval + i * 4);
+		if (is_ip_multicast_address_option(level, optname)) {
+			for (i = 0; (uae_u32)i < len; i++)
+				buf[i] = get_byte(optval + i);
+		} else {
+			for (i = 0; (uae_u32)i < len / 4; i++) {
+				((long*)buf)[i] = get_long(optval + i * 4);
+			}
+			if (len - i == 2)
+				((long*)buf)[i] = get_word(optval + i * 4);
+			else if (len - i == 1)
+				((long*)buf)[i] = get_byte(optval + i * 4);
 		}
-		if (len - i == 2)
-			((long*)buf)[i] = get_word(optval + i * 4);
-		else if (len - i == 1)
-			((long*)buf)[i] = get_byte(optval + i * 4);
 
 		if (level == SOL_SOCKET && (optname == SO_SNDTIMEO || optname == SO_RCVTIMEO)) {
 			uae_u32 millis = ((long*)buf)[0] * 1000 + ((long*)buf)[1] / 1000;
@@ -1420,26 +1435,31 @@ uae_u32 host_getsockopt(TrapContext *ctx, SB, uae_u32 sd, uae_u32 level, uae_u32
 					((long*)buf)[1] = (millis % 1000) * 1000;
 					len = 8;
 				}
-				for (int i = 0; i < len; i += 4) {
-					uae_u32 v;
-					if (len - i >= 4)
-						v = *((long*)(buf + i));
-					else if (len - i >= 2)
-						v = *((short*)(buf + i));
-					else
-						v = buf[i];
-					if (outlen >= 4) {
-						put_long(optval + outcnt, v);
-						outlen -= 4;
-						outcnt += 4;
-					} else if (outlen >= 2) {
-						put_word(optval + outcnt, v);
-						outlen -= 2;
-						outcnt += 2;
-					} else if (outlen > 0) {
-						put_byte(optval + outcnt, v);
-						outlen -= 1;
-						outcnt += 1;
+				if (is_ip_multicast_address_option(level, optname)) {
+					for (int i = 0; i < len && outlen > 0; i++, outlen--)
+						put_byte(optval + outcnt++, buf[i]);
+				} else {
+					for (int i = 0; i < len; i += 4) {
+						uae_u32 v;
+						if (len - i >= 4)
+							v = *((long*)(buf + i));
+						else if (len - i >= 2)
+							v = *((short*)(buf + i));
+						else
+							v = buf[i];
+						if (outlen >= 4) {
+							put_long(optval + outcnt, v);
+							outlen -= 4;
+							outcnt += 4;
+						} else if (outlen >= 2) {
+							put_word(optval + outcnt, v);
+							outlen -= 2;
+							outcnt += 2;
+						} else if (outlen > 0) {
+							put_byte(optval + outcnt, v);
+							outlen -= 1;
+							outcnt += 1;
+						}
 					}
 				}
 				put_long(optlen, outcnt);
@@ -1688,7 +1708,7 @@ uae_u32 host_IoctlSocket(TrapContext *ctx, SB, uae_u32 sd, uae_u32 request, uae_
 		case SIOCGIFPHYS:
 			{
 				int idx = get_net_if(ctx, arg, true);
-				if (idx >= 0) {
+				if (idx >= 0 && net_interfaces2) {
 					struct bsdsock_interface_info *ii2 = &net_interfaces2[idx];
 					if (ii2->inuse) {
 						if (request == SIOCGIFMETRIC) {
@@ -2666,6 +2686,9 @@ void host_getservbynameport(TrapContext *ctx, SB, uae_u32 nameport, uae_u32 prot
 #include <csignal>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <string>
+#include <unordered_map>
+#include <mutex>
 #endif /* _WIN32 */
 
 #if defined(__HAIKU__)
@@ -2696,6 +2719,8 @@ void host_getservbynameport(TrapContext *ctx, SB, uae_u32 nameport, uae_u32 prot
 #include <cstddef>
 #include <cstring>
 #include <vector>
+#include "bsdsocket_blocking.h"
+#include "bsdsocket_ifinfo.h"
 #include <SDL3/SDL_mutex.h>
 #if defined(_WIN32)
 #include <mutex>
@@ -2885,6 +2910,8 @@ struct socket_event_entry {
 	int eventmask;             // REP_* flags to monitor
 	bool connecting;           // True if connect() is in progress
 	bool connected;            // True if socket is connected (or connectionless/listener)
+	bool dgram;                // True if SOCK_DGRAM: no EOF semantics, readiness works unconnected
+	bool listening;            // True if stream socket is listening: only these can fire REP_ACCEPT
 	int fired_mask;            // Events that have fired and need re-enabling
 };
 
@@ -3081,6 +3108,8 @@ static int mapsockoptname (int level, int optname)
 			return IP_MULTICAST_LOOP;
 		case 12:
 			return IP_ADD_MEMBERSHIP;
+		case 13:
+			return IP_DROP_MEMBERSHIP;
 
 		default:
 			write_log("Invalid setsockopt option 0x%x for level %d\n",
@@ -3110,9 +3139,33 @@ static int mapsockoptname (int level, int optname)
 }
 
 /*
+ * IPv4 multicast options don't take a 32-bit integer: struct in_addr and
+ * struct ip_mreq hold addresses in network byte order, and the TTL and loop
+ * flags are a u_char (an int is accepted too). Returns the smallest valid
+ * argument size, or 0 for any other option.
+ */
+static int ip_multicast_option_size(int level, int optname)
+{
+	if (level != IPPROTO_IP)
+		return 0;
+	switch (optname) {
+	case IP_MULTICAST_TTL:
+	case IP_MULTICAST_LOOP:
+		return 1;
+	case IP_MULTICAST_IF:
+		return 4;
+	case IP_ADD_MEMBERSHIP:
+	case IP_DROP_MEMBERSHIP:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+/*
  * Map amiga (s|g)etsockopt return value into the correct form
  */
-static void mapsockoptreturn(int level, int optname, uae_u32 optval, void *buf)
+static void mapsockoptreturn(int level, int optname, uae_u32 optval, void *buf, socklen_t len)
 {
 	switch (level) {
 
@@ -3160,11 +3213,22 @@ static void mapsockoptreturn(int level, int optname, uae_u32 optval, void *buf)
 		case IP_RECVOPTS:
 		//case IP_RECVRETOPTS:
 		//case IP_RETOPTS:
+			put_long (optval, *(int *)buf);
+			break;
+
 		case IP_MULTICAST_IF:
+			// struct in_addr, already in network byte order
+			for (int i = 0; i < 4; i++)
+				put_byte (optval + i, ((uae_u8 *)buf)[i]);
+			break;
+
 		case IP_MULTICAST_TTL:
 		case IP_MULTICAST_LOOP:
-		case IP_ADD_MEMBERSHIP:
-			put_long (optval, *(int *)buf);
+			// the host returns a u_char or an int, matching the length asked for
+			if (len < sizeof(int))
+				put_byte (optval, *(uae_u8 *)buf);
+			else
+				put_long (optval, *(int *)buf);
 			break;
 
 		default:
@@ -3192,7 +3256,7 @@ static void mapsockoptreturn(int level, int optname, uae_u32 optval, void *buf)
 /*
  * Map amiga (s|g)etsockopt value from amiga to the appropriate value
  */
-static void mapsockoptvalue(int level, int optname, uae_u32 optval, void *buf)
+static void mapsockoptvalue(int level, int optname, uae_u32 optval, void *buf, uae_u32 len)
 {
 	switch (level) {
 
@@ -3236,11 +3300,24 @@ static void mapsockoptvalue(int level, int optname, uae_u32 optval, void *buf)
 		case IP_RECVOPTS:
 		//case IP_RECVRETOPTS:
 		//case IP_RETOPTS:
+			*((int *)buf) = get_long (optval);
+			break;
+
 		case IP_MULTICAST_IF:
+		case IP_ADD_MEMBERSHIP:
+		case IP_DROP_MEMBERSHIP:
+			// struct in_addr / struct ip_mreq, already in network byte order
+			for (int i = 0; i < ip_multicast_option_size(level, optname); i++)
+				((uae_u8 *)buf)[i] = get_byte (optval + i);
+			break;
+
 		case IP_MULTICAST_TTL:
 		case IP_MULTICAST_LOOP:
-		case IP_ADD_MEMBERSHIP:
-			*((int *)buf) = get_long (optval);
+			// a u_char, or an int
+			if (len < sizeof(uae_u32))
+				*(uae_u8 *)buf = get_byte (optval);
+			else
+				*((int *)buf) = get_long (optval);
 			break;
 
 		default:
@@ -3301,10 +3378,6 @@ static int sockopt_amiga_scalar_size(int level, int optname)
 		case IP_TOS:
 		case IP_TTL:
 		case IP_RECVOPTS:
-		case IP_MULTICAST_IF:
-		case IP_MULTICAST_TTL:
-		case IP_MULTICAST_LOOP:
-		case IP_ADD_MEMBERSHIP:
 			return sizeof(uae_u32);
 		default:
 			return -1;
@@ -3326,6 +3399,9 @@ static int sockopt_amiga_scalar_size(int level, int optname)
 
 static int setsockopt_argument_size(int level, int optname)
 {
+	int size = ip_multicast_option_size(level, optname);
+	if (size)
+		return size;
 	if (level == SOL_SOCKET && optname == SO_LINGER)
 		return 8;
 	if (level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO))
@@ -3335,6 +3411,12 @@ static int setsockopt_argument_size(int level, int optname)
 
 static int getsockopt_result_size(int level, int optname)
 {
+	// memberships can only be set
+	if (level == IPPROTO_IP && (optname == IP_ADD_MEMBERSHIP || optname == IP_DROP_MEMBERSHIP))
+		return -1;
+	int size = ip_multicast_option_size(level, optname);
+	if (size)
+		return size;
 	if (level == SOL_SOCKET && optname == SO_LINGER)
 		return 8;
 	if (level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO))
@@ -3444,27 +3526,36 @@ static int event_monitor_thread(void* data)
 			// Use active_mask to respect One-Shot behavior (Wait for re-enablement via recv/accept)
 			if (active_mask & (REP_READ | REP_ACCEPT)) {
 				if (active_mask & REP_READ) {
-					// Prevent premature monitoring of READ on connecting/disconnected sockets
-					if (!entry.connecting && entry.connected) {
+					// Prevent premature monitoring of READ on connecting/disconnected stream sockets
+					if (!entry.connecting && (entry.connected || entry.dgram)) {
 						FD_SET(entry.s, &readfds);
 						// write_log("BSDSOCK: Adding socket %d to readfds (mask has REP_READ)\n", entry.sd);
 					}
-				} else {
-					// REP_ACCEPT always monitored (if in active_mask)
+				} else if (entry.listening) {
+					// REP_ACCEPT monitored only on listening stream sockets —
+					// readable datagram/connected sockets must not report accept-ready
 					FD_SET(entry.s, &readfds);
 					BSDTRACE((_T("BSDSOCK: Adding socket %d to readfds (mask has REP_ACCEPT)\n"), entry.sd));
 				}
 			}
 
-			// REP_CLOSE requires readfds to detect EOF via peek_socket
-			if ((active_mask & REP_CLOSE) && entry.connected && !entry.connecting) {
+			// REP_CLOSE requires readfds to detect EOF via peek_socket.
+			// Stream sockets only: datagrams have no EOF, and a queued datagram
+			// would keep select() readable forever with no event able to fire
+			// (close-only polling would busy-spin). Datagram readfds come from
+			// the REP_READ gate above, including for zero-length datagrams.
+			if ((active_mask & REP_CLOSE) && entry.connected && !entry.dgram && !entry.connecting) {
 				FD_SET(entry.s, &readfds);
 			}
 
 			// REP_WRITE is treated as Level Triggered in select() but Edge Triggered/One-Shot for Amiga signals.
 			// If connected and not connecting, we monitor for write if the event is active (not fired).
 			// FIX: Also monitor if REP_CONNECT was requested, as implicit Writability expectation.
-			if ((active_mask & (REP_WRITE | REP_CONNECT)) && entry.connected && !entry.connecting) {
+			// Datagram sockets are always writable, but REP_CONNECT's implicit writability
+			// is stream-only — an unconnected datagram socket has no connect() to complete.
+			if (!entry.connecting
+				&& ((active_mask & REP_WRITE) || (!entry.dgram && (active_mask & REP_CONNECT)))
+				&& (entry.connected || entry.dgram)) {
 				FD_SET(entry.s, &writefds);
 				// logging noise reduced
 			}
@@ -3537,17 +3628,24 @@ static int event_monitor_thread(void* data)
 						if ((entry.eventmask & REP_READ) && !(entry.fired_mask & REP_READ)) {
 							events |= REP_READ;
 						}
-					} else if (peek == 1) { // EOF
-						if ((entry.eventmask & REP_CLOSE) && !(entry.fired_mask & REP_CLOSE)) {
-							events |= REP_CLOSE;
-						}
-						// EOF is also readable (read returns 0)
-						if ((entry.eventmask & REP_READ) && !(entry.fired_mask & REP_READ)) {
-							events |= REP_READ;
+					} else if (peek == 1) { // recv() returned 0: EOF on streams, zero-length datagram on UDP
+						if (entry.dgram) {
+							// Datagram sockets have no EOF; a zero-length datagram is readable data
+							if ((entry.eventmask & REP_READ) && !(entry.fired_mask & REP_READ)) {
+								events |= REP_READ;
+							}
+						} else {
+							if ((entry.eventmask & REP_CLOSE) && !(entry.fired_mask & REP_CLOSE)) {
+								events |= REP_CLOSE;
+							}
+							// EOF is also readable (read returns 0)
+							if ((entry.eventmask & REP_READ) && !(entry.fired_mask & REP_READ)) {
+								events |= REP_READ;
+							}
 						}
 					}
 				}
-				if ((entry.eventmask & REP_ACCEPT) && !(entry.fired_mask & REP_ACCEPT)) {
+				if (entry.listening && (entry.eventmask & REP_ACCEPT) && !(entry.fired_mask & REP_ACCEPT)) {
 					events |= REP_ACCEPT;
 				}
 			}
@@ -3761,7 +3859,16 @@ static bool register_socket_events(struct socketbase* sb, int sd, SOCKET_TYPE s,
 		entry.s = s;
 		entry.eventmask = eventmask;
 		entry.connecting = false;
-		// Determine actual connection state — bare sockets must not fire REP_WRITE/READ
+		// Determine socket type and actual connection state. `connected` stays the
+		// real getpeername() result: REP_CONNECT semantics must not fire for
+		// unconnected datagram sockets. `dgram` only relaxes the read/write
+		// readiness gates in the monitor loop. `listening` gates REP_ACCEPT.
+		int socktype = 0;
+		socklen_t stlen = sizeof(socktype);
+		entry.dgram = (getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socktype, &stlen) == 0 && socktype == SOCK_DGRAM);
+		int acceptconn = 0;
+		socklen_t aclen = sizeof(acceptconn);
+		entry.listening = (getsockopt(s, SOL_SOCKET, SO_ACCEPTCONN, (char*)&acceptconn, &aclen) == 0 && acceptconn != 0);
 		struct sockaddr_in peer;
 		socklen_t plen = sizeof(peer);
 		entry.connected = (getpeername(s, (struct sockaddr*)&peer, &plen) == 0);
@@ -3855,6 +3962,27 @@ static void set_socket_connecting(struct socketbase* sb, int sd, bool connecting
 	SDL_UnlockMutex(g_event_monitor->mutex);
 }
 
+// Set the listening state for a socket (SO_ACCEPTCONN changed via listen())
+static void set_socket_listening(struct socketbase* sb, int sd, bool listening)
+{
+	if (!g_event_monitor || !valid_amiga_socket_descriptor(sb, sd)) return;
+
+	SDL_LockMutex(g_event_monitor->mutex);
+	for (auto& entry : g_event_monitor->socket_list) {
+		if (entry.sb == sb && entry.sd == sd) {
+			entry.listening = listening;
+			BSDTRACE((_T("BSDSOCK: Socket %d listening state set to %d\n"), sd, listening));
+			break;
+		}
+	}
+	// Wake up monitor to update handling
+	if (g_event_monitor->wake_pipe[1] != -1) {
+		char b = 1;
+		write_pipe(g_event_monitor->wake_pipe[1], &b, 1);
+	}
+	SDL_UnlockMutex(g_event_monitor->mutex);
+}
+
 // Re-enable specific events for a socket (called by IO functions)
 static void socket_reenable_events(struct socketbase* sb, int sd, int events)
 {
@@ -3930,46 +4058,114 @@ static int copysockaddr_n2a (uae_u32 a_addr, const struct sockaddr_in *addr, uns
 /*
  * Copy a hostent object from native space to amiga space
  */
-static void copyHostent(TrapContext* ctx, const struct hostent* hostent, SB)
+/*
+ * Host-side copy of a gethostby*() result. The socket thread does the
+ * lookup and saves the result here; host_gethostbynameaddr() then builds
+ * the Amiga hostent in the trap context, because allocating Amiga memory
+ * needs a trap context.
+ */
+struct unix_hostent_copy {
+	int addrtype;
+	int length;
+	std::string name;
+	std::vector<std::string> aliases;
+	std::vector<std::string> addrs;
+};
+
+static std::mutex hostent_copy_mutex;
+static std::unordered_map<struct socketbase*, unix_hostent_copy> hostent_copies;
+
+static void save_hostent(SB, const struct hostent* hostent)
+{
+	unix_hostent_copy h;
+	int i;
+
+	h.addrtype = hostent->h_addrtype;
+	h.length = hostent->h_length;
+	if (hostent->h_name != nullptr)
+		h.name = hostent->h_name;
+	if (hostent->h_aliases != nullptr) {
+		for (i = 0; hostent->h_aliases[i]; i++)
+			h.aliases.emplace_back(hostent->h_aliases[i]);
+	}
+	if (hostent->h_addr_list != nullptr) {
+		for (i = 0; hostent->h_addr_list[i]; i++)
+			h.addrs.emplace_back(hostent->h_addr_list[i], hostent->h_length);
+	}
+
+	std::lock_guard<std::mutex> lock(hostent_copy_mutex);
+	hostent_copies[sb] = std::move(h);
+}
+
+static bool take_hostent(SB, unix_hostent_copy* h)
+{
+	std::lock_guard<std::mutex> lock(hostent_copy_mutex);
+	auto it = hostent_copies.find(sb);
+	if (it == hostent_copies.end())
+		return false;
+	*h = std::move(it->second);
+	hostent_copies.erase(it);
+	return true;
+}
+
+static void drop_hostent(SB)
+{
+	std::lock_guard<std::mutex> lock(hostent_copy_mutex);
+	hostent_copies.erase(sb);
+}
+
+/*
+ * Copy a hostent object from native space to amiga space
+ */
+static void copyHostent(TrapContext* ctx, const unix_hostent_copy* hostent, SB)
 {
 	int size = 28;
 	int i;
-	int numaddr = 0;
-	int numaliases = 0;
+	int numaddr = static_cast<int>(hostent->addrs.size());
+	int numaliases = static_cast<int>(hostent->aliases.size());
 	uae_u32 aptr;
 
-	if (hostent->h_name != NULL)
-		size += strlen(hostent->h_name) + 1;
+	size += static_cast<int>(hostent->name.size()) + 1;
+	for (i = 0; i < numaliases; i++)
+		size += static_cast<int>(hostent->aliases[i].size()) + 5;
+	size += numaddr * (hostent->length + 4);
 
-	if (hostent->h_aliases != NULL)
-		while (hostent->h_aliases[numaliases])
-			size += strlen(hostent->h_aliases[numaliases++]) + 5;
+	// The buffer starts at 1024 bytes; grow it for larger results
+	if (sb->hostent && sb->hostentsize < size) {
+		uae_FreeMem(ctx, sb->hostent, sb->hostentsize, sb->sysbase);
+		sb->hostent = 0;
+		sb->hostentsize = 0;
+	}
 
-	if (hostent->h_addr_list != NULL) {
-		while (hostent->h_addr_list[numaddr])
-			numaddr++;
-		size += numaddr * (hostent->h_length + 4);
+	if (!sb->hostent) {
+		sb->hostent = uae_AllocMem(ctx, size, 0, sb->sysbase);
+		if (!sb->hostent) {
+			write_log("BSDSOCK: WARNING - copyHostent() ran out of Amiga memory (couldn't allocate %d bytes)\n", size);
+			bsdsocklib_seterrno(ctx, sb, 12); // ENOMEM
+			return;
+		}
+		sb->hostentsize = size;
 	}
 
 	aptr = sb->hostent + 28 + numaliases * 4 + numaddr * 4;
 
 	// transfer hostent to Amiga memory
 	trap_put_long(ctx, sb->hostent + 4, sb->hostent + 20);
-	trap_put_long(ctx, sb->hostent + 8, hostent->h_addrtype);
-	trap_put_long(ctx, sb->hostent + 12, hostent->h_length);
+	trap_put_long(ctx, sb->hostent + 8, hostent->addrtype);
+	trap_put_long(ctx, sb->hostent + 12, hostent->length);
 	trap_put_long(ctx, sb->hostent + 16, sb->hostent + 24 + numaliases * 4);
 
 	for (i = 0; i < numaliases; i++)
-		trap_put_long(ctx, sb->hostent + 20 + i * 4, addstr(ctx, &aptr, hostent->h_aliases[i]));
+		trap_put_long(ctx, sb->hostent + 20 + i * 4, addstr(ctx, &aptr, hostent->aliases[i].c_str()));
 	trap_put_long(ctx, sb->hostent + 20 + numaliases * 4, 0);
 
 	for (i = 0; i < numaddr; i++) {
-		trap_put_long(ctx, sb->hostent + 24 + (numaliases + i) * 4, addmem(ctx, &aptr, hostent->h_addr_list[i], hostent->h_length));
+		trap_put_long(ctx, sb->hostent + 24 + (numaliases + i) * 4, addmem(ctx, &aptr, hostent->addrs[i].data(), hostent->length));
 	}
 	trap_put_long(ctx, sb->hostent + 24 + numaliases * 4 + numaddr * 4, 0);
 	trap_put_long(ctx, sb->hostent, aptr);
-	addstr(ctx, &aptr, hostent->h_name);
-	
+	addstr(ctx, &aptr, hostent->name.c_str());
+
 	bsdsocklib_seterrno(ctx, sb, 0);
 }
 
@@ -4164,6 +4360,7 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
     long flags;
     int nonblock;
     int saved_errno = 0;
+    int interrupted = 0; /* sockabort fired: caller must see EINTR, not saved_errno */
     int socktype = 0;
     socklen_t optlen = sizeof(socktype);
     int is_raw = 0;
@@ -4176,6 +4373,14 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
     if ((flags = fcntl(sb->s, F_GETFL)) == -1)
         flags = 0;
 #endif
+    /* Read the guest's timeout before the raw-socket override below replaces
+     * SO_RCVTIMEO. Connect (1) and accept (6) wait without a limit, as on BSD. */
+    const auto direction = sb->action == 3 ? bsdsock_blocking::direction::receive
+        : sb->action == 2 ? bsdsock_blocking::direction::send
+        : bsdsock_blocking::direction::none;
+    bsdsock_blocking::wait_clock::time_point deadline;
+    const bool has_deadline = bsdsock_blocking::socket_deadline(sb->s, direction,
+        bsdsock_blocking::wait_clock::now(), deadline);
     // Check if this is a raw socket
     if (getsockopt(sb->s, SOL_SOCKET, SO_TYPE, (char*)&socktype, &optlen) == 0 && socktype == SOCK_RAW) {
         is_raw = 1;
@@ -4183,9 +4388,13 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
         if (getsockopt(sb->s, SOL_SOCKET, SO_RCVTIMEO, (char*)&orig_timeout, &tvlen) == 0) {
             timeout_set = 1;
         }
-        // Set a 1 second timeout for raw sockets
+        // Set a 1 second timeout for raw sockets, or the guest's receive
+        // timeout when it is shorter, so recv() cannot outlast the deadline
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
+        if (timeout_set && direction == bsdsock_blocking::direction::receive && has_deadline
+            && orig_timeout.tv_sec == 0)
+            timeout = orig_timeout;
         setsockopt(sb->s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     }
 #ifdef _WIN32
@@ -4214,9 +4423,6 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
         if (foo < 0 && !nonblock) {
             errno = saved_errno;
             if ((saved_errno == EAGAIN) || (saved_errno == EWOULDBLOCK) || (saved_errno == EINPROGRESS)) {
-                fd_set readset, writeset, exceptset;
-                int maxfd = (sb->s > sb->sockabort[0]) ? sb->s : sb->sockabort[0];
-                int num;
                 if (!socket_fd_usable_for_select(sb->s) || !socket_fd_usable_for_select(sb->sockabort[0])) {
                     int fd_errno = EINVAL;
                     write_log("Blocking select skipped: socket fd %d or abort fd %d exceeds select() limit %d\n",
@@ -4231,20 +4437,10 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
                     return -1;
                 }
 
-                FD_ZERO(&readset);
-                FD_ZERO(&writeset);
-                FD_ZERO(&exceptset);
-
-                if (sb->action == 3 || sb->action == 6)
-                    FD_SET(sb->s, &readset);
-                if (sb->action == 2 || sb->action == 1 || sb->action == 4)
-                    FD_SET(sb->s, &writeset);
-                FD_SET(sb->sockabort[0], &readset);
-
-                do {
-                    num = select(maxfd + 1, &readset, &writeset, &exceptset, NULL);
-                } while (num == -1 && errno == EINTR); // retry on EINTR
-                if (num == -1) {
+                const bool want_read = sb->action == 3 || sb->action == 6;
+                const auto wait = bsdsock_blocking::wait_for_socket(sb->s, sb->sockabort[0], want_read,
+                    has_deadline ? &deadline : nullptr);
+                if (wait == bsdsock_blocking::wait_result::error) {
                     int _select_err = errno; /* save before write_log/fcntl/setsockopt clobber it */
                     BSDLOG("Blocking select(%d) returns -1,errno is %d\n", sb->sockabort[0], _select_err);
 #ifdef _WIN32
@@ -4257,7 +4453,7 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
                     return -1;
                 }
 
-                if (FD_ISSET(sb->sockabort[0], &readset) || FD_ISSET(sb->sockabort[0], &writeset)) {
+                if (wait == bsdsock_blocking::wait_result::aborted) {
                     /* reset sock abort pipe */
                     /* read from the pipe to reset it */
                     BSDLOG("select aborted from signal\n");
@@ -4265,6 +4461,14 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
                     clearsockabort(sb);
                     BSDLOG("Done read\n");
                     errno = EINTR;
+                    interrupted = 1;
+                    done = 1;
+                }
+                else if (wait == bsdsock_blocking::wait_result::timed_out) {
+                    /* SO_RCVTIMEO/SO_SNDTIMEO expired with nothing transferred:
+                     * BSD reports EWOULDBLOCK, which mapErrno turns into Amiga 35. */
+                    BSDLOG("Blocking call on fd %d timed out\n", sb->s);
+                    saved_errno = EAGAIN;
                     done = 1;
                 }
                 else {
@@ -4282,8 +4486,9 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
 #endif
     if (is_raw && timeout_set) setsockopt(sb->s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&orig_timeout, sizeof(orig_timeout));
     /* Restore errno after fcntl/setsockopt cleanup — caller (bsdlib_threadfunc) reads
-     * errno via SETERRNO immediately after we return. */
-    errno = saved_errno;
+     * errno via SETERRNO immediately after we return. An aborted blocking call must
+     * keep EINTR; restoring saved_errno here would report EAGAIN/EINPROGRESS instead. */
+    errno = interrupted ? EINTR : saved_errno;
     return foo;
 }
 
@@ -4342,7 +4547,7 @@ static int bsdlib_threadfunc(void* arg)
 			int herr, ret;
 			ret = gethostbyname_r((char*)get_real_address(sb->name), &hent, buf, sizeof(buf), &tmphostent, &herr);
 			if (ret == 0 && tmphostent) {
-				copyHostent(ctx, tmphostent, sb);
+				save_hostent(sb, tmphostent);
 				bsdsocklib_setherrno(ctx, sb, 0);
 			} else {
 				bsdsocklib_setherrno(ctx, sb, herr);
@@ -4352,7 +4557,7 @@ static int bsdlib_threadfunc(void* arg)
 			std::lock_guard<std::mutex> lock(bsdsock_mutex);
 			struct hostent* tmphostent = gethostbyname((char*)get_real_address(sb->name));
 			if (tmphostent) {
-				copyHostent(ctx, tmphostent, sb);
+				save_hostent(sb, tmphostent);
 				bsdsocklib_setherrno(ctx, sb, 0);
 			} else {
 				SETHERRNO;
@@ -4383,7 +4588,7 @@ static int bsdlib_threadfunc(void* arg)
 			int herr, ret;
 			ret = gethostbyaddr_r((char*)get_real_address(sb->name), sb->a_addrlen, sb->flags, &hent, buf, sizeof(buf), &tmphostent, &herr);
 			if (ret == 0 && tmphostent) {
-				copyHostent(ctx, tmphostent, sb);
+				save_hostent(sb, tmphostent);
 				bsdsocklib_setherrno(ctx, sb, 0);
 			} else {
 				bsdsocklib_setherrno(ctx, sb, herr);
@@ -4393,7 +4598,7 @@ static int bsdlib_threadfunc(void* arg)
 			std::lock_guard<std::mutex> lock(bsdsock_mutex);
 			struct hostent* tmphostent = gethostbyaddr((const char*)get_real_address(sb->name), sb->a_addrlen, sb->flags);
 			if (tmphostent) {
-				copyHostent(ctx, tmphostent, sb);
+				save_hostent(sb, tmphostent);
 				bsdsocklib_setherrno(ctx, sb, 0);
 			} else {
 				SETHERRNO;
@@ -4424,7 +4629,9 @@ int init_socket_layer(void)
 	ensure_winsock();
 
 	if (currprefs.socket_emu) {
-		if (uae_sem_init(&sem_queue, 0, 1) < 0) {
+		// Every Boot ROM rebuild installs the library again; uae_sem_init() on
+		// the existing semaphore would signal it and break the queue lock.
+		if (!sem_queue && uae_sem_init(&sem_queue, 0, 1)) {
 			write_log("Can't create sem %d\n", errno);
 			return 0;
 		}
@@ -4528,6 +4735,7 @@ void host_sbcleanup (SB)
 		 * about that. */
 		uae_wait_thread (&thread);
 		sb->thread = nullptr;
+		drop_hostent(sb);
 	}
 
 	if (sb->sem) {
@@ -4679,6 +4887,9 @@ uae_u32 host_listen(TrapContext *ctx, SB, uae_u32 sd, uae_u32 backlog)
 		write_log("failed (%d)\n", sb->sb_errno);
 	} else {
 		BSDLOG("OK\n");
+		/* REP_ACCEPT gating snapshots SO_ACCEPTCONN at registration; refresh the
+		 * monitor entry so event masks armed before listen() report accept-ready */
+		set_socket_listening(sb, sd, true);
 	}
 	return success;
 }
@@ -4894,9 +5105,16 @@ void host_setsockopt(SB, uae_u32 sd, uae_u32 level, uae_u32 optname, uae_u32 opt
 		}
 		
 		// Fix for dynAMIte and other apps that rely on implicit Writability after Connect:
+		// stream sockets only — a datagram socket has no connect-completion writability,
+		// and the forced bit would fire an unrequested REP_WRITE notification
 		if (eventflags & REP_CONNECT) {
-			eventflags |= REP_WRITE;
-			write_log("BSDSOCK: Force-enabled REP_WRITE for socket %d (requested mask 0x%x -> 0x%x)\n", sd, get_long(optval), eventflags);
+			int socktype = 0;
+			socklen_t stlen = sizeof(socktype);
+			bool is_dgram = (getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socktype, &stlen) == 0 && socktype == SOCK_DGRAM);
+			if (!is_dgram) {
+				eventflags |= REP_WRITE;
+				write_log("BSDSOCK: Force-enabled REP_WRITE for socket %d (requested mask 0x%x -> 0x%x)\n", sd, get_long(optval), eventflags);
+			}
 		}
 
 		BSDTRACE((_T("BSDSOCK: SO_EVENTMASK called for socket %d, eventflags=0x%x\n"), sd, eventflags));
@@ -4973,7 +5191,7 @@ void host_setsockopt(SB, uae_u32 sd, uae_u32 level, uae_u32 optname, uae_u32 opt
 			bsdsocklib_seterrno(ctx, sb, 12); // ENOMEM
 			return;
 		}
-		mapsockoptvalue(nativelevel, nativeoptname, optval, buf);
+		mapsockoptvalue(nativelevel, nativeoptname, optval, buf, len);
 	}
 
 	if (nativeoptname == SO_RCVTIMEO || nativeoptname == SO_SNDTIMEO) {
@@ -5128,7 +5346,7 @@ uae_u32 host_getsockopt(TrapContext* ctx, SB, uae_u32 sd, uae_u32 level, uae_u32
 				put_long(optval + 4, sl.l_linger);
 			}
 			else {
-				mapsockoptreturn(nativelevel, nativeoptname, optval, buf);
+				mapsockoptreturn(nativelevel, nativeoptname, optval, buf, len);
 			}
 		}
 	}
@@ -5194,6 +5412,50 @@ uae_u32 host_getpeername(TrapContext *ctx, SB, uae_u32 sd, uae_u32 name, uae_u32
 	return -1;
 }
 
+/* SIOCGIFFLAGS, SIOCGIF{ADDR,DSTADDR,BRDADDR,NETMASK} and SIOCGIFCONF. */
+static int host_interface_ioctl(TrapContext *ctx, SB, bsdsock_ifinfo::request req, uae_u32 arg)
+{
+	using namespace bsdsock_ifinfo;
+
+	struct ifaddrs *list;
+	if (getifaddrs(&list) != 0) {
+		SETERRNO;
+		return -1;
+	}
+
+	int err = 0;
+	if (req == request::conf) {
+		const uae_s32 len = trap_get_long(ctx, arg);
+		const uae_u32 bufptr = trap_get_long(ctx, arg + 4);
+		if (len > 0 && !bufptr) {
+			err = 14; /* EFAULT */
+		} else {
+			const size_t needed = conf_size(list);
+			const size_t capacity = len > 0 ? static_cast<size_t>(len) : 0;
+			std::vector<uint8_t> buf(capacity < needed ? capacity : needed);
+			const size_t used = conf(list, buf.data(), buf.size());
+			if (used)
+				trap_put_bytes(ctx, buf.data(), bufptr, static_cast<int>(used));
+			trap_put_long(ctx, arg, static_cast<uae_u32>(used));
+		}
+	} else {
+		char name[name_size + 1];
+		trap_get_bytes(ctx, name, arg, name_size);
+		name[name_size] = 0;
+		uint8_t value[value_size];
+		err = query(list, name, req, value);
+		if (!err)
+			trap_put_bytes(ctx, value, arg + name_size, value_size);
+	}
+	freeifaddrs(list);
+
+	if (err) {
+		bsdsocklib_seterrno(ctx, sb, err);
+		return -1;
+	}
+	return 0;
+}
+
 uae_u32 host_IoctlSocket(TrapContext *ctx, SB, uae_u32 sd, uae_u32 request, uae_u32 arg)
 {
 	sd++;
@@ -5223,11 +5485,11 @@ uae_u32 host_IoctlSocket(TrapContext *ctx, SB, uae_u32 sd, uae_u32 request, uae_
 
 	switch (request) {
 	case 0x4004667B: /* FIOGETOWN */
-		sb->ownertask = get_long (arg);
+		trap_put_long(ctx, arg, sb->ownertask);
 		return 0;
 
 	case 0x8004667C: /* FIOSETOWN */
-		trap_put_long(ctx, arg,sb->ownertask);
+		sb->ownertask = trap_get_long(ctx, arg);
 		return 0;
 	case 0x8004667D: /* FIOASYNC */
 #ifdef _WIN32
@@ -5277,63 +5539,11 @@ uae_u32 host_IoctlSocket(TrapContext *ctx, SB, uae_u32 sd, uae_u32 request, uae_
 		break;
 	}
 
-#ifndef _WIN32
-	// Interface discovery IOCTLs - not available on Windows (no ifreq/ifconf)
-	case 0x80106921: /* SIOCGIFADDR */
-	case 0x80106923: /* SIOCGIFDSTADDR */
-	case 0x80106925: /* SIOCGIFBRDADDR */
-	case 0x80106927: /* SIOCGIFNETMASK */
-	case 0xc0206911: /* SIOCGIFFLAGS */
-	{
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(ifr));
-		// Read interface name from Amiga memory
-		for (int i = 0; i < IFNAMSIZ - 1; i++) {
-			ifr.ifr_name[i] = trap_get_byte(ctx, arg + i);
-			if (ifr.ifr_name[i] == 0) break;
-		}
-		ifr.ifr_name[IFNAMSIZ - 1] = 0;
-		r = ioctl(sock, request, &ifr);
-		if (r >= 0) {
-			// Write result back
-			if (request == 0xc0206911) { // SIOCGIFFLAGS
-				trap_put_word(ctx, arg + IFNAMSIZ, ifr.ifr_flags);
-			} else { // Address IOCTLs
-				copysockaddr_n2a(arg + IFNAMSIZ, (struct sockaddr_in*)&ifr.ifr_addr, 16);
-			}
-		}
-		return r;
-	}
-
-	case 0xc0086924: /* SIOCGIFCONF */
-	{
-		struct ifconf ifc;
-		char buf[1024];
-		ifc.ifc_len = sizeof(buf);
-		ifc.ifc_buf = buf;
-		r = ioctl(sock, SIOCGIFCONF, &ifc);
-		if (r >= 0) {
-			// Write back the interface list
-			trap_put_long(ctx, arg, ifc.ifc_len);
-			uae_u32 bufptr = trap_get_long(ctx, arg + 4);
-			if (bufptr) {
-				for (int i = 0; i < ifc.ifc_len && i < (int)sizeof(buf);) {
-					struct ifreq *ifr = (struct ifreq*)(buf + i);
-					// Write interface name
-					for (int j = 0; j < IFNAMSIZ; j++) {
-						trap_put_byte(ctx, bufptr + i + j, ifr->ifr_name[j]);
-					}
-					// Write address
-					copysockaddr_n2a(bufptr + i + IFNAMSIZ, (struct sockaddr_in*)&ifr->ifr_addr, 16);
-					i += sizeof(struct ifreq);
-				}
-			}
-		}
-		return r;
-	}
-#endif /* !_WIN32 */
-
 	} /* end switch */
+
+	const auto iface_req = bsdsock_ifinfo::decode(request);
+	if (iface_req != bsdsock_ifinfo::request::none)
+		return host_interface_ioctl(ctx, sb, iface_req, arg);
 
 	bsdsocklib_seterrno (ctx, sb, EINVAL);
 	return -1;
@@ -5692,9 +5902,18 @@ void host_gethostbynameaddr (TrapContext *ctx, SB, uae_u32 name, uae_u32 namelen
 	else
 		sb->action = 7;
 
+	drop_hostent(sb);
 	uae_sem_post (&sb->sem);
 
 	WAITSIGNAL;
+
+	unix_hostent_copy hostent;
+	if (sb->eintr) {
+		take_hostent(sb, &hostent);
+		bsdsocklib_setherrno(ctx, sb, 2); /* TRY_AGAIN */
+	} else if (take_hostent(sb, &hostent)) {
+		copyHostent(ctx, &hostent, sb);
+	}
 }
 
 #endif /* _WIN32 */

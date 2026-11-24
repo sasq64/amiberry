@@ -2,10 +2,7 @@
 #include "sysdeps.h"
 #include "options.h"
 #include "memory.h"
-#include "custom.h"
-#include "events.h"
 #include "newcpu.h"
-#include "cpu_prefetch.h"
 #include "cputbl.h"
 #include "cpummu.h"
 #define SET_ALWAYS_CFLG(x) SET_CFLG(x)
@@ -19992,8 +19989,6 @@ uae_u32 REGPARAM2 op_4e73_33_ff(uae_u32 opcode)
 		newsr = sr; newpc = pc;
 		if (frame == 0x0) {
 		m68k_areg(regs, 7) += offset; break; }
-		else if (frame == 0x1) {
-		m68k_areg(regs, 7) += offset; }
 		else if (frame == 0x2) {
 		m68k_areg(regs, 7) += offset + 4; break; }
 		else if (frame == 0x3) {

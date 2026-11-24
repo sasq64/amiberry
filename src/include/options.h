@@ -55,7 +55,17 @@ struct strlist {
 #define MAX_TOTAL_SCSI_DEVICES 8
 
 /* maximum number native input devices supported (single type) */
+#ifndef MAX_INPUT_DEVICES
 #define MAX_INPUT_DEVICES 20
+#endif
+#ifdef AMIBERRY
+// Builds may override MAX_INPUT_DEVICES (e.g. -DMAX_INPUT_DEVICES=8) to shrink uae_prefs.
+// The libretro core always registers 4 joysticks, and custom gameport
+// autoswitching keeps one bit per device in an int (custom_autoswitch_joy/mouse).
+#if MAX_INPUT_DEVICES < 4 || MAX_INPUT_DEVICES > 32
+#error "MAX_INPUT_DEVICES must be between 4 and 32"
+#endif
+#endif
 /* maximum number of native input device's buttons and axles supported */
 #define MAX_INPUT_DEVICE_EVENTS 256
 /* 4 different customization settings */
@@ -348,6 +358,20 @@ struct chipset_refresh
 	TCHAR commands[256];
 	TCHAR filterprofile[64];
 };
+// One chipset refresh entry in the configuration's displaydata CSV format:
+// the writer (truncating to size TCHARs) and the reader's parser (every
+// field but inuse and index). cfgfile and the shared settings layer both
+// use them, so the layer's option value is exactly what the file holds.
+void write_chipset_refresh_entry(const struct chipset_refresh* cr, int index, TCHAR* out,
+	size_t size);
+void parse_chipset_refresh_entry(const TCHAR* value, struct chipset_refresh* cr);
+// One cdimageN value: the writer (path already converted for saving, then
+// ",delay:" and the unit type when they are not the defaults; truncating
+// to size TCHARs) and the reader's parser (every field of the slot; the
+// path is not resolved against the relative-path base). cfgfile and the
+// shared settings layer both use them.
+void write_cdimage_entry(const struct cdslot* cd, const TCHAR* path, TCHAR* out, size_t size);
+void parse_cdimage_entry(const TCHAR* entry, struct cdslot* cd);
 
 #define APMODE_NATIVE 0
 #define APMODE_RTG 1
@@ -409,6 +433,7 @@ struct gfx_filterdata
 	int gfx_filter_integerscalelimit;
 	int gfx_filter_keep_autoscale_aspect;
 	int gfx_filter_rotation;
+	int gfx_filter_blanking;
 	bool changed;
 };
 
@@ -606,6 +631,7 @@ struct whdload_options
 	int slave_count;
 	std::string slave_default;
 	bool slave_libraries;
+	bool exp_chip;
 	std::vector<whdload_slave> slaves;
 	whdload_slave selected_slave;
 	std::string custom;
@@ -616,6 +642,13 @@ struct whdload_options
 	bool quit_on_exit;
 };
 #endif
+
+/* fpu_mode, the FPU core. Automatic: the exact core unless the JIT FPU is on,
+ * else the host core. Exact: 80-bit softfloat (cfgfile fpu_softfloat).
+ * Host: host floating point, 64-bit doubles. */
+#define FPU_MODE_AUTO 0
+#define FPU_MODE_EXACT 1
+#define FPU_MODE_HOST 2
 
 struct uae_prefs {
 
@@ -654,6 +687,9 @@ struct uae_prefs {
 
 	bool start_debugger;
 	int debugging_features;
+#ifdef GDBSERVER
+	int gdb_port;
+#endif
 	TCHAR debugging_options[MAX_DPATH];
 	bool start_gui;
 
@@ -696,7 +732,7 @@ struct uae_prefs {
 	bool cachesize_inhibit;
 	TCHAR jitblacklist[MAX_DPATH];
 	bool fpu_strict;
-	int fpu_mode;
+	int fpu_mode; // FPU_MODE_*: the FPU core (fpp.cpp fpu_core_wanted())
 
 	struct monconfig gfx_monitor[MAX_AMIGADISPLAYS];
 	int gfx_framerate, gfx_autoframerate;
@@ -734,6 +770,7 @@ struct uae_prefs {
 	int gfx_monitorblankdelay;
 	int gfx_rotation;
 	bool gfx_ntscpixels;
+	bool gfx_ntscpixelspal;
 	uae_u32 gfx_bordercolor;
 
 	struct gfx_filterdata gf[3];
@@ -886,6 +923,10 @@ struct uae_prefs {
 	TCHAR prtname[MAX_DPATH];
 	TCHAR sername[MAX_DPATH];
 	TCHAR a2065name[MAX_DPATH];
+#ifdef AMIBERRY
+	TCHAR zz9000net_name[MAX_DPATH];
+	bool zz9000_int2;
+#endif
 	TCHAR ne2000pciname[MAX_DPATH];
 	TCHAR ne2000pcmcianame[MAX_DPATH];
 	TCHAR picassoivromfile[MAX_DPATH];
@@ -967,6 +1008,7 @@ struct uae_prefs {
 	int uae_hide;
 	bool clipboard_sharing;
 	bool native_code;
+	bool minigl_zerocopy;
 	bool uae_hide_autoconfig;
 	int z3_mapping_mode;
 	bool autoconfig_custom_sort;
@@ -1004,6 +1046,7 @@ struct uae_prefs {
 	int gfx_vertical_offset;
 	int gfx_correct_aspect;
 	int scaling_method;
+	bool multithreaded_denise;
 #ifdef AMIBERRY
 	char shader[128];
 	char shader_rtg[128];
@@ -1073,6 +1116,7 @@ struct uae_prefs {
 
 	struct jport jports[MAX_JPORTS];
 	struct jport_custom jports_custom[MAX_JPORTS_CUSTOM];
+	int jports_default[MAX_JPORTS];
 	int input_selected_setting;
 	int input_joymouse_multiplier;
 	int input_joymouse_deadzone;
@@ -1104,6 +1148,7 @@ struct uae_prefs {
 
 #ifdef AMIBERRY
 	bool vkbd_enabled;
+	bool vkbd_touch_button; // KB button on the on-screen joystick overlay
 	bool vkbd_numpad;
 	bool vkbd_hires;
 	bool vkbd_exit;
@@ -1129,6 +1174,7 @@ struct uae_prefs {
 	bool use_retroarch_statebuttons;
 	bool use_retroarch_vkbd;
 
+	bool ipc_disable_logging;
 #endif
 };
 
@@ -1159,6 +1205,22 @@ extern void cfgfile_target_dwrite_str_escape(struct zfile *f, const TCHAR *optio
 
 extern void cfgfile_backup(const TCHAR* path);
 extern struct uaedev_config_data* add_filesys_config(struct uae_prefs* p, int index, struct uaedev_config_info*);
+// The controller field of a mount entry on controller type ct (board unit
+// ct_unit), with "%d" where the controller unit goes: "uae%d",
+// "ide%d_mainboard", "scsi%d_a2091-2"; empty for an unknown type.
+extern void cfgfile_controller_template(int ct, int ct_unit, TCHAR* out, size_t size);
+// The complete uaehfN spelling of an entry without adding it to a
+// configuration; false for a NULL entry or output buffer.
+extern bool cfgfile_mount_value_ci(const struct uaedev_config_info* ci, TCHAR* out, size_t size);
+// The uaehfN value of mount entry index, the complete .uae spelling of the
+// entry; false when index is not an entry.
+extern bool cfgfile_mount_value(struct uae_prefs* p, int index, TCHAR* out, size_t size);
+// Whether mount entry index's lines fit the line length the configuration
+// loader reads, so the entry survives a save and a load.
+extern bool cfgfile_mount_entry_fits(struct uae_prefs* p, int index);
+// Parses a uaehfN value into ci without adding it; false when the value is
+// not a valid entry.
+extern bool cfgfile_parse_mount_value(struct uae_prefs* p, const TCHAR* value, struct uaedev_config_info* ci);
 extern bool get_hd_geometry(struct uaedev_config_info*);
 extern void uci_set_defaults(struct uaedev_config_info* uci, bool rdb);
 
@@ -1216,10 +1278,18 @@ extern int cfgfile_string(const std::string& option, const std::string& value, c
 extern int cfgfile_string_escape(const TCHAR* option, const TCHAR* value, const TCHAR* name, TCHAR* location, int maxsz);
 extern bool cfgfile_option_find(const TCHAR* s, const TCHAR* option);
 extern TCHAR* cfgfile_option_get(const TCHAR* s, const TCHAR* option);
+// A board's settings word <-> its configuration text ("maprom,scsikitii").
+// configtext receives a board's string settings; it may be NULL only for
+// tables without EXPANSIONBOARD_STRING entries. The writer appends to buf,
+// which must hold MAX_DPATH characters.
+struct expansionboardsettings;
+extern int cfgfile_read_rom_settings(const struct expansionboardsettings* ebs, const TCHAR* buf, TCHAR* configtext);
+extern void cfgfile_write_rom_settings(const struct expansionboardsettings* ebs, TCHAR* buf, int settings, const TCHAR* settingstring);
 extern TCHAR* cfgfile_subst_path(const TCHAR* path, const TCHAR* subst, const TCHAR* file);
 
 extern TCHAR* target_expand_environment(const TCHAR* path, TCHAR* out, int maxlen);
 extern int target_parse_option (struct uae_prefs *, const TCHAR *option, const TCHAR *value, int type);
+extern int target_parse_compat_option(struct uae_prefs *, const TCHAR *option, const TCHAR *value, int type);
 extern void target_save_options(struct zfile*, struct uae_prefs*);
 extern void target_default_options(struct uae_prefs*, int type);
 extern void target_fixup_options(struct uae_prefs*);
@@ -1237,6 +1307,7 @@ extern struct uae_prefs* cfgfile_open(const TCHAR* filename, int* type);
 extern void cfgfile_close(struct uae_prefs* p);
 extern int cfgfile_load(struct uae_prefs* p, const TCHAR* filename, int* type, int ignorelink, int userconfig);
 extern int cfgfile_save(struct uae_prefs* p, const TCHAR* filename, int);
+extern int cfgfile_dump_config(struct uae_prefs* p, int type);
 extern void cfgfile_parse_line(struct uae_prefs* p, TCHAR*, int);
 extern void cfgfile_parse_lines(struct uae_prefs* p, const TCHAR*, int);
 extern int cfgfile_parse_option(struct uae_prefs* p, const TCHAR* option, TCHAR* value, int);
@@ -1249,6 +1320,9 @@ extern uae_u32 cfgfile_modify(uae_u32 index, const TCHAR* parms, uae_u32 size, T
 extern void cfgfile_addcfgparam(TCHAR*);
 extern int built_in_prefs(struct uae_prefs* p, int model, int config, int compa, int romcheck);
 extern int built_in_chipset_prefs(struct uae_prefs* p);
+// Amiberry settings layer: reads whether the configuration has expansion
+// memory that carries a battery-backed RTC (used by the chipset presets).
+extern bool has_expansion_with_rtc(struct uae_prefs* p, int chiplimit);
 //extern int cmdlineparser (const TCHAR *s, TCHAR *outp[], int max);
 extern void fixup_prefs_dimensions(struct uae_prefs* prefs);
 extern void fixup_prefs(struct uae_prefs* prefs, bool userconfig);
@@ -1257,6 +1331,16 @@ extern void cfgfile_compatibility_romtype(struct uae_prefs* p);
 extern void cfgfile_compatibility_rtg(struct uae_prefs* p);
 #ifdef AMIBERRY
 extern void cfgfile_compatibility_rtg_pixelformat(struct uae_prefs* p);
+// Resolves p as fixup_prefs() does for a settings preview: nothing is logged
+// and no device, input, hotkey, boot ROM or Kickstart state outside p
+// changes. fixup_prefs_preview_active is true on the calling thread while
+// a preview runs.
+extern void fixup_prefs_preview(struct uae_prefs* p);
+// built_in_prefs(p, model, config, compa, 0) for a settings preview: only p
+// changes. The target defaults it applies leave the multithreaded drawing
+// flag, the WHDLoad defaults and the FloppyBridge drivers alone.
+extern int built_in_prefs_preview(struct uae_prefs* p, int model, int config, int compa);
+extern thread_local bool fixup_prefs_preview_active;
 #endif
 extern bool cfgfile_detect_art(struct uae_prefs* p, TCHAR* path);
 extern const TCHAR *cfgfile_getconfigdata(size_t *len);
@@ -1265,9 +1349,23 @@ extern void cfgfile_get_shader_config(struct uae_prefs* p, int rtg);
 
 #ifdef AMIBERRY
 extern void whdload_auto_prefs(struct uae_prefs* prefs, const char* filepath, bool preserve_quickstart_hardware = false);
+extern void whdload_set_host_writes_enabled(bool enabled);
 extern void cd_auto_prefs(struct uae_prefs* prefs, char* filepath);
 extern void symlink_roms(struct uae_prefs* prefs);
 extern void drawbridge_update_profiles(struct uae_prefs* prefs);
+// The FloppyBridge drivers, in driver-index order (the drawbridge_driver
+// value): 0 drivers when the library is not available. refresh re-reads
+// the library's list. The option bits are FloppyBridgeAPI::ConfigOption_*.
+#define DRAWBRIDGE_OPTION_AUTOCACHE 0x01
+#define DRAWBRIDGE_OPTION_COMPORT 0x02
+#define DRAWBRIDGE_OPTION_AUTODETECT_COMPORT 0x04
+#define DRAWBRIDGE_OPTION_DRIVE_CABLE 0x08
+#define DRAWBRIDGE_OPTION_SMARTSPEED 0x10
+#define DRAWBRIDGE_OPTION_SHUGART 0x20
+extern int drawbridge_driver_count(bool refresh);
+extern const char* drawbridge_driver_name(int index);
+extern unsigned int drawbridge_driver_options(int index);
+extern void drawbridge_check_prefs_changed();
 #endif
 
 extern void check_prefs_changed_custom(void);
@@ -1337,7 +1435,9 @@ struct hotkey_modifiers
 struct amiberry_hotkey
 {
 	int scancode;
-	uint8_t button;
+	// The gamepad button (SDL_GamepadButton) the value names, -1 for none:
+	// 0 is the South button.
+	int button = -1;
 	std::string key_name;
 	std::string modifiers_string;
 	hotkey_modifiers modifiers;
@@ -1370,6 +1470,10 @@ struct amiberry_gui_theme
 	amiberry_gui_color table_header_color;
 	// Modal overlay
 	amiberry_gui_color modal_dim_color;
+	// Status text (warnings, errors, success messages)
+	amiberry_gui_color warning_color;
+	amiberry_gui_color error_color;
+	amiberry_gui_color success_color;
 
 	// Legacy fields (kept for backward compatibility with old .theme files)
 	amiberry_gui_color selector_inactive;
@@ -1385,12 +1489,26 @@ struct amiberry_shader_parameter
 	float value = 0.0f;
 };
 
+// Android mixes at 48 kHz (44.1 kHz loses AAudio's low-latency path to
+// resampling) and needs more queued audio to ride out scheduling stalls.
+// Every build has them: the settings layer exports them as the sound
+// options' Android defaults (the Android launcher's settings schema is
+// generated by a desktop build).
+#define ANDROID_DEFAULT_SOUND_FREQUENCY 48000
+#define ANDROID_DEFAULT_SOUND_BUFFER 8192
+
 struct amiberry_options
 {
 	bool quickstart_start = true;
 	bool read_config_descriptions = true;
+	// Configurations panel category groups left expanded, restored on startup.
+	std::vector<std::string> expanded_config_groups;
 	bool write_logfile = false;
 	bool rctrl_as_ramiga = false;
+	// macOS native UI: what Left Command-Q does while an emulation window
+	// is key. 0 = Left Amiga-Q to the Amiga, 1 = asks to quit, 2 = quits.
+	// Asks by default: earlier Mac builds quit on Command-Q.
+	int macos_left_command_q = 1;
 	bool gui_joystick_control = true;
 	int default_line_mode = 1;
 	int input_default_mouse_speed = 100;
@@ -1408,11 +1526,11 @@ struct amiberry_options
 	char default_quit_key[128]{};
 	char default_ar_key[128] = "Pause";
 	char default_fullscreen_toggle_key[128]{};
+	char default_screenshot_key[128]{};
 	bool default_horizontal_centering = false;
 	bool default_vertical_centering = false;
 	int default_scaling_method = -1;
 	int default_gfx_autoresolution = 0;
-	bool default_frameskip = false;
 	bool perf_log = false;
 	bool slow_host_warning = true;
 	bool use_adpf = true;
@@ -1420,12 +1538,18 @@ struct amiberry_options
 	int default_quickstart_compatibility = 0;
 	bool default_correct_aspect_ratio = true;
 	bool default_auto_crop = false;
+	bool default_multithreaded_denise = true;
 	int default_width = 720;
 	int default_height = 568;
 	int default_fullscreen_mode = 0;
 	int default_stereo_separation = 7;
+#ifdef __ANDROID__
+	int default_sound_buffer = ANDROID_DEFAULT_SOUND_BUFFER;
+	int default_sound_frequency = ANDROID_DEFAULT_SOUND_FREQUENCY;
+#else
 	int default_sound_buffer = 3072;
 	int default_sound_frequency = 44100;
+#endif
 	int default_joystick_deadzone = 33;
 	bool default_retroarch_quit = true;
 	bool default_retroarch_menu = true;
@@ -1453,9 +1577,17 @@ struct amiberry_options
 	bool default_onscreen_joystick = false;
 	bool default_vkbd_enabled = false;
 #endif
-	char default_vkbd_language[128] = "US";
-	int default_vkbd_transparency;
-	char default_vkbd_toggle[128] = "guide";
+char default_vkbd_language[128] = "US";
+int default_vkbd_transparency;
+#if defined(__ANDROID__) || defined(LIBRETRO)
+// Guide is intercepted as the menu trigger on Android (see
+// handle_controller_button_event), and the libretro joypad action space
+// has no guide button at all, so both frontends need a different default.
+char default_vkbd_toggle[128] = "leftstick";
+#else
+char default_vkbd_toggle[128] = "guide";
+#endif
+	bool default_vkbd_toggle_migrated = false;
 	char gui_theme[128] = "Default.theme";
 	char shader[128] = "none";
 	char shader_rtg[128] = "none";

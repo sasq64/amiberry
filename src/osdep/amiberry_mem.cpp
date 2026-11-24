@@ -12,7 +12,6 @@
 #include "autoconf.h"
 #include "gfxboard.h"
 #include "cpuboard.h"
-#include "rommgr.h"
 #include "newcpu.h"
 
 #ifdef _WIN32
@@ -22,7 +21,6 @@
 #endif
 
 #include "gui.h"
-#include "sys/types.h"
 #if defined(__linux__) && !defined(__ANDROID__)
 #include "sys/sysinfo.h"
 #endif
@@ -64,14 +62,6 @@ static void GetSystemInfo(SYSTEM_INFO* si)
 {
 	si->dwPageSize = sysconf(_SC_PAGESIZE);
 }
-
-#define USE_MMAP
-
-#ifdef USE_MMAP
-#ifdef MACOSX
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-#endif
 
 static void* VirtualAlloc(void* lpAddress, size_t dwSize, int flAllocationType,
 	int flProtect)
@@ -197,6 +187,9 @@ size_t max_physmem;
 #define MAXZ3MEM64 0xF0000000
 
 static struct uae_shmid_ds shmids[MAX_SHMID];
+static size_t shm_allocsizes[MAX_SHMID];
+static void* shm_heapallocs[MAX_SHMID];
+static addrbank* shm_heapowners[MAX_SHMID];
 uae_u8 *natmem_reserved, *natmem_offset;
 size_t natmem_reserved_size;
 static uae_u8 *p96mem_offset;
@@ -207,6 +200,19 @@ static uaecptr start_rtg = 0;
 static uaecptr end_rtg = 0;
 int maxmem;
 bool jit_direct_compatible_memory;
+// doinit_shm() has laid memory out, and whether it was asked for JIT direct
+static bool shm_laid_out;
+static bool shm_laid_out_direct;
+
+bool jit_direct_wanted(const struct uae_prefs *p)
+{
+	return p->cachesize && (!p->comptrustbyte || !p->comptrustword || !p->comptrustlong);
+}
+
+bool jit_direct_pending(const struct uae_prefs *p)
+{
+	return jit_direct_wanted(p) && !canbang && shm_laid_out && !shm_laid_out_direct;
+}
 
 bool can_have_1gb()
 {
@@ -251,12 +257,90 @@ static uae_u32 lowmem ()
 
 static uae_u64 size64;
 
-static void clear_shm ()
+static size_t page_round(size_t size)
+{
+	const size_t page_size = uae_vm_page_size();
+	return (size + page_size - 1) & ~(page_size - 1);
+}
+
+static size_t shmid_protect_size(int shmid)
+{
+	if (!shm_heapallocs[shmid])
+		return shmids[shmid].rosize;
+
+	const size_t protectsize = page_round(shmids[shmid].rosize);
+	return std::min(protectsize, shm_allocsizes[shmid]);
+}
+
+static void clear_shmid(int shmid)
+{
+	memset(&shmids[shmid], 0, sizeof shmids[shmid]);
+	shmids[shmid].key = -1;
+	shm_allocsizes[shmid] = 0;
+	shm_heapallocs[shmid] = nullptr;
+	shm_heapowners[shmid] = nullptr;
+}
+
+static void unprotect_nondirect_shmid(int shmid)
+{
+	if (shmid < 0 || shmid >= MAX_SHMID || !shm_heapallocs[shmid])
+		return;
+
+	if (shmids[shmid].mode == PAGE_READONLY && shmids[shmid].attached && shmids[shmid].rosize) {
+		DWORD old;
+		VirtualProtect(shmids[shmid].attached, shmid_protect_size(shmid), PAGE_READWRITE, &old);
+	}
+}
+
+static bool release_nondirect_shmid(int shmid)
+{
+	if (shmid < 0 || shmid >= MAX_SHMID || !shm_heapallocs[shmid])
+		return false;
+
+	unprotect_nondirect_shmid(shmid);
+	addrbank* owner = shm_heapowners[shmid];
+	if (owner && owner->baseaddr == shmids[shmid].attached) {
+		owner->baseaddr = nullptr;
+		owner->flags &= ~(ABFLAG_DIRECTMAP | ABFLAG_MAPPED);
+		owner->allocated_size = 0;
+	}
+	xfree(shm_heapallocs[shmid]);
+	clear_shmid(shmid);
+	return true;
+}
+
+static int find_shmid_by_address(const void* address)
+{
+	for (int i = 0; i < MAX_SHMID; i++) {
+		if (shmids[i].key != -1 && shmids[i].attached == address)
+			return i;
+	}
+	return -1;
+}
+
+#ifndef _WIN32
+static void* alloc_page_aligned(size_t size, void** rawmem)
+{
+	const size_t page_size = uae_vm_page_size();
+	void* raw = nullptr;
+
+	if (posix_memalign(&raw, page_size, size) != 0)
+		return nullptr;
+	memset(raw, 0, size);
+
+	*rawmem = raw;
+	return raw;
+}
+#endif
+
+static void clear_shm(const addrbank* keep)
 {
 	shm_start = nullptr;
-	for (auto & shmid : shmids) {
-		memset (&shmid, 0, sizeof(struct uae_shmid_ds));
-		shmid.key = -1;
+	for (int i = 0; i < MAX_SHMID; i++) {
+		if (keep && shm_heapowners[i] == keep && shmids[i].attached)
+			continue;
+		if (!release_nondirect_shmid(i))
+			clear_shmid(i);
 	}
 }
 
@@ -298,16 +382,10 @@ bool preinit_shm ()
 	GetSystemInfo (&si);
 	size_t max_allowed_mman = 512 + 256;
 	if (os_64bit) {
-#ifdef CPU_64_BIT
 		// 64-bit JITs are pointer-clean via a dedicated natmem base register.
 		// Reserve 4GB to cover the full 68040 32-bit address space,
 		// preventing SIGSEGV from JIT direct access to high M68K addresses.
 		max_allowed_mman = 4096 - 1;
-#else
-		// 32-bit builds (e.g. WoW64): all addresses are naturally below 4GB.
-		// Higher than 2G to support G-REX PCI VRAM.
-		max_allowed_mman = 2560;
-#endif
 	}
 	if (maxmem > 0)
 		max_allowed_mman = std::max<size_t>(static_cast<size_t>(maxmem), max_allowed_mman);
@@ -381,14 +459,10 @@ bool preinit_shm ()
 	natmem_size = WIN32_NATMEM_TEST * 1024 * 1024;
 #endif
 
-	#if defined(CPU_64_BIT)
 	// 64-bit JIT: ensure at least 4GB for full 68040 32-bit address space coverage.
 	// MAXZ3MEM64 may cap size64 below 4GB, but we need the natmem reservation
 	// to span all 4GB so JIT direct access to any M68K address won't fault outside it.
 	natmem_size = std::max<size_t>(natmem_size, 0x100000000ULL);
-#else
-	natmem_size = std::min<size_t>(natmem_size, 0xc0000000);
-#endif
 
 	write_log (_T("MMAN: Total physical RAM %llu MB, all RAM %llu MB\n"),
 	           totalphys64 >> 20, total64 >> 20);
@@ -397,13 +471,11 @@ bool preinit_shm ()
 #if 1
 	{
 		int vm_flags = UAE_VM_32BIT | UAE_VM_WRITE_WATCH;
-#if defined(CPU_64_BIT)
 		/* 64-bit JITs are pointer-clean (including add/sub on PC_P):
 		   natmem can live above 4GB.  Dropping UAE_VM_32BIT avoids futile
 		   mmap/munmap cycles on platforms where the kernel ignores low-address
 		   hints (e.g. macOS x86-64/ARM64). */
 		vm_flags &= ~UAE_VM_32BIT;
-#endif
 		natmem_reserved = static_cast<uae_u8*>(uae_vm_reserve(natmem_size, vm_flags));
 	}
 #else
@@ -436,7 +508,7 @@ bool preinit_shm ()
 				write_log (_T("MMAN: Can't allocate 257M of virtual address space!?\n"));
 				natmem_size = 17 * 1024 * 1024;
 				natmem_reserved = static_cast<uae_u8*>(VirtualAlloc(nullptr, natmem_size, vaflags, PAGE_READWRITE));
-				if (!natmem_size) {
+				if (!natmem_reserved) {
 					write_log (_T("MMAN: Can't allocate 17M of virtual address space!? Something is seriously wrong\n"));
 					notify_user(NUMSG_NOMEMORY);
 					return false;
@@ -457,14 +529,12 @@ bool preinit_shm ()
 			   natmem_reserved, natmem_reserved + natmem_reserved_size,
 			   natmem_reserved_size, natmem_reserved_size / (1024 * 1024));
 
-	clear_shm ();
+	clear_shm (nullptr);
 
 	canbang = true;
-#ifdef CPU_64_BIT
 	if ((uintptr_t)natmem_reserved + natmem_reserved_size > (uintptr_t)0x100000000ULL) {
 		write_log (_T("MMAN: INFO: natmem at %p exceeds 32-bit range - JIT direct mode allowed (64-bit clean)\n"), natmem_reserved);
 	}
-#endif
 	return true;
 }
 
@@ -510,6 +580,22 @@ static uae_u8 *va (uae_u32 offset, uae_u32 len, unsigned int alloc, unsigned int
 	return nullptr;
 }
 
+// Amiga addresses below this offset can be reached by JIT direct through natmem.
+static size_t jit_direct_limit(const struct uae_prefs *p)
+{
+	size_t limit = natmem_reserved_size;
+#if defined(CPU_AARCH64)
+	// The ARM64 JIT treats a host pointer that fits in 32 bits as a signed
+	// value in places, so natmem + address must stay below 2 GB when natmem
+	// itself lies below 4 GB. Desktop hosts reserve natmem above 4 GB; a
+	// program embedding the core with its own memory map may not.
+	const auto base = reinterpret_cast<uintptr_t>(natmem_reserved);
+	if (p->cachesize && base < 0x100000000ULL)
+		limit = base < 0x80000000ULL ? std::min<size_t>(limit, 0x80000000ULL - base) : 0;
+#endif
+	return limit;
+}
+
 static int doinit_shm ()
 {
 	struct rtgboardconfig *rbc = &changed_prefs.rtgboards[0];
@@ -537,7 +623,10 @@ static int doinit_shm ()
 	start_rtg = 0;
 	end_rtg = 0;
 
-	jit_direct_compatible_memory = p->cachesize && (!p->comptrustbyte || !p->comptrustword || !p->comptrustlong);
+	jit_direct_compatible_memory = jit_direct_wanted(p);
+	shm_laid_out = true;
+	shm_laid_out_direct = jit_direct_compatible_memory;
+	const size_t direct_limit = jit_direct_limit(p);
 
 	// 1G Z3chip?
 	if ((Z3BASE_UAE + p->z3chipmem.size > Z3BASE_REAL) ||
@@ -548,7 +637,7 @@ static int doinit_shm ()
 		// Wanted UAE || Blizzard RAM
 		p->z3_mapping_mode == Z3MAPPING_UAE || cpuboard_memorytype(&changed_prefs) == BOARD_MEMORY_BLIZZARD_12xx ||
 		// JIT && Automatic && Real does not fit in NATMEM && UAE fits in NATMEM
-		(expamem_z3_highram_real + extra >= natmem_reserved_size && expamem_z3_highram_uae + extra <= natmem_reserved_size && p->z3_mapping_mode == Z3MAPPING_AUTO && jit_direct_compatible_memory)) {
+		(expamem_z3_highram_real + extra >= direct_limit && expamem_z3_highram_uae + extra <= direct_limit && p->z3_mapping_mode == Z3MAPPING_AUTO && jit_direct_compatible_memory)) {
 		changed_prefs.z3autoconfig_start = currprefs.z3autoconfig_start = Z3BASE_UAE;
 		if (p->z3_mapping_mode == Z3MAPPING_AUTO)
 			write_log(_T("MMAN: Selected UAE Z3 mapping mode\n"));
@@ -561,7 +650,7 @@ static int doinit_shm ()
 		set_expamem_z3_hack_mode(Z3MAPPING_REAL);
 		if (expamem_z3_highram_real > totalsize_z3 && jit_direct_compatible_memory) {
 			totalsize_z3 = expamem_z3_highram_real;
-			if (totalsize_z3 + extra >= natmem_reserved_size) {
+			if (totalsize_z3 + extra >= direct_limit) {
 				jit_direct_compatible_memory = false;
 				write_log(_T("MMAN: Not enough direct memory for Z3REAL. Switching off JIT Direct.\n"));
 			}
@@ -573,7 +662,7 @@ static int doinit_shm ()
 
 	expansion_scan_autoconfig(&currprefs, true);
 
-	if (jit_direct_compatible_memory && (totalsize > size64 || totalsize + extra >= natmem_reserved_size)) {
+	if (jit_direct_compatible_memory && (totalsize > size64 || totalsize + extra >= direct_limit)) {
 		jit_direct_compatible_memory = false;
 		write_log(_T("MMAN: Not enough direct memory. Switching off JIT Direct.\n"));
 	}
@@ -590,6 +679,11 @@ static int doinit_shm ()
 			if (!start_rtg)
 				start_rtg = aci->start;
 			end_rtg = aci->start + aci->size;
+		} else if (aci->direct_vram && aci->zorro == 2) {
+			// Zorro II space (8 MB) is full: the board stays unconfigured.
+			write_log(_T("MMAN: %s (%u MB) does not fit in Zorro II space, disabled.\n"), aci->name, aci->size >> 20);
+			gui_message(_T("%s (%u MB) does not fit in the 8 MB Zorro II address space beside the other Zorro II boards, so it is disabled.\nLower the Z2 Fast RAM or the RTG board memory."),
+				aci->name, aci->size >> 20);
 		}
 	}
 
@@ -604,23 +698,14 @@ static int doinit_shm ()
 			notify_user(NUMSG_NOMEMORY);
 			return -1;
 		}
-#ifdef _WIN64
 		// 64-bit can't do natmem_offset..
 		notify_user(NUMSG_NOMEMORY);
 		return -1;
-#else
-
-		p96base_offset = start_rtg;
-		p96mem_size = end_rtg - start_rtg;
-		write_log("MMAN: rtgbase_offset = %08x, size %08x\n", p96base_offset, p96mem_size);
-		// adjust p96mem_offset to beginning of natmem
-		// by subtracting start of original p96mem_offset from natmem_offset
-		if (p96base_offset >= 0x10000000) {
-			natmem_offset = natmem_reserved - p96base_offset;
-			p96mem_offset = natmem_offset + p96base_offset;
-		}
-#endif
 	} else {
+		if (end_rtg > direct_limit && jit_direct_compatible_memory) {
+			write_log(_T("MMAN: VRAM above the JIT direct limit (%08x > %zx), switching off JIT Direct.\n"), end_rtg, direct_limit);
+			jit_direct_compatible_memory = false;
+		}
 		start_rtg = 0;
 		end_rtg = 0;
 	}
@@ -637,8 +722,8 @@ static int doinit_shm ()
 				ab->flags &= ~ABFLAG_ALLOCINDIRECT;
 				ab->jit_read_flag = 0;
 				ab->jit_write_flag = 0;
-				if (aci->start + aci->size > natmem_reserved_size) {
-					write_log(_T("%s %08x-%08x: not JIT direct capable (>%zx)!\n"), ab->name, aci->start, aci->start + aci->size - 1, natmem_reserved_size);
+				if (aci->start + aci->size > direct_limit) {
+					write_log(_T("%s %08x-%08x: not JIT direct capable (>%zx)!\n"), ab->name, aci->start, aci->start + aci->size - 1, direct_limit);
 					ab->flags |= ABFLAG_ALLOCINDIRECT;
 					ab->jit_read_flag = S_READ;
 					ab->jit_write_flag = S_WRITE;
@@ -683,6 +768,9 @@ bool init_shm()
 		if (ortgmem_type[i] != changed_prefs.rtgboards[i].rtgmem_type)
 			changed = true;
 	}
+	// JIT direct access (or the JIT) switched on or off since the layout
+	if (shm_laid_out && shm_laid_out_direct != jit_direct_wanted(&changed_prefs))
+		changed = true;
 	if (!changed && oz3chipmem_size == changed_prefs.z3chipmem.size)
 		return true;
 
@@ -702,7 +790,10 @@ bool init_shm()
 		return false;
 
 	resetmem (false);
-	clear_shm ();
+	// The UAE Boot ROM (rtarea) is allocated once, by virtualdevice_init():
+	// keep its non-direct allocation, or expamem_reset() writes through a
+	// NULL rtarea_bank.baseaddr.
+	clear_shm (&rtarea_bank);
 
 	memory_hardreset(2);
 	return true;
@@ -711,7 +802,7 @@ bool init_shm()
 void free_shm ()
 {
 	resetmem (true);
-	clear_shm ();
+	clear_shm (nullptr);
 	for (int & i : ortgmem_type) {
 		i = -1;
 	}
@@ -754,6 +845,15 @@ void mapped_free (addrbank *ab)
 	ab->flags &= ~ABFLAG_MAPPED;
 	if (ab->baseaddr == nullptr)
 		return;
+
+	const int nondirect_shmid = find_shmid_by_address(ab->baseaddr);
+	if (release_nondirect_shmid(nondirect_shmid)) {
+		ab->baseaddr = nullptr;
+		ab->flags &= ~ABFLAG_DIRECTMAP;
+		ab->allocated_size = 0;
+		write_log(_T("mapped_free nondirect %s\n"), ab->name);
+		return;
+	}
 
 	if (ab->flags & ABFLAG_INDIRECT) {
 		while(x) {
@@ -823,11 +923,9 @@ static uae_key_t get_next_shmkey ()
 
 STATIC_INLINE uae_key_t find_shmkey (uae_key_t key)
 {
-	int result = -1;
-	if(shmids[key].key == key) {
-		result = key;
-	}
-	return result;
+	if (key >= 0 && key < MAX_SHMID && shmids[key].key == key)
+		return key;
+	return -1;
 }
 
 bool uae_mman_info(addrbank* ab, struct uae_mman_data* md)
@@ -1071,11 +1169,13 @@ bool uae_mman_info(addrbank* ab, struct uae_mman_data* md)
 		md->maprom = maprom;
 		md->hasbarrier = barrier;
 
+		// 64-bit sums: an unassigned board (start 0xffffffff) wraps a 32-bit
+		// start + size below the limit and would be mapped past natmem.
+		const uae_u64 end = static_cast<uae_u64>(start) + size;
 		if (start_rtg && end_rtg) {
-			if (start < start_rtg || start + size > end_rtg)
+			if (start < start_rtg || end > end_rtg)
 				directsupport = false;
-		} else if (start >= natmem_reserved_size || start + size > natmem_reserved_size) {
-			// start + size may cause 32-bit overflow
+		} else if (start >= natmem_reserved_size || end > natmem_reserved_size) {
 			directsupport = false;
 		}
 		md->directsupport = directsupport;
@@ -1084,6 +1184,51 @@ bool uae_mman_info(addrbank* ab, struct uae_mman_data* md)
 		}
 	}
 	return got;
+}
+
+bool uae_mman_alloc_nodirect(addrbank* ab, uae_u32 size)
+{
+#ifdef _WIN32
+	(void)ab;
+	(void)size;
+	return false;
+#else
+	struct uae_mman_data md{};
+	if (!uae_mman_info(ab, &md) || !md.readonly)
+		return false;
+
+	const int shmid = get_next_shmkey();
+	if (shmid < 0)
+		return false;
+
+	const size_t requested = std::max<size_t>(md.size, size);
+	const size_t allocsize = page_round(requested);
+	void* rawmem = nullptr;
+	void* result = alloc_page_aligned(allocsize, &rawmem);
+	if (!result) {
+		write_log(_T("MMAN: failed to allocate %zu bytes for %s (%s)\n"),
+			allocsize, ab && ab->label ? ab->label : _T("?"),
+			ab && ab->name ? ab->name : _T("?"));
+		clear_shmid(shmid);
+		return false;
+	}
+
+	shmids[shmid].size = ab->reserved_size;
+	_tcscpy(shmids[shmid].name, ab->label ? ab->label : _T(""));
+	shmids[shmid].attached = result;
+	shmids[shmid].mode = PAGE_READONLY;
+	shmids[shmid].rosize = md.readonlysize;
+	shmids[shmid].maprom = md.maprom ? 1 : 0;
+	shmids[shmid].natmembase = nullptr;
+	shm_allocsizes[shmid] = allocsize;
+	shm_heapallocs[shmid] = rawmem;
+	shm_heapowners[shmid] = ab;
+	ab->baseaddr = static_cast<uae_u8*>(result);
+	write_log(_T("MMAN: allocated %s %p-%p %zu (%zuk) readonly-capable\n"),
+		ab->label ? ab->label : _T("?"), result,
+		static_cast<uae_u8*>(result) + allocsize, allocsize, allocsize >> 10);
+	return true;
+#endif
 }
 
 void *uae_shmat (addrbank *ab, int shmid, void *shmaddr, int shmflg, struct uae_mman_data *md)
@@ -1144,7 +1289,7 @@ void *uae_shmat (addrbank *ab, int shmid, void *shmaddr, int shmflg, struct uae_
 			virtualfreewithlock (shmaddr, size, MEM_DECOMMIT);
 		result = virtualallocwithlock (shmaddr, size, MEM_COMMIT, PAGE_READWRITE);
 		if (result == nullptr)
-			virtualfreewithlock (shmaddr, 0, MEM_DECOMMIT);
+			virtualfreewithlock (shmaddr, size, MEM_DECOMMIT);
 		result = virtualallocwithlock (shmaddr, size, MEM_COMMIT, PAGE_READWRITE);
 		if (result == nullptr) {
 			result = reinterpret_cast<void*>(-1);
@@ -1164,9 +1309,8 @@ void *uae_shmat (addrbank *ab, int shmid, void *shmaddr, int shmflg, struct uae_
 
 void unprotect_maprom()
 {
-	bool protect = false;
-	for (auto & shmid : shmids) {
-		struct uae_shmid_ds *shm = &shmid;
+	for (int i = 0; i < MAX_SHMID; i++) {
+		struct uae_shmid_ds *shm = &shmids[i];
 		if (shm->mode != PAGE_READONLY)
 			continue;
 		if (!shm->attached || !shm->rosize)
@@ -1174,11 +1318,12 @@ void unprotect_maprom()
 		if (shm->maprom <= 0)
 			continue;
 		shm->maprom = -1;
+		const size_t protectsize = shmid_protect_size(i);
 		DWORD old;
-		if (!VirtualProtect (shm->attached, shm->rosize, protect ? PAGE_READONLY : PAGE_READWRITE, &old)) {
-			write_log (_T("unprotect_maprom VP %08lX - %08lX %x (%dk) failed %d\n"),
-				static_cast<uae_u8*>(shm->attached) - natmem_offset, static_cast<uae_u8*>(shm->attached) - natmem_offset + shm->size,
-				shm->size, shm->size >> 10, GetLastError ());
+		if (!VirtualProtect(shm->attached, protectsize, PAGE_READWRITE, &old)) {
+			write_log(_T("unprotect_maprom VP %p - %p %zx (%zuk) failed %d\n"),
+				shm->attached, static_cast<uae_u8*>(shm->attached) + protectsize,
+				protectsize, protectsize >> 10, GetLastError());
 		}
 	}
 }
@@ -1186,31 +1331,36 @@ void unprotect_maprom()
 void protect_roms(bool protect)
 {
 	if (protect) {
-		// protect only if JIT enabled, always allow unprotect
-		if (!currprefs.cachesize || currprefs.comptrustbyte || currprefs.comptrustword || currprefs.comptrustlong) {
+		// protect only if JIT enabled, always allow unprotect.
+		// Only comp_trustbyte=indirect makes every access indirect
+		// (special_mem_default, jit/compemu_prefs.cpp); with
+		// comp_trustword/trustlong=indirect the other sizes are still
+		// native stores, so the ROM must stay write-protected.
+		if (!currprefs.cachesize || currprefs.comptrustbyte) {
 			return;
 		}
 		if (currprefs.rom_readwrite || rom_write_enabled) {
 			return;
 		}
 	}
-	for (auto & shmid : shmids) {
-		struct uae_shmid_ds *shm = &shmid;
+	for (int i = 0; i < MAX_SHMID; i++) {
+		struct uae_shmid_ds *shm = &shmids[i];
 		if (shm->mode != PAGE_READONLY)
 			continue;
 		if (!shm->attached || !shm->rosize)
 			continue;
 		if (shm->maprom < 0 && protect)
 			continue;
+		const size_t protectsize = shmid_protect_size(i);
 		DWORD old;
-		if (!VirtualProtect (shm->attached, shm->rosize, protect ? PAGE_READONLY : PAGE_READWRITE, &old)) {
-			write_log (_T("protect_roms VP %08lX - %08lX %x (%dk) failed %d\n"),
-				static_cast<uae_u8*>(shm->attached) - natmem_offset, static_cast<uae_u8*>(shm->attached) - natmem_offset + shm->rosize,
-				shm->rosize, shm->rosize >> 10, GetLastError ());
+		if (!VirtualProtect(shm->attached, protectsize, protect ? PAGE_READONLY : PAGE_READWRITE, &old)) {
+			write_log(_T("protect_roms VP %p - %p %zx (%zuk) failed %d\n"),
+				shm->attached, static_cast<uae_u8*>(shm->attached) + protectsize,
+				protectsize, protectsize >> 10, GetLastError());
 		} else {
-			write_log(_T("ROM VP %08lX - %08lX %x (%dk) %s\n"),
-				static_cast<uae_u8*>(shm->attached) - natmem_offset, static_cast<uae_u8*>(shm->attached) - natmem_offset + shm->rosize,
-				shm->rosize, shm->rosize >> 10, protect ? _T("WPROT") : _T("UNPROT"));
+			write_log(_T("ROM VP %p - %p %zx (%zuk) %s\n"),
+				shm->attached, static_cast<uae_u8*>(shm->attached) + protectsize,
+				protectsize, protectsize >> 10, protect ? _T("WPROT") : _T("UNPROT"));
 		}
 	}
 }
@@ -1422,12 +1572,11 @@ int uae_shmctl (int shmid, int cmd, struct uae_shmid_ds *buf)
 			result = 0;
 			break;
 		case UAE_IPC_RMID:
-			VirtualFree (shmids[shmid].attached, shmids[shmid].size, MEM_DECOMMIT);
-			shmids[shmid].key = -1;
-			shmids[shmid].name[0] = '\0';
-			shmids[shmid].size = 0;
-			shmids[shmid].attached = nullptr;
-			shmids[shmid].mode = 0;
+			if (!release_nondirect_shmid(shmid)) {
+				if (shmids[shmid].attached && !shmids[shmid].fake)
+					VirtualFree (shmids[shmid].attached, shmids[shmid].size, MEM_DECOMMIT);
+				clear_shmid(shmid);
+			}
 			result = 0;
 			break;
 		default: /* Invalid command */

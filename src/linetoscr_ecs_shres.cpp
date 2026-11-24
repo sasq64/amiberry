@@ -70,15 +70,9 @@ static void lts_ecs_shres_dhires(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, NULL, &dpix_val2, NULL);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_2x) {
 				#ifdef DEBUGGER
 				if (decode_specials_debug) {
 					dpix_val0 = decode_denise_specials_debug(dpix_val0, cnt + 0);
@@ -192,15 +186,9 @@ static void lts_ecs_shres_dhires_filtered(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, &dpix_val1, &dpix_val2, &dpix_val3);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_2x) {
 				dpix_val0 = filter_pixel(dpix_val0, dpix_val1);
 				dpix_val2 = filter_pixel(dpix_val2, dpix_val3);
 				#ifdef DEBUGGER
@@ -316,15 +304,9 @@ static void lts_ecs_shres_dshres(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, &dpix_val1, &dpix_val2, &dpix_val3);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_4x) {
 				#ifdef DEBUGGER
 				if (decode_specials_debug) {
 					dpix_val0 = decode_denise_specials_debug(dpix_val0, cnt + 0);
@@ -465,15 +447,9 @@ static void lts_ecs_shres_dhires_genlock(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, NULL, &dpix_val2, NULL);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_2x) {
 				#ifdef DEBUGGER
 				if (decode_specials_debug) {
 					dpix_val0 = decode_denise_specials_debug(dpix_val0, cnt + 0);
@@ -593,15 +569,9 @@ static void lts_ecs_shres_dhires_genlock_filtered(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, &dpix_val1, &dpix_val2, &dpix_val3);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_2x) {
 				dpix_val0 = filter_pixel(dpix_val0, dpix_val1);
 				dpix_val2 = filter_pixel(dpix_val2, dpix_val3);
 				gpix0 = filter_pixel_genlock(gpix0, gpix1);
@@ -725,15 +695,9 @@ static void lts_ecs_shres_dshres_genlock(void)
 			}
 			matchsprites_ecs_shres(cnt + 2);
 			if (sv0 || sv1) {
-				get_shres_spr_pix(sv0, sv1, &dpix_val0, &dpix_val2);
-				if (sv0) {
-					dpix_val1 = dpix_val0;
-				}
-				if (sv1) {
-					dpix_val3 = dpix_val2;
-				}
+				get_shres_spr_pix(pix0, pix1, pix2, pix3, sv0, sv1, &dpix_val0, &dpix_val1, &dpix_val2, &dpix_val3);
 			}
-			if (denise_pixtotal >= 0 && denise_pixtotal < denise_pixtotal_max) {
+			if (denise_pixtotal >= 0 && buf1 < denise_pixtotal_max_buf_4x) {
 				#ifdef DEBUGGER
 				if (decode_specials_debug) {
 					dpix_val0 = decode_denise_specials_debug(dpix_val0, cnt + 0);

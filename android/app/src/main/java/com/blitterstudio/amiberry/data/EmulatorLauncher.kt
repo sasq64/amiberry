@@ -4,25 +4,35 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.util.Log
 import com.blitterstudio.amiberry.AmiberryActivity
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 object EmulatorLauncher {
 
+	/** Whether an SDL start is in flight; see [launchSdlActivity]. */
+	private val startingLaunch = AtomicBoolean(false)
+
+	private const val TAG = "Amiberry-Launcher"
+
 	/**
-	 * Launch emulation with a Quick Start model and optional media.
-	 * Uses --model + -0/-s for floppy/CD, plus -G to skip ImGui GUI.
+	 * Launch emulation with a Quick Start model's configuration (which the
+	 * launcher wrote, the whole machine) and optional media: -0/-1/-s for
+	 * floppy/CD, plus -G to skip ImGui GUI.
 	 */
 	fun launchQuickStart(
 		context: Context,
 		model: AmigaModel,
+		configPath: String,
 		floppyPath: String? = null,
 		floppy1Path: String? = null,
-		cdPath: String? = null,
-		configPath: String? = null
+		cdPath: String? = null
 	) {
 		val request = LaunchRequest.QuickStart(
 			model = model,
@@ -44,18 +54,23 @@ object EmulatorLauncher {
 	}
 
 	/**
-	 * Launch emulation from a saved .uae config file.
+	 * Launch emulation from a saved .uae config file. The file's own control keys
+	 * win; [rememberedControls] only fills the control groups the file lacks.
 	 */
-	fun launchWithConfig(
+	suspend fun launchWithConfig(
 		context: Context,
 		configPath: String,
 		skipGui: Boolean = true,
-		controlSettings: EmulatorSettings? = null
+		rememberedControls: EmulatorSettings? = null
 	) {
+		val controlOverrides = rememberedControls?.let { remembered ->
+			val parsed = withContext(Dispatchers.IO) { ConfigParser.parse(File(configPath)) }
+			LaunchRequest.AndroidControlOverrides.missingFrom(parsed, remembered)
+		}
 		val request = LaunchRequest.SavedConfig(
 			configPath = configPath,
 			skipGui = skipGui,
-			controlOverrides = controlSettings?.let { LaunchRequest.AndroidControlOverrides.fromSettings(it) }
+			controlOverrides = controlOverrides
 		)
 
 		launchRequest(context, request)
@@ -70,24 +85,32 @@ object EmulatorLauncher {
 	 * This is intentionally not added to Recents because the backing config is
 	 * the transient .current_settings.uae file, not a user-saved configuration.
 	 */
-	fun launchSettingsConfig(context: Context, model: AmigaModel, configPath: String) {
-		launchRequest(context, LaunchRequest.SettingsConfig(model = model, configPath = configPath))
+	fun launchSettingsConfig(context: Context, configPath: String) {
+		launchRequest(context, LaunchRequest.SettingsConfig(configPath = configPath))
+	}
+
+	/** Restores a background autosave with the original launch's controls and settings. */
+	fun launchAutosave(context: Context, session: AndroidAutosave.Session) {
+		launchRequest(context, LaunchRequest.Autosave(session.stateFile.absolutePath, session.launchArgs))
 	}
 
 	/**
-	 * Launch a WHDLoad game via the --autoload mechanism.
-	 * The emulator auto-configures based on its XML database match.
+	 * Launch a WHDLoad game via the --autoload mechanism: WHDBooter chooses
+	 * the hardware from its game database, the installed Kickstarts or the
+	 * game's own configuration.
 	 */
 	fun launchWhdload(
 		context: Context,
 		lhaPath: String,
 		configPath: String? = null,
-		shaderOverride: String? = null
+		shaderOverride: String? = null,
+		controlOverrides: LaunchRequest.AndroidControlOverrides? = null
 	) {
 		val request = LaunchRequest.WhdLoad(
 			lhaPath = lhaPath,
 			configPath = configPath,
-			shaderOverride = shaderOverride
+			shaderOverride = shaderOverride,
+			controlOverrides = controlOverrides
 		)
 		launchRequest(context, request)
 		AppPreferences.getInstance(context).addRecentLaunch(JSONObject().apply {
@@ -111,21 +134,6 @@ object EmulatorLauncher {
 		})
 	}
 
-	/**
-	 * Open the full ImGui GUI, optionally loading a config file for editing.
-	 * Does NOT write a session marker or mark as emulator launch, since this
-	 * is a GUI-only session — the user expects to return cleanly to the
-	 * Kotlin UI without seeing a crash dialog.
-	 */
-	fun launchAdvancedGui(context: Context, configPath: String? = null) {
-		// No -G: ImGui GUI will open for the user
-
-		launchRequest(
-			context = context,
-			request = LaunchRequest.AdvancedGui(configPath = configPath)
-		)
-	}
-
 	private const val SESSION_MARKER = ".emulator_session"
 	private const val CLEAN_EXIT_MARKER = ".clean_exit"
 
@@ -136,8 +144,8 @@ object EmulatorLauncher {
 	/**
 	 * @param trackSession If true, writes a crash-detection marker and marks the
 	 *                     launch for review-prompt tracking. Set to false for
-	 *                     GUI-only sessions (Advanced/ImGui) where process exit
-	 *                     is expected and should not trigger the crash dialog.
+	 *                     launches whose process exit is expected and should not
+	 *                     trigger the crash dialog.
 	 */
 	private fun launchSdlActivity(
 		context: Context,
@@ -145,31 +153,42 @@ object EmulatorLauncher {
 		args: Array<String>,
 		trackSession: Boolean = true
 	) {
-		if (trackSession) {
-			writeSessionMarker(context)
-		} else {
-			clearUntrackedLaunchMarkers(context)
-		}
-
-		val finalArgs = prepareLaunchArgs(args)
-		writeLaunchDiagnostics(context, request, finalArgs, trackSession)
-
-		val intent = Intent(context, AmiberryActivity::class.java)
-		intent.putExtra("SDL_ARGS", finalArgs)
-		if (!context.isActivityBacked()) {
-			intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+		// One SDL start at a time, process-wide: two launch paths racing (the Library and
+		// the editor, or a second tap the UI had not disabled yet) must not start two
+		// emulator activities. A refused launch returns quietly; no marker is written.
+		if (!startingLaunch.compareAndSet(false, true)) {
+			Log.w(TAG, "Ignoring launch request while another launch is starting")
+			return
 		}
 		try {
-			context.startActivity(intent)
-		} catch (e: RuntimeException) {
 			if (trackSession) {
-				clearSessionMarker(context)
+				writeSessionMarker(context)
+			} else {
+				clearUntrackedLaunchMarkers(context)
 			}
-			throw e
-		}
 
-		if (trackSession) {
-			(context as? com.blitterstudio.amiberry.ui.MainActivity)?.markEmulatorLaunched()
+			val finalArgs = prepareLaunchArgs(args)
+			writeLaunchDiagnostics(context, request, finalArgs, trackSession)
+
+			val intent = Intent(context, AmiberryActivity::class.java)
+			intent.putExtra("SDL_ARGS", finalArgs)
+			if (!context.isActivityBacked()) {
+				intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+			}
+			try {
+				context.startActivity(intent)
+			} catch (e: RuntimeException) {
+				if (trackSession) {
+					clearSessionMarker(context)
+				}
+				throw e
+			}
+
+			if (trackSession) {
+				(context as? com.blitterstudio.amiberry.ui.MainActivity)?.markEmulatorLaunched()
+			}
+		} finally {
+			startingLaunch.set(false)
 		}
 	}
 

@@ -20,7 +20,6 @@
 #include "zfile.h"
 #include "archivers/zip/unzip.h"
 #include "archivers/dms/pfile.h"
-#include "crc32.h"
 #include "zarchive.h"
 #include "disk.h"
 
@@ -123,6 +122,7 @@ static struct zvolume *getzvolume (struct znode *parent, struct zfile *zf, unsig
 
 struct zfile *archive_access_select (struct znode *parent, struct zfile *zf, unsigned int id, int dodefault, int *retcode, int index)
 {
+	std::lock_guard<std::recursive_mutex> zarchive_guard(zarchive_access_mutex);
 	struct zvolume *zv;
 	struct znode *zn;
 	int zipcnt, first, select;
@@ -277,6 +277,7 @@ struct zfile *archive_access_arcacc_select (struct zfile *zf, unsigned int id, i
 
 void archive_access_scan (struct zfile *zf, zfile_callback zc, void *user, unsigned int id)
 {
+	std::lock_guard<std::recursive_mutex> zarchive_guard(zarchive_access_mutex);
 	struct zvolume *zv;
 	struct znode *zn;
 
@@ -1253,7 +1254,7 @@ struct zvolume *archive_directory_plain (struct zfile *z)
 	if (!memcmp (id, exeheader, sizeof id)) {
 		char *an = ua (zai.name);
 		char *data = xmalloc (char, 1 + strlen (an) + 1 + 1 + 1);
-		_sntprintf (data, sizeof data, "\"%s\"\n", an);
+		_sntprintf (data, 1 + strlen (an) + 1 + 1 + 1, "\"%s\"\n", an);
 		zn = addfile (zv, z, _T("s/startup-sequence"), (uae_u8*)data, uaestrlen (data));
 		xfree (data);
 		xfree (an);
@@ -2290,6 +2291,7 @@ void archive_access_close (void *handle, unsigned int id)
 #endif
 #ifdef A_LHA
 	case ArchiveFormatLHA:
+		archive_close_lha (handle);
 		break;
 #endif
 	case ArchiveFormatADF:

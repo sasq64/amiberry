@@ -56,6 +56,10 @@
 #include "scsi.h"
 #include "rtc.h"
 #include "devices.h"
+#ifdef AMIBERRY
+#include "fsdb_host.h"
+#endif
+#include <filesystem>
 #include "keyboard_mcu.h"
 
 #define CIAA_DEBUG_R 0
@@ -642,9 +646,9 @@ static void CIA_update_check(void)
 							t->inputpipe &= ~CIA_PIPE_CLR2;
 						}
 					} else {
-						if (acc_mode()) {
-							t->inputpipe &= ~CIA_PIPE_CLR1;
-						}
+						// Continuous mode: the reload takes one clock, so the
+						// period is latch + 1 (also in the non-accurate mode).
+						t->inputpipe &= ~CIA_PIPE_CLR1;
 					}
 				}
 				t->preovfl = false;
@@ -1151,7 +1155,9 @@ static void CIA_tod_event_check(int num)
 	if (c->tod_event_state == 1) {
 		int hpos = current_hpos();
 		if (hpos >= c->tod_offset) {
-			CIA_tod_inc(false, num);
+			// irq: the alarm or TOD may have been written after
+			// CIA_tod_handler() predicted no alarm on this tick.
+			CIA_tod_inc(true, num);
 			c->tod_event_state = 0;
 		}
 	}
@@ -1315,7 +1321,10 @@ static void cia_delayed_tod(int num)
 		return;
 	}
 	if (c->tod_event_state == 1) {
-		CIA_tod_inc(false, num);
+		// No alarm event was scheduled, either because none was
+		// predicted (the alarm or TOD can be written after that) or
+		// because the increment crossed into this line: still raise it.
+		CIA_tod_inc(true, num);
 	}
 	c->tod_event_state = 0;
 	c->tod_offset = -1;
@@ -1543,21 +1552,9 @@ static uae_u8 ReadCIAReg(int num, int reg)
 		bool timer_prev = true;
 		// fast CPU timer hack
 		if ((t->cr & CR_START) && !(t->cr & CR_INMODE1) && !(t->cr & CR_INMODE)) {
-			if (t->latch == t->timer) {
-				if (currprefs.cachesize || currprefs.m68k_speed < 0) {
-					uae_u16 adj = cia_timer_hack_adjust;
-					if (adj >= tval && (tval > 1 || !(t->cr & CR_RUNMODE))) {
-						adj = tval - 1;
-					}
-					tval -= adj;
-				}
-			}
 			if ((slow_cpu_access & 1) && (reg == 4 || reg == 6) && tval == t->timerval_prev) {
 				if (currprefs.cachesize || currprefs.m68k_speed < 0) {
-					uae_u16 adj = cia_timer_hack_adjust;
-					if (adj > 0 && ((tval > 1) || !(t->cr & CR_RUNMODE))) {
-						tval -= adj;
-					}
+					// Advance emulated time, not just this timer's returned value.
 					set_special(SPCFLAG_CPU_SLOW);
 					timer_prev = false;
 					t->timerval_prev = 0xffffffff;
@@ -2486,7 +2483,18 @@ static int cia_cycles(int delay, int phase, int val, int post)
 
 static void cia_wait_pre(int cianummask)
 {
-	if (currprefs.cachesize || currprefs.cpu_thread)
+	// Served for the CPU thread, the E-clock wait becomes chipset time the
+	// main thread may run without waiting for the CPU's progress (see
+	// cpu_thread_charge_access()).
+	if (cpu_threaded_run) {
+		if (!currprefs.cachesize) {
+			int syncdelay = 0;
+			int delay = get_cia_sync_cycles(&syncdelay);
+			cpu_thread_charge_access(syncdelay + delay);
+		}
+		return;
+	}
+	if (currprefs.cachesize)
 		return;
 #ifdef WITH_PPC
 	if (ppc_state)
@@ -2530,8 +2538,10 @@ static void cia_wait_post(int cianummask, uaecptr addr, uae_u32 value, bool rw)
 	if (ppc_state)
 		return;
 #endif
-	if (currprefs.cpu_thread)
+	if (cpu_threaded_run) {
+		cpu_thread_charge_access(currprefs.cachesize ? 12 * E_CYCLE_UNIT : e_clock_end * E_CYCLE_UNIT);
 		return;
+	}
 	if (currprefs.cachesize) {
 		do_cycles(12 * E_CYCLE_UNIT);
 	} else {
@@ -2712,6 +2722,16 @@ static uae_u32 REGPARAM2 cia_bget(uaecptr addr)
 	}
 #endif
 	return v;
+}
+
+// CIA-A PRA as a CPU read of 0xbfe001 would return it now (cia_bget()), for
+// the CPU thread's register snapshot. Not with inputs that need each read.
+bool cia_cpu_thread_pra(uae_u8 *v)
+{
+	if (currprefs.dongle || input_record > 0 || input_play > 0)
+		return false;
+	*v = ReadCIAA(0, nullptr);
+	return true;
 }
 
 static uae_u32 REGPARAM2 cia_wget(uaecptr addr)
@@ -2974,10 +2994,6 @@ static void write_battclock(void)
 	cfgfile_resolve_path_out_load(currprefs.rtcfile, path, MAX_DPATH, PATH_ROM);
 	struct zfile *f = zfile_fopen(path, _T("wb"));
 	if (f) {
-		struct tm *ct;
-		time_t t = time(0);
-		t += currprefs.cs_rtc_adjust;
-		ct = localtime(&t);
 		uae_u8 od;
 		if (currprefs.cs_rtc == 2) {
 			od = rtc_ricoh.clock_control_d;
@@ -2986,7 +3002,7 @@ static void write_battclock(void)
 			od = rtc_msm.clock_control_d;
 		}
 		for (int i = 0; i < 13; i++) {
-			uae_u8 v = getclockreg(i, ct);
+			uae_u8 v = getclockreg(i, NULL);
 			zfile_fwrite(&v, 1, 1, f);
 		}
 		if (currprefs.cs_rtc == 2) {
@@ -3008,16 +3024,45 @@ static void write_battclock(void)
 	}
 }
 
+// How long ago the rtcfile was written (write_battclock() rewrites all of
+// it), or -1. Taken from the file clock directly: no time zone involved.
+static uae_s64 rtcfile_age_us(const TCHAR *path)
+{
+	std::error_code ec;
+#ifdef AMIBERRY
+	const std::filesystem::path p(iso_8859_1_to_utf8(path));
+#else
+	const std::filesystem::path p(path);
+#endif
+	const auto written = std::filesystem::last_write_time(p, ec);
+	if (ec)
+		return -1;
+	const auto age = std::filesystem::file_time_type::clock::now() - written;
+	const uae_s64 us = std::chrono::duration_cast<std::chrono::microseconds>(age).count();
+	return us < 0 ? 0 : us;
+}
+
+static bool rtc_state_restored;	/* this savestate restore loaded an "RTC " chunk */
+
 void rtc_hardreset(void)
 {
+	// A state restore resets the machine after its chunks are loaded: keep
+	// the RTC state the savestate brought (older ones without it re-seed).
+	const bool keep = isrestore() && rtc_state_restored;
 	if (currprefs.cs_rtc == 1 || currprefs.cs_rtc == 3) { /* MSM6242B */
 		clock_bank.name = currprefs.cs_rtc == 1 ? _T("Battery backed up clock (MSM6242B)") : _T("Battery backed up clock A2000 (MSM6242B)");
+	} else if (currprefs.cs_rtc == 2) { /* RF5C01A */
+		clock_bank.name = _T("Battery backed up clock (RF5C01A)");
+	}
+	if (keep)
+		return;
+	if (currprefs.cs_rtc == 1 || currprefs.cs_rtc == 3) { /* MSM6242B */
 		rtc_msm.clock_control_d = 0x1;
 		rtc_msm.clock_control_e = 0;
 		rtc_msm.clock_control_f = 0x4; /* 24/12 */
 		rtc_msm.delayed_write = 0;
+		rtc_msm.clock = {};
 	} else if (currprefs.cs_rtc == 2) { /* RF5C01A */
-		clock_bank.name = _T("Battery backed up clock (RF5C01A)");
 		rtc_ricoh.clock_control_d = 0x8; /* Timer EN */
 		rtc_ricoh.clock_control_e = 0;
 		rtc_ricoh.clock_control_f = 0;
@@ -3025,6 +3070,7 @@ void rtc_hardreset(void)
 		memset(rtc_ricoh.rtc_alarm, 0, RF5C01A_RAM_SIZE);
 		rtc_ricoh.rtc_alarm[10] = 1; /* 24H mode */
 		rtc_ricoh.delayed_write = 0;
+		rtc_ricoh.clock = {};
 	}
 	if (currprefs.rtcfile[0]) {
 		TCHAR path[MAX_DPATH];
@@ -3034,16 +3080,27 @@ void rtc_hardreset(void)
 			int size = zfile_size32(f);
 			uae_u8 empty[16];
 			zfile_fread(empty, sizeof(empty), 1, f);
+			// The calendar digits (0-12) hold the time the guest set, as
+			// write_battclock() stored it: restore it, moved on by the time
+			// since then, like a battery-backed clock. Older files hold the
+			// host's time, which keeps the clock following the host. Not on
+			// a state restore: a savestate without RTC state re-seeds from
+			// the host clock.
+			const uae_s64 age = isrestore() ? -1 : rtcfile_age_us(path);
 			if (size > 16) {
 				rtc_ricoh.clock_control_d = empty[13];
 				rtc_ricoh.clock_control_e = empty[14];
 				rtc_ricoh.clock_control_f = empty[15];
 				zfile_fread(rtc_ricoh.rtc_alarm, RF5C01A_RAM_SIZE, 1, f);
 				zfile_fread(rtc_ricoh.rtc_memory, RF5C01A_RAM_SIZE, 1, f);
+				if (currprefs.cs_rtc == 2 && age >= 0)
+					rtc_restore_calendar(&rtc_ricoh, empty, age);
 			} else if (size == 16) {
 				rtc_msm.clock_control_d = empty[13];
 				rtc_msm.clock_control_e = empty[14];
 				rtc_msm.clock_control_f = empty[15];
+				if ((currprefs.cs_rtc == 1 || currprefs.cs_rtc == 3) && age >= 0)
+					rtc_restore_calendar(&rtc_msm, empty, age);
 			}
 			zfile_fclose(f);
 		}
@@ -3068,7 +3125,6 @@ static uae_u32 REGPARAM2 clock_wget(uaecptr addr)
 
 static uae_u32 REGPARAM2 clock_bget(uaecptr addr)
 {
-	struct tm *ct;
 	uae_u8 v = 0;
 
 	if ((addr & 0xffff) >= 0x8000 && currprefs.cs_fatgaryrev >= 0)
@@ -3083,11 +3139,8 @@ static uae_u32 REGPARAM2 clock_bget(uaecptr addr)
 	if ((addr & 3) == 2 || (addr & 3) == 0 || currprefs.cs_rtc == 0) {
 		return dummy_get_safe(addr, 1, false, v);
 	}
-	time_t t = time(0);
-	t += currprefs.cs_rtc_adjust;
-	ct = localtime(&t);
 	addr >>= 2;
-	return getclockreg(addr, ct);
+	return getclockreg(addr, NULL);
 }
 
 static void cputester_event(uae_u32 v)
@@ -3324,6 +3377,112 @@ uae_u8 *save_cia(int num, size_t *len, uae_u8 *dstptr)
 
 	*len = dst - dstbak;
 	return dstbak;
+}
+
+/* RTC state (chunk "RTC "): the clock time the guest set lives in the
+ * chip, so a snapshot restores it as it was at save time. A savestate
+ * without the chunk (older, or no RTC) re-seeds from the host clock:
+ * restore_rtc_start() clears the clocks first. */
+static void save_rtc_tm(uae_u8 **dstp, const struct tm *t)
+{
+	uae_u8 *dst = *dstp;
+	save_u16(t->tm_sec); save_u16(t->tm_min); save_u16(t->tm_hour);
+	save_u16(t->tm_mday); save_u16(t->tm_mon); save_u16(t->tm_year); save_u16(t->tm_wday);
+	*dstp = dst;
+}
+
+static uae_u8 *restore_rtc_tm(uae_u8 *src, struct tm *t)
+{
+	*t = {};
+	t->tm_sec = restore_u16(); t->tm_min = restore_u16(); t->tm_hour = restore_u16();
+	t->tm_mday = restore_u16(); t->tm_mon = restore_u16(); t->tm_year = (uae_s16)restore_u16(); t->tm_wday = restore_u16();
+	return src;
+}
+
+void restore_rtc_start(void)
+{
+	rtc_msm.clock = {};
+	rtc_ricoh.clock = {};
+	rtc_state_restored = false;
+}
+
+uae_u8 *save_rtc(size_t *len, uae_u8 *dstptr)
+{
+	if (currprefs.cs_rtc < 1 || currprefs.cs_rtc > 3)
+		return NULL;
+	uae_u8 *dstbak, *dst;
+	if (dstptr)
+		dstbak = dst = dstptr;
+	else
+		dstbak = dst = xmalloc(uae_u8, 200);
+	// The calendar advances lazily on register access, not on every frame.
+	getclockreg(0xd, NULL);
+	const bool ricoh = currprefs.cs_rtc == 2;
+	const struct rtc_clock_data *c = ricoh ? &rtc_ricoh.clock : &rtc_msm.clock;
+	save_u32(1);							/* version */
+	save_u32(currprefs.cs_rtc);				/* chip */
+	save_u8(ricoh ? rtc_ricoh.clock_control_d : rtc_msm.clock_control_d);
+	save_u8(ricoh ? rtc_ricoh.clock_control_e : rtc_msm.clock_control_e);
+	save_u8(ricoh ? rtc_ricoh.clock_control_f : rtc_msm.clock_control_f);
+	save_u8((c->initialized ? 1 : 0) | (c->written ? 2 : 0) | (c->hour12_written ? 4 : 0) | (c->carry_pending ? 8 : 0));
+	save_u32(c->phase_us);
+	save_u32(c->hour12);
+	save_rtc_tm(&dst, &c->value);
+	save_rtc_tm(&dst, &c->held_value);
+	if (ricoh) {
+		for (int i = 0; i < RF5C01A_RAM_SIZE; i++)
+			save_u8(rtc_ricoh.rtc_alarm[i]);
+		for (int i = 0; i < RF5C01A_RAM_SIZE; i++)
+			save_u8(rtc_ricoh.rtc_memory[i]);
+	}
+	*len = dst - dstbak;
+	return dstbak;
+}
+
+uae_u8 *restore_rtc(uae_u8 *src)
+{
+	if (restore_u32() != 1)
+		return src;
+	const uae_u32 chip = restore_u32();
+	const bool ricoh = chip == 2;
+	struct rtc_clock_data c = {};
+	const uae_u8 d = restore_u8(), e = restore_u8(), f = restore_u8();
+	const uae_u8 flags = restore_u8();
+	c.phase_us = restore_u32();
+	c.hour12 = restore_u32();
+	src = restore_rtc_tm(src, &c.value);
+	src = restore_rtc_tm(src, &c.held_value);
+	uae_u8 alarm[RF5C01A_RAM_SIZE], memory[RF5C01A_RAM_SIZE];
+	if (ricoh) {
+		for (int i = 0; i < RF5C01A_RAM_SIZE; i++)
+			alarm[i] = restore_u8();
+		for (int i = 0; i < RF5C01A_RAM_SIZE; i++)
+			memory[i] = restore_u8();
+	}
+	if (chip != (uae_u32)currprefs.cs_rtc)
+		return src;		/* another chip: re-seed from the host */
+	c.initialized = (flags & 1) != 0;
+	c.written = (flags & 2) != 0;
+	c.hour12_written = (flags & 4) != 0;
+	c.carry_pending = (flags & 8) != 0;
+	rtc_clock_resume(&c);	/* the clock runs on from now */
+	if (ricoh) {
+		rtc_ricoh.clock_control_d = d;
+		rtc_ricoh.clock_control_e = e;
+		rtc_ricoh.clock_control_f = f;
+		memcpy(rtc_ricoh.rtc_alarm, alarm, sizeof alarm);
+		memcpy(rtc_ricoh.rtc_memory, memory, sizeof memory);
+		rtc_ricoh.clock = c;
+		rtc_ricoh.delayed_write = -1;	/* the rtcfile mirrors the chip */
+	} else {
+		rtc_msm.clock_control_d = d;
+		rtc_msm.clock_control_e = e;
+		rtc_msm.clock_control_f = f;
+		rtc_msm.clock = c;
+		rtc_msm.delayed_write = -1;	/* the rtcfile mirrors the chip */
+	}
+	rtc_state_restored = true;
+	return src;
 }
 
 uae_u8 *save_keyboard(size_t *len, uae_u8 *dstptr)

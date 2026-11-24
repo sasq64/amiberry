@@ -1,57 +1,53 @@
 package com.blitterstudio.amiberry.ui
 
-import android.content.res.Configuration
 import android.widget.Toast
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationRail
-import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import com.blitterstudio.amiberry.R
-import com.blitterstudio.amiberry.ui.findActivity
-import androidx.navigation.NavDestination.Companion.hierarchy
-import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.blitterstudio.amiberry.R
+import com.blitterstudio.amiberry.data.ConfigurationSaveActions
 import com.blitterstudio.amiberry.data.GlobalDialogState
 import com.blitterstudio.amiberry.data.PendingImportState
+import com.blitterstudio.amiberry.ui.findActivity
 import com.blitterstudio.amiberry.ui.navigation.Screen
 import com.blitterstudio.amiberry.ui.navigation.shouldMoveTaskToBack
-import com.blitterstudio.amiberry.ui.screens.AboutScreen
-import com.blitterstudio.amiberry.ui.screens.ConfigurationsScreen
-import com.blitterstudio.amiberry.ui.screens.FileManagerScreen
-import com.blitterstudio.amiberry.ui.screens.QuickStartScreen
+import com.blitterstudio.amiberry.ui.screens.appsettings.AppSettingsScreen
+import com.blitterstudio.amiberry.ui.screens.library.LibraryScreen
 import com.blitterstudio.amiberry.ui.screens.settings.SettingsScreen
-import androidx.activity.ComponentActivity
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.lifecycle.viewmodel.compose.viewModel
-import com.blitterstudio.amiberry.data.ConfigurationSaveActions
 import com.blitterstudio.amiberry.ui.viewmodel.SettingsViewModel
 import kotlinx.coroutines.launch
 
@@ -84,12 +80,19 @@ fun AmiberryApp() {
 					}
 				},
 				dismissButton = {
-					TextButton(onClick = { activity.copyAssetExtractionFailureDetailsToClipboard() }) {
+					TextButton(
+						onClick = { activity.copyAssetExtractionFailureDetailsToClipboard() },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
 						Text(stringResource(R.string.asset_extraction_copy_details))
 					}
 				},
 				confirmButton = {
-					TextButton(onClick = { activity.retryAssetExtraction() }, enabled = !assetExtractionInProgress) {
+					TextButton(
+						onClick = { activity.retryAssetExtraction() },
+						enabled = !assetExtractionInProgress,
+						modifier = Modifier.dpadFocusIndicator()
+					) {
 						Text(
 							stringResource(
 								if (assetExtractionInProgress) R.string.action_retrying else R.string.action_retry
@@ -114,12 +117,18 @@ fun AmiberryApp() {
 					}
 				},
 				dismissButton = {
-					TextButton(onClick = { activity.copyCrashDiagnosticsToClipboard() }) {
+					TextButton(
+						onClick = { activity.copyCrashDiagnosticsToClipboard() },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
 						Text(stringResource(R.string.crash_dialog_copy_diagnostics))
 					}
 				},
 				confirmButton = {
-					TextButton(onClick = { activity.clearCrashFlag() }) {
+					TextButton(
+						onClick = { activity.clearCrashFlag() },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
 						Text(stringResource(R.string.crash_dialog_dismiss))
 					}
 				}
@@ -149,32 +158,25 @@ fun AmiberryApp() {
 		}
 	}
 
-	val configuration = LocalConfiguration.current
-	val useNavRail = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-
 	val navBackStackEntry by navController.currentBackStackEntryAsState()
 	val currentDestination = navBackStackEntry?.destination
 
 	val settingsViewModel: SettingsViewModel =
 		viewModel(LocalContext.current.findActivity() as ComponentActivity)
 	val navScope = rememberCoroutineScope()
-	var pendingNavigation by remember { mutableStateOf<(() -> Unit)?>(null) }
+	var pendingGuard by remember { mutableStateOf<UnsavedChangesGuard.Pending?>(null) }
 
-	fun navigateToRoute(route: String) {
-		navController.navigate(route) {
-			popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-			launchSingleTop = true
-			restoreState = true
-		}
-	}
 
-	val onSettingsRoute = currentDestination?.hierarchy?.any { it.route == Screen.Settings.route } == true
 
-	fun guardedNavigate(targetRoute: String, action: () -> Unit) {
-		if (targetRoute != Screen.Settings.route && onSettingsRoute && settingsViewModel.isDirty) {
-			pendingNavigation = action
-		} else {
-			action()
+	// Settings' Start asks the same question while a named configuration has unsaved edits.
+	val startGuard = remember(settingsViewModel) {
+		StartGuard { proceed ->
+			val pending = UnsavedChangesGuard.request(
+				UnsavedChangesGuard.Trigger.Start,
+				settingsViewModel.isDirty,
+				proceed
+			)
+			if (pending != null) pendingGuard = pending else proceed()
 		}
 	}
 
@@ -188,46 +190,70 @@ fun AmiberryApp() {
 		activity?.moveTaskToBack(true)
 	}
 
-	BackHandler(enabled = onSettingsRoute && settingsViewModel.isDirty) {
-		pendingNavigation = { activity?.moveTaskToBack(true) }
-	}
+	// Back from the editor to the Library asks about unsaved edits first (the handler
+	// sits in the Settings destination, AmiberryNavHost below); without any, Back
+	// simply pops to the Library.
 
-	pendingNavigation?.let { proceed ->
+	pendingGuard?.let { pending ->
 		val configName = settingsViewModel.currentConfigName.orEmpty()
-		AlertDialog(
-			onDismissRequest = { pendingNavigation = null },
-			title = { Text(stringResource(R.string.dialog_unsaved_changes_title)) },
-			text = { Text(stringResource(R.string.dialog_unsaved_changes_message, configName)) },
-			confirmButton = {
-				TextButton(onClick = {
-					navScope.launch {
-						val result = settingsViewModel.saveTracked()
-						if (result is ConfigurationSaveActions.SaveResult.Saved) {
-							pendingNavigation = null
-							proceed()
-						} else {
-							pendingNavigation = null
-							Toast.makeText(
-								context,
-								context.getString(R.string.msg_failed_save_config),
-								Toast.LENGTH_SHORT
-							).show()
-						}
+		val starting = pending.trigger == UnsavedChangesGuard.Trigger.Start
+		fun answer(choice: UnsavedChangesGuard.Choice) {
+			val resolution = UnsavedChangesGuard.resolve(pending.trigger, choice)
+			pendingGuard = null
+			if (resolution.saveFirst) {
+				navScope.launch {
+					val result = settingsViewModel.saveTracked()
+					if (result is ConfigurationSaveActions.SaveResult.Saved) {
+						pending.proceed()
+					} else {
+						Toast.makeText(
+							context,
+							context.getString(R.string.msg_failed_save_config),
+							Toast.LENGTH_SHORT
+						).show()
 					}
-				}) {
+				}
+				return
+			}
+			if (resolution.discardEdits) settingsViewModel.discardChanges()
+			if (resolution.proceed) pending.proceed()
+		}
+		AlertDialog(
+			onDismissRequest = { answer(UnsavedChangesGuard.Choice.Cancel) },
+			title = { Text(stringResource(R.string.dialog_unsaved_changes_title)) },
+			text = {
+				Text(
+					stringResource(
+						if (starting) R.string.dialog_unsaved_changes_start_message else R.string.dialog_unsaved_changes_message,
+						configName
+					)
+				)
+			},
+			confirmButton = {
+				// Save is the safe default for D-pad focus: an OK pressed at once must not
+				// throw the edits away.
+				val saveFocus = remember { FocusRequester() }
+				LaunchedEffect(Unit) { saveFocus.requestFocus() }
+				TextButton(
+					onClick = { answer(UnsavedChangesGuard.Choice.Save) },
+					modifier = Modifier.focusRequester(saveFocus).dpadFocusIndicator()
+				) {
 					Text(stringResource(R.string.action_save))
 				}
 			},
 			dismissButton = {
 				Row {
-					TextButton(onClick = {
-						settingsViewModel.discardChanges()
-						pendingNavigation = null
-						proceed()
-					}) {
-						Text(stringResource(R.string.action_discard))
+					TextButton(
+						onClick = { answer(UnsavedChangesGuard.Choice.DontSave) },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
+						// One wording for both: leaving reverts the edits, starting keeps them open, unsaved.
+						Text(stringResource(R.string.action_dont_save))
 					}
-					TextButton(onClick = { pendingNavigation = null }) {
+					TextButton(
+						onClick = { answer(UnsavedChangesGuard.Choice.Cancel) },
+						modifier = Modifier.dpadFocusIndicator()
+					) {
 						Text(stringResource(R.string.action_cancel))
 					}
 				}
@@ -235,65 +261,82 @@ fun AmiberryApp() {
 		)
 	}
 
-	if (useNavRail) {
-		Row(modifier = Modifier.fillMaxSize()) {
-			NavigationRail(modifier = Modifier.focusGroup()) {
-					Screen.bottomNavItems.forEach { screen ->
-						val title = stringResource(screen.titleRes)
-						NavigationRailItem(
-							icon = { Icon(screen.icon, contentDescription = title) },
-							label = { Text(title) },
-							selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
-						onClick = { guardedNavigate(screen.route) { navigateToRoute(screen.route) } }
-					)
-				}
-			}
-			Scaffold(modifier = Modifier.weight(1f)) { innerPadding ->
-				AmiberryNavHost(navController, Modifier.padding(innerPadding))
+	// D-pad focus enters the destination's content where it last was, else at the control the screen
+	// marks (contentEntryFocus), else at its first control.
+	val contentFocus = remember { FocusRequester() }
+	val contentEntry = remember { FocusRequester() }
+	val contentModifier = Modifier
+		.focusRequester(contentFocus)
+		.focusRestorer(contentEntry)
+		.focusGroup()
+	val currentRoute = currentDestination?.route
+	val tv = isTvDevice()
+	// On a TV, focus starts in the content, not on a top bar; the editor and App Settings
+	// take it from there (their page lists), the Library's content has it.
+	var initialFocusDone by rememberSaveable { mutableStateOf(false) }
+	LaunchedEffect(currentRoute) {
+		if (!tv || currentRoute == null || initialFocusDone) return@LaunchedEffect
+		// The destination's controls compose over the next frames.
+		repeat(CONTENT_FOCUS_ATTEMPTS) {
+			withFrameNanos { }
+			if (contentFocus.requestFocus(FocusDirection.Enter)) {
+				initialFocusDone = true
+				return@LaunchedEffect
 			}
 		}
-	} else {
-		Scaffold(
-			bottomBar = {
-				NavigationBar(modifier = Modifier.focusGroup()) {
-					Screen.bottomNavItems.forEach { screen ->
-						val title = stringResource(screen.titleRes)
-						NavigationBarItem(
-							icon = { Icon(screen.icon, contentDescription = title) },
-							label = { Text(title) },
-							selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
-							onClick = { guardedNavigate(screen.route) { navigateToRoute(screen.route) } }
-						)
+	}
+
+	CompositionLocalProvider(LocalContentEntryFocus provides contentEntry) {
+		Scaffold { innerPadding ->
+			// The screens' own Scaffolds apply the status and navigation bar insets;
+			// consuming the shell's padding keeps them from adding the same inset twice
+			// (an empty band above every title).
+			AmiberryNavHost(
+				navController,
+				startGuard,
+				editorDirty = settingsViewModel.isDirty,
+				onGuardedBack = {
+					pendingGuard = UnsavedChangesGuard.Pending(UnsavedChangesGuard.Trigger.Leave) {
+						navController.popBackStack()
 					}
-				}
-			}
-		) { innerPadding ->
-			AmiberryNavHost(navController, Modifier.padding(innerPadding))
+				},
+				contentModifier.padding(innerPadding).consumeWindowInsets(innerPadding)
+			)
 		}
 	}
 }
 
+/** Frames the shell waits for a destination's controls before it gives up moving focus there. */
+private const val CONTENT_FOCUS_ATTEMPTS = 30
+
 @Composable
-private fun AmiberryNavHost(navController: NavHostController, modifier: Modifier = Modifier) {
+private fun AmiberryNavHost(
+	navController: NavHostController,
+	startGuard: StartGuard,
+	editorDirty: Boolean,
+	onGuardedBack: () -> Unit,
+	modifier: Modifier = Modifier
+) {
 	NavHost(
 		navController = navController,
-		startDestination = Screen.QuickStart.route,
+		startDestination = Screen.Library.route,
 		modifier = modifier
 	) {
-		composable(Screen.QuickStart.route) {
-			QuickStartScreen(navController = navController)
+		composable(Screen.Library.route) {
+			LibraryScreen(navController = navController)
 		}
-		composable(Screen.About.route) {
-			AboutScreen(onBack = { navController.popBackStack() })
+		composable(Screen.AppSettings.route) {
+			AppSettingsScreen(navController = navController)
 		}
 		composable(Screen.Settings.route) {
-			SettingsScreen()
-		}
-		composable(Screen.FileManager.route) {
-			FileManagerScreen()
-		}
-		composable(Screen.Configurations.route) {
-			ConfigurationsScreen(navController = navController)
+			// Back from a dirty editor asks about the edits first. This handler must sit
+			// inside the destination: at the shell's level the NavHost's own Back would
+			// pop the editor without asking. The editor's page handler (registered while
+			// SettingsScreen composes, after this one) still closes an open page first.
+			BackHandler(enabled = editorDirty, onBack = onGuardedBack)
+			CompositionLocalProvider(LocalStartGuard provides startGuard) {
+				SettingsScreen()
+			}
 		}
 	}
 }

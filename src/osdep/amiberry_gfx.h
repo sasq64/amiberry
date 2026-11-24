@@ -20,6 +20,9 @@ extern SDL_PixelFormat pixel_format;
 extern uae_u8* p96_get_render_buffer_pointer(int monid);
 extern bool p96_is_zero_copy_enabled(int monid);
 extern bool p96_is_zero_copy_surface(int monid, const void* pixels);
+extern bool p96_is_vram_pointer(const void* ptr);
+extern bool p96_screen_fits_board_memory(int monid);
+extern bool p96_overlay_active();
 #endif
 
 #define GUI_WIDTH  860
@@ -185,6 +188,10 @@ inline SDL_Surface* get_amiga_surface(int monid = 0)
 	return amiga_surface;
 }
 
+// Native-chipset frame surface in pixel_format. Dma-buf backed when the
+// OpenGL renderer can sample it directly (dmabuf_surface.h).
+SDL_Surface* create_native_surface(int width, int height);
+
 enum class AmiberryGuiViewportSpace
 {
 	SdlRendererLogical,
@@ -209,11 +216,15 @@ AmiberryGuiGuardedInputResult amiberry_gui_guarded_input_apply(
 
 extern SDL_DisplayMode sdl_mode;
 extern const char* sdl_video_driver;
+// True when GL context creation failed at runtime and the SDL software
+// renderer took over (see gfx_window.cpp doInit). Diagnostics surface it.
+extern bool gl_renderer_demoted;
 extern SDL_Cursor* normalcursor;
 
 extern void sortdisplays();
 extern void enumeratedisplays();
 extern void reenumeratemonitors();
+void install_headless_display_fallback();
 
 extern bool MonitorFromPoint(SDL_Point pt);
 void gfx_DisplayChangeRequested(int);

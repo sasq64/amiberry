@@ -14,7 +14,8 @@ object AndroidLaunchConfig {
 
 	data class PreparedWhdLoad(
 		val configFile: File,
-		val shaderOverride: String
+		val shaderOverride: String,
+		val controlOverrides: LaunchRequest.AndroidControlOverrides?
 	)
 
 	fun loadLastSessionSettings(context: Context): EmulatorSettings {
@@ -46,19 +47,14 @@ object AndroidLaunchConfig {
 	): EmulatorSettings {
 		val selectedRoms = ModelRomAvailability.selectRomsForModel(model, roms)
 
-		return EmulatorSettings.fromModel(model).copy(
-			romFile = selectedRoms.kick?.path.orEmpty(),
-			romExtFile = selectedRoms.ext?.path.orEmpty(),
+		// The model's machine with the current controls, shader and input options.
+		return currentSettings.withModel(model, selectedRoms.config).copy(
+			romFile = selectedRoms.romFile,
+			romExtFile = selectedRoms.romExtFile,
 			floppy0 = floppy0,
 			floppy1 = floppy1,
 			floppy1Type = if (floppy1.isBlank()) -1 else 0,
-			cdImage = cdImage,
-			shader = currentSettings.shader,
-			joyport0 = currentSettings.joyport0,
-			joyport1 = currentSettings.joyport1,
-			onScreenJoystick = currentSettings.onScreenJoystick,
-			onScreenKeyboard = currentSettings.onScreenKeyboard,
-			onScreenKeyboardNumpad = currentSettings.onScreenKeyboardNumpad
+			cdImage = cdImage
 		)
 	}
 
@@ -68,21 +64,24 @@ object AndroidLaunchConfig {
 		filename: String = CONTROL_CONFIG
 	): File = ConfigGenerator.writeControlConfig(context, settings, filename)
 
+	/**
+	 * The control configuration and the overrides of a WHDLoad launch. WHDBooter
+	 * chooses the hardware when the game starts; the launcher passes only its
+	 * shader and controls, minus the ones the game's own configuration sets.
+	 */
 	fun prepareWhdLoad(
 		context: Context,
 		lhaPath: String,
 		currentSettings: EmulatorSettings
 	): PreparedWhdLoad {
-		val externalFilesDir = context.getExternalFilesDir(null)
-		val shader = WhdLoadAutoConfig.resolveLaunchShader(
-			globalSettingsFile = ShaderCatalog.findSettingsFile(context.filesDir, externalFilesDir),
-			externalFilesDir = externalFilesDir,
-			lhaFile = File(lhaPath),
-			currentShader = currentSettings.shader
+		val launch = WhdLoadPerGameConfig.launch(
+			WhdLoadPerGameConfig.existingFile(context, lhaPath),
+			currentSettings
 		)
 		return PreparedWhdLoad(
-			configFile = writeControlConfig(context, currentSettings.copy(shader = shader)),
-			shaderOverride = shader
+			configFile = writeControlConfig(context, launch.settings),
+			shaderOverride = launch.settings.shader,
+			controlOverrides = launch.controls
 		)
 	}
 

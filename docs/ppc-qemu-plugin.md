@@ -1,6 +1,6 @@
 # QEMU-UAE PPC Plugin
 
-Amiberry PPC emulation uses an external `qemu-uae` plugin built from QEMU 11.0.1 plus the UAE PPC patch deck. The plugin is loaded at runtime, so Amiberry can keep the emulator core and the QEMU-derived code in separate build and release pipelines.
+Amiberry PPC emulation uses an external `qemu-uae` plugin built from QEMU 11.1.3 plus the UAE PPC patch deck. The plugin is loaded at runtime, so Amiberry can keep the emulator core and the QEMU-derived code in separate build and release pipelines.
 
 ## Architecture
 
@@ -11,14 +11,12 @@ Amiberry PPC emulation uses an external `qemu-uae` plugin built from QEMU 11.0.1
 
 ## Plugin Source
 
-The initial plugin work is based on:
+The plugin is built and released from https://github.com/BlitterStudio/amiberry-qemu-uae, which applies its ordered patch deck to the official QEMU 11.1.3 release archive and publishes per-platform plugin artifacts. Amiberry CI and the AppImage build download a pinned release tag from that repository.
 
-- QEMU release: https://download.qemu.org/qemu-11.0.1.tar.xz
-- QEMU-UAE fork: https://github.com/reinauer/qemu-uae/tree/qemu-v11.0.1-uae
+The patch deck descends from:
+
 - UAE PPC patch deck: https://github.com/reinauer/uae-ppc-plugin
 - WinUAE packaging reference: https://github.com/reinauer/WinUAE/commit/35a6df1537961a507bea0f1bd1ab9d0e3f711132
-
-The preferred long-term layout is a separate Amiberry-owned plugin repository that tracks the upstream QEMU release, applies the UAE patch deck in order, and publishes per-platform plugin artifacts.
 
 ## Runtime Placement
 
@@ -53,13 +51,17 @@ cmake -B build-no-ppc -DUSE_PPC=OFF
 cmake -B build-ppc-no-qemu -DUSE_PPC=ON -DUSE_QEMU_PPC=OFF
 ```
 
-`USE_PPC=ON` enables PPC accelerator board support in Amiberry. `USE_QEMU_PPC=ON` enables runtime loading of the QEMU-UAE PPC implementation. PCem/QEMU device glue remains controlled by `USE_PCEM`.
+`USE_PPC=ON` enables PPC accelerator board support in Amiberry. `USE_QEMU_PPC=ON` enables runtime loading of the QEMU-UAE PPC implementation. The 86Box/QEMU device glue is controlled by `USE_86BOX`.
 
 `QEMU_UAE_PLUGIN` is optional. When set, CMake validates that the artifact exists and that QEMU PPC support is enabled, then installs it beside the other Amiberry plugins.
 
 ## Runtime Behavior
 
 With a compatible plugin installed, selecting a CyberStorm PPC or Blizzard PPC board and enabling PPC CPU emulation should load the QEMU implementation. If the plugin is missing, too old, or missing required symbols, Amiberry logs the plugin error and falls back to another available PPC implementation or the dummy implementation.
+
+### Plugin locations
+
+For installation folders, lookup order, and macOS signing requirements, see [Plugin locations](/plugin-locations).
 
 Non-PPC builds hide PPC accelerator options, clear stale PPC config state, and do not save PPC-only config keys.
 

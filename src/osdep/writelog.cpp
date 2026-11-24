@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <iostream>
 #include <clocale>
+#include <string>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -65,6 +66,15 @@ static SDL_Window* previousactivewindow;
 
 static uae_sem_t log_sem;
 static int log_sem_init;
+
+// Startup work such as legacy layout migration runs before logging_init() opens
+// the log file. Hold those messages and replay them into the log once it opens,
+// so notices that point users at the log have something to point at.
+// amiberry_main() can run more than once per process (libretro reloads), so each
+// run re-arms the capture with write_log_begin_startup_capture().
+static std::string startup_log_buffer;
+static bool startup_log_capture = true;
+static constexpr size_t STARTUP_LOG_BUFFER_LIMIT = 1024 * 1024;
 
 #ifndef _WIN32
 // Returns true when the fd is a redirected regular file or pipe — i.e. the
@@ -906,8 +916,9 @@ TCHAR* write_log_get_ts(void)
 	p += strlen(p);
 	_sntprintf(p, 10, "%03d", milliseconds);
 	p += strlen(p);
-	if (vsync_counter != 0xffffffff)
-		_sntprintf(p, 50, " [%u %03d%s%03d/%03d]", vsync_counter, current_hpos_safe(), lof_store ? "-" : "=", vpos, linear_display_vpos);
+	if (vsync_counter != 0xffffffff) {
+		_stprintf (p, _T(" [%d %03d%s%03d/%03d]"), vsync_counter, current_hpos_safe(), lof_store ? _T("-") : _T("="), vpos, linear_vpos_start);
+	}
 	strcat(p, ": ");
 	return out;
 }
@@ -922,8 +933,13 @@ void write_log(const char* format, ...)
 	va_list parms;
 	const bool has_libretro_log = false;
 
+	// A settings preview runs the configuration fixups only to report what
+	// they would change; their log lines would repeat on every preview.
+	if (fixup_prefs_preview_active)
+		return;
 #ifndef __ANDROID__
-	if (!has_libretro_log && !amiberry_options.write_logfile && !console_logging && !debugfile)
+	if (!has_libretro_log && !amiberry_options.write_logfile && !console_logging && !debugfile
+		&& !startup_log_capture)
 		return;
 #endif
 
@@ -963,6 +979,9 @@ void write_log(const char* format, ...)
 			fprintf(debugfile, "%s", ts);
 		fprintf(debugfile, "%s", bufp);
 	}
+	if (startup_log_capture && !debugfile
+		&& startup_log_buffer.size() + _tcslen(bufp) <= STARTUP_LOG_BUFFER_LIMIT)
+		startup_log_buffer += bufp;
 	lfdetected = 0;
 	if (bufp[0] != '\0' && bufp[_tcslen(bufp) - 1] == '\n')
 		lfdetected = 1;
@@ -1001,6 +1020,30 @@ void flush_log()
 	if (debugfile)
 		fflush(debugfile);
 	flushconsole();
+}
+
+void write_log_begin_startup_capture()
+{
+	if (log_sem_init) uae_sem_wait(&log_sem);
+	startup_log_capture = true;
+	if (log_sem_init) uae_sem_post(&log_sem);
+}
+
+void write_log_end_startup_capture()
+{
+	if (log_sem_init) uae_sem_wait(&log_sem);
+	if (startup_log_capture)
+	{
+		if (debugfile && !startup_log_buffer.empty())
+		{
+			fputs(startup_log_buffer.c_str(), debugfile);
+			if (always_flush_log)
+				fflush(debugfile);
+		}
+		startup_log_capture = false;
+		std::string().swap(startup_log_buffer);
+	}
+	if (log_sem_init) uae_sem_post(&log_sem);
 }
 
 void f_out(FILE* f, const TCHAR* format, ...)

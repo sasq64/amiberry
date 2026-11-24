@@ -25,6 +25,10 @@
 #include "sana2.h"
 
 #define TARGET_NAME _T("amiberry")
+// Also read the settings that WinUAE for Windows saves as win32.*.
+#define TARGET_NAME_COMPAT _T("win32")
+// True when a win32.* option means the same in Amiberry (without the prefix).
+bool amiberry_config_is_compat_option(const TCHAR *option);
 
 #define NO_MAIN_IN_MAIN_C
 
@@ -58,10 +62,20 @@ extern std::string get_version_string();
 extern std::string get_copyright_notice();
 extern std::string get_sdl_version_string();
 
+#if defined(_WIN32) && !defined(LIBRETRO)
+// Host file names are UTF-8 (the native UI) or ANSI (older configurations);
+// host_fopen() (host_fs.h) opens either through the wide API.
+extern FILE* host_fopen(const char* path, const char* mode);
+STATIC_INLINE FILE* uae_tfopen(const TCHAR* path, const TCHAR* mode)
+{
+	return host_fopen(path, mode);
+}
+#else
 STATIC_INLINE FILE* uae_tfopen(const TCHAR* path, const TCHAR* mode)
 {
 	return fopen(path, mode);
 }
+#endif
 
 // Expose prefix_with_application_directory from amiberry_filesys,
 // so we can use it to open the main configuration file on OS X
@@ -71,9 +85,14 @@ extern int minimized;
 extern int monitor_off;
 extern bool joystick_refresh_needed;
 extern void handle_joy_device_event(unsigned int which, bool removed);
+extern bool install_fault_signal_handlers();
 extern std::string screenshot_filename;
 
 extern void logging_init();
+// Startup log capture: messages logged between write_log_begin_startup_capture()
+// and logging_init() are replayed into the log file once it opens.
+extern void write_log_begin_startup_capture();
+extern void write_log_end_startup_capture();
 
 extern bool my_kbd_handler(int, int, int, bool);
 extern bool my_kbd_host_hotkey_handler(int, int, bool, bool, bool, bool);
@@ -91,6 +110,11 @@ extern int amiberry_get_active_input_monitor();
 extern int amiberry_resolve_active_input_monitor();
 
 extern amiberry_hotkey get_hotkey_from_config(const std::string& config_option);
+// The gamepad button a shortcut value names, SDL_GAMEPAD_BUTTON_INVALID for
+// none; a letter key's value ("A") is not a button ("a").
+extern SDL_GamepadButton gamepad_button_from_config(const std::string& value);
+// Re-reads the keyboard shortcuts (open GUI, quit, screenshot ...) from p.
+extern void target_hotkeys_changed(const uae_prefs* p);
 extern amiberry_hotkey enter_gui_key;
 extern SDL_GamepadButton enter_gui_button;
 extern amiberry_hotkey quit_key;
@@ -110,6 +134,9 @@ extern int z3_base_adr;
 extern bool volatile flip_in_progress;
 
 extern void setmouseactive(int monid, int active);
+// Lets the mouse go without the "pause when not captured" option pausing the
+// emulation: the native on-screen keyboard's keys are clicked while it runs.
+extern void setmouseinactive_running(int monid);
 extern void minimizewindow(int monid);
 extern void updatemouseclip(struct AmigaMonitor*);
 extern void updatewinrect(struct AmigaMonitor*, bool);
@@ -159,7 +186,10 @@ extern void create_missing_directories_for_base_content_path(const std::string& 
 extern void set_configuration_path(const std::string& newpath);
 extern std::string get_nvram_path();
 extern void set_nvram_path(const std::string& newpath);
-extern std::string get_plugins_path();
+extern std::string get_plugins_override_path();
+extern bool user_plugins_supported();
+extern std::string get_user_plugins_path();
+extern std::vector<std::string> get_plugin_search_paths();
 extern void set_plugins_path(const std::string& newpath);
 extern std::string get_floppy_sounds_path();
 extern void set_floppy_sounds_path(const std::string& newpath);
@@ -173,6 +203,7 @@ extern std::string get_video_path();
 extern void set_video_path(const std::string& newpath);
 extern void set_screenshot_path(const std::string& newpath);
 extern std::string get_savestate_path();
+extern std::string get_savestate_folder();
 extern void set_savestate_path(const std::string& newpath);
 extern void set_themes_path(const std::string& newpath);
 extern void set_shaders_path(const std::string& newpath);
@@ -217,6 +248,9 @@ extern bool get_portable_mode();
 extern bool can_toggle_portable_mode(std::string* reason_out);
 extern bool set_portable_mode(bool enable);
 #endif
+extern int relativepaths;
+extern std::string get_relative_path_base();
+extern const char* get_nvram_directory_name();
 extern bool should_show_legacy_cleanup_prompt();
 extern std::vector<std::string> get_legacy_cleanup_prompt_items();
 extern bool legacy_cleanup_uses_trash();
@@ -232,8 +266,19 @@ extern void extract_path(const char* str, char* buffer);
 extern std::string extract_path(const std::string& filename);
 extern void remove_file_extension(char* filename);
 extern std::string remove_file_extension(const std::string& filename);
+// What screenshots and save states are named after; empty when nothing is.
+extern std::string current_content_name();
+extern void set_last_active_config(const char* filename);
+// The configuration file the pending configuration came from or was last
+// saved to; empty for a default or an RP9 package.
+extern void set_current_config_path(const char* filename);
+extern std::string get_current_config_path();
+// Forgets the configuration file and the names taken from it: the pending
+// configuration becomes a new machine.
+extern void forget_loaded_config();
 extern void set_last_active_config_from_media(const char* filename);
 extern void ReadConfigFileList();
+extern bool remove_configuration_file(const std::string& config_file);
 extern void configurations_panel_reset();
 extern void read_rom_list(bool);
 extern int scan_roms(int show);
@@ -322,7 +367,7 @@ typedef long GUID;
 #define SOUND_DEVICE_WASAPI 4
 #define SOUND_DEVICE_WASAPI_EXCLUSIVE 5
 #define SOUND_DEVICE_XAUDIO2 6
-#define SOUND_DEVICE_SDL2 7
+#define SOUND_DEVICE_SDL 7
 
 struct sound_device
 {

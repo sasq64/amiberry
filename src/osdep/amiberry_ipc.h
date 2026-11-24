@@ -1,6 +1,6 @@
 //
 // Unified IPC interface for Amiberry
-// Supports Unix domain sockets (cross-platform: Linux, macOS, FreeBSD)
+// Listens on a Unix domain socket (Linux, macOS, FreeBSD) or a named pipe (Windows)
 //
 
 #pragma once
@@ -13,15 +13,7 @@
 
 namespace Amiberry::IPC {
 
-// Socket path - use XDG_RUNTIME_DIR on Linux if available, else /tmp
-#ifdef __linux__
-    #define DEFAULT_SOCKET_PATH "/tmp/amiberry.sock"
-#else
-    // macOS and other Unix systems
-    constexpr char const* DEFAULT_SOCKET_PATH = "/tmp/amiberry.sock";
-#endif
-
-// Command names (same as DBus for consistency)
+// Command names
 constexpr char const* CMD_QUIT = "QUIT";
 constexpr char const* CMD_PAUSE = "PAUSE";
 constexpr char const* CMD_RESUME = "RESUME";
@@ -37,6 +29,11 @@ constexpr char const* CMD_GET_STATUS = "GET_STATUS";
 constexpr char const* CMD_GET_CONFIG = "GET_CONFIG";
 constexpr char const* CMD_SET_CONFIG = "SET_CONFIG";
 constexpr char const* CMD_LOAD_CONFIG = "LOAD_CONFIG";
+constexpr char const* CMD_SAVE_CONFIG = "SAVE_CONFIG";
+constexpr char const* CMD_HOST_SETTINGS_LIST = "HOST_SETTINGS_LIST";
+constexpr char const* CMD_HOST_SETTINGS_GET = "HOST_SETTINGS_GET";
+constexpr char const* CMD_HOST_SETTINGS_SET = "HOST_SETTINGS_SET";
+constexpr char const* CMD_HOST_SETTINGS_SAVE = "HOST_SETTINGS_SAVE";
 constexpr char const* CMD_SEND_KEY = "SEND_KEY";
 constexpr char const* CMD_READ_MEM = "READ_MEM";
 constexpr char const* CMD_WRITE_MEM = "WRITE_MEM";
@@ -48,6 +45,8 @@ constexpr char const* CMD_GET_VOLUME = "GET_VOLUME";
 constexpr char const* CMD_MUTE = "MUTE";
 constexpr char const* CMD_UNMUTE = "UNMUTE";
 constexpr char const* CMD_TOGGLE_FULLSCREEN = "TOGGLE_FULLSCREEN";
+constexpr char const* CMD_OPEN_SETTINGS = "OPEN_SETTINGS";
+constexpr char const* CMD_CHOOSE_MEDIA = "CHOOSE_MEDIA";
 constexpr char const* CMD_SET_WARP = "SET_WARP";
 constexpr char const* CMD_GET_WARP = "GET_WARP";
 constexpr char const* CMD_GET_VERSION = "GET_VERSION";
@@ -56,12 +55,39 @@ constexpr char const* CMD_LIST_CONFIGS = "LIST_CONFIGS";
 constexpr char const* CMD_FRAME_ADVANCE = "FRAME_ADVANCE";
 constexpr char const* CMD_SET_MOUSE_SPEED = "SET_MOUSE_SPEED";
 constexpr char const* CMD_SEND_MOUSE = "SEND_MOUSE";
+constexpr char const* CMD_SEND_JOYSTICK = "SEND_JOYSTICK";
 constexpr char const* CMD_SEND_MOUSE_ABS = "SEND_MOUSE_ABS";
 constexpr char const* CMD_GET_GUI_AUTOMATION_STATE = "GET_GUI_AUTOMATION_STATE";
 constexpr char const* CMD_SET_GUI_AUTOMATION_CONFIG = "SET_GUI_AUTOMATION_CONFIG";
 constexpr char const* CMD_SEND_MOUSE_ABS_GUARDED = "SEND_MOUSE_ABS_GUARDED";
 constexpr char const* CMD_RELEASE_MOUSE_BUTTONS = "RELEASE_MOUSE_BUTTONS";
 constexpr char const* CMD_PING = "PING";
+
+// Settings edit session (one session owned by the IPC server)
+constexpr char const* CMD_SETTINGS_GET = "SETTINGS_GET";
+constexpr char const* CMD_SETTINGS_SET = "SETTINGS_SET";
+constexpr char const* CMD_SETTINGS_VALIDATE = "SETTINGS_VALIDATE";
+constexpr char const* CMD_SETTINGS_COMMIT = "SETTINGS_COMMIT";
+constexpr char const* CMD_SETTINGS_RESET_SESSION = "SETTINGS_RESET_SESSION";
+constexpr char const* CMD_SETTINGS_GET_ACTIVE = "SETTINGS_GET_ACTIVE";
+constexpr char const* CMD_SETTINGS_LIST = "SETTINGS_LIST";
+constexpr char const* CMD_SETTINGS_DESCRIBE = "SETTINGS_DESCRIBE";
+constexpr char const* CMD_SETTINGS_APPLY = "SETTINGS_APPLY";
+constexpr char const* CMD_LIST_MEDIA = "LIST_MEDIA";
+constexpr char const* CMD_GET_FOLDER = "GET_FOLDER";
+constexpr char const* CMD_SET_FOLDER = "SET_FOLDER";
+constexpr char const* CMD_SETTINGS_MOUNTS = "SETTINGS_MOUNTS";
+constexpr char const* CMD_SETTINGS_MOUNT_ADD = "SETTINGS_MOUNT_ADD";
+constexpr char const* CMD_SETTINGS_MOUNT_REPLACE = "SETTINGS_MOUNT_REPLACE";
+constexpr char const* CMD_SETTINGS_MOUNT_REMOVE = "SETTINGS_MOUNT_REMOVE";
+constexpr char const* CMD_SETTINGS_BOARDS = "SETTINGS_BOARDS";
+constexpr char const* CMD_SETTINGS_BOARD_DESCRIBE = "SETTINGS_BOARD_DESCRIBE";
+constexpr char const* CMD_SETTINGS_BOARD_GET = "SETTINGS_BOARD_GET";
+constexpr char const* CMD_SETTINGS_BOARD_SET = "SETTINGS_BOARD_SET";
+constexpr char const* CMD_SETTINGS_CUSTOM_CONTROLS = "SETTINGS_CUSTOM_CONTROLS";
+constexpr char const* CMD_SETTINGS_INPUT_EVENTS = "SETTINGS_INPUT_EVENTS";
+constexpr char const* CMD_SETTINGS_CUSTOM_CONTROL_GET = "SETTINGS_CUSTOM_CONTROL_GET";
+constexpr char const* CMD_SETTINGS_CUSTOM_CONTROL_SET = "SETTINGS_CUSTOM_CONTROL_SET";
 constexpr char const* CMD_HELP = "HELP";
 
 // Joystick, Quicksave, LED status, etc.
@@ -126,6 +152,7 @@ constexpr char const* CMD_DEBUG_STATUS = "DEBUG_STATUS";
 constexpr char const* CMD_DEBUG_STEP = "DEBUG_STEP";
 constexpr char const* CMD_DEBUG_STEP_OVER = "DEBUG_STEP_OVER";
 constexpr char const* CMD_DEBUG_CONTINUE = "DEBUG_CONTINUE";
+constexpr char const* CMD_MONITOR = "MONITOR";
 constexpr char const* CMD_GET_CPU_REGS = "GET_CPU_REGS";
 constexpr char const* CMD_GET_CUSTOM_REGS = "GET_CUSTOM_REGS";
 constexpr char const* CMD_DISASSEMBLE = "DISASSEMBLE";
@@ -151,6 +178,10 @@ void IPCHandle();
 
 // Check if IPC is active
 bool IPCIsActive();
+
+// Instance number of this process's socket (0 for the default path), which
+// distinguishes emulator instances running on the same host
+int IPCInstance();
 
 } // namespace Amiberry::IPC
 

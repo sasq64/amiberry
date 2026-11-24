@@ -9,6 +9,8 @@
 #include <unistd.h>
 #else
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #endif
 #ifdef __ANDROID__
 #include <sched.h>
@@ -22,7 +24,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
-#include <sys/types.h>
 #include <dirent.h>
 #include <cstdlib>
 #include <ctime>
@@ -31,18 +32,20 @@
 #include <fstream>
 #include <filesystem>
 #include <vector>
+#include <unordered_map>
+#include <functional>
+#include <nlohmann/json.hpp>
 
 #include "sysdeps.h"
 #include "options.h"
-#include "audio.h"
 #include "sounddep/sound.h"
 #include "uae.h"
 #include "memory.h"
 #include "rommgr.h"
 #include "custom.h"
 #include "newcpu.h"
-#include "traps.h"
 #include "xwin.h"
+#include "gdb_server.h"
 #include "keyboard.h"
 #include "inputdevice.h"
 #include "drawing.h"
@@ -53,6 +56,11 @@
 #include "disk.h"
 #include "savestate.h"
 #include "zfile.h"
+#ifdef AMIBERRY_NATIVE_WINDOWS_UI
+#include "windows/settings_bridge.h"
+#endif
+#include "7z/Sha256.h"
+#include "zarchive.h"
 #include "rtgmodes.h"
 #include "gfxboard.h"
 #include "devices.h"
@@ -69,18 +77,22 @@
 #include "amiberry_input.h"
 #include "amiberry_adpf.h"
 #include "amiberry_rp9.h"
+#include "amiberry_reset_chipset_prefs.h"
 #include "amiberry_update.h"
+#include "amiberry_curl.h"
+#include "amiberry_update_asset_policy.h"
+#include "settings/amiberry_actions.h"
+#include "settings/amiberry_media.h"
 #include "clipboard.h"
-#include "dpi_handler.hpp"
 #include "gui_layout_scale.h"
 #include "fsdb.h"
+#include "host_fs.h"
 #include "scsidev.h"
 #ifdef FLOPPYBRIDGE
 #include "floppybridge_lib.h"
 #endif
 #include "registry.h"
 #include "threaddep/thread.h"
-#include "uae/uae.h"
 #include "sana2.h"
 #include "gui_handling_platform.h"
 #include "gui/gui_handling.h"
@@ -88,8 +100,11 @@
 #include "amiberry_mouse_capture.h"
 #include "amiberry_mouse_delta.h"
 #include "imgui_osk.h"
+#include "native_ui_tests.h"
+#include "native_ui_host.h"
 #ifdef __ANDROID__
 #include "android_touch_mouse.h"
+#include "android_overlay.h"
 #endif
 #include "macos_bookmarks.h"
 #include "macos_window.h"
@@ -126,9 +141,6 @@ struct gpiod_line* lineYellow; // Yellow LED
 #endif
 #endif
 
-#ifdef USE_DBUS
-#include "amiberry_dbus.h"
-#endif
 #ifdef USE_IPC_SOCKET
 #include "amiberry_ipc.h"
 #endif
@@ -558,6 +570,68 @@ static void neutralize_touch_controls()
 #endif
 }
 
+#if !defined(__ANDROID__) && !defined(LIBRETRO)
+// SDL3 hands the app lifecycle events only to event watchers, in the call
+// stack that sends them; it never queues them. On iOS that is UIKit's
+// notification, on the main thread while the emulator pumps events between
+// frames, so the emulation can be paused (and saved) here. Android has its
+// own filter (android_touch_event_filter), a libretro core's front end owns
+// the lifecycle, and desktops send none of these.
+// SDL sends each of these events twice (scene and application).
+static struct {
+	bool active = false; // paused for the background
+	bool owned = false;  // ... by this: the emulation was running
+} background_pause;
+
+static bool SDLCALL app_lifecycle_watch(void*, SDL_Event* event)
+{
+	if (!is_mainthread())
+		return true;
+	switch (event->type) {
+	case SDL_EVENT_WILL_ENTER_BACKGROUND:
+		// The app is no longer active (the Control Center counts): touches
+		// end, and the emulation pauses unless the user paused it already.
+		neutralize_touch_controls();
+#ifdef AMIBERRY_NATIVE_HOST
+		native_host_hide_keyboard();
+#endif
+#ifdef __ANDROID__
+		android_osk_hide();
+#endif
+		if (!background_pause.active) {
+			background_pause.active = true;
+			background_pause.owned = pause_emulation == 0;
+			// setpaused() releases held host keys and pauses the sound and
+			// the CPU thread (no focus loss need come first, as with the
+			// Control Center).
+			if (background_pause.owned)
+				setpaused(1);
+		}
+		break;
+	case SDL_EVENT_DID_ENTER_BACKGROUND:
+#ifdef AMIBERRY_NATIVE_HOST
+		// The system may end the app from here on; the save is written
+		// between frames (this can run mid-frame, where the run loop is
+		// pumped for input).
+		native_host_request_autosave();
+#endif
+		break;
+	case SDL_EVENT_DID_ENTER_FOREGROUND:
+		neutralize_touch_controls();
+		if (background_pause.active) {
+			background_pause.active = false;
+			// Only the pause this set ends (not the settings UI's, say).
+			if (background_pause.owned && pause_emulation == 1)
+				resumepaused(1);
+		}
+		break;
+	default:
+		break;
+	}
+	return true;
+}
+#endif
+
 static void drain_pending_touch_neutralization()
 {
 #ifdef __ANDROID__
@@ -570,14 +644,8 @@ static void drain_pending_touch_neutralization()
 
 static SDL_ThreadID mainthreadid;
 static int logging_started;
-int log_scsi;
-int log_net;
-int log_vsync, debug_vsync_min_delay, debug_vsync_forced_delay;
-int uaelib_debug;
-int pissoff_value = 15000 * CYCLE_UNIT;
-int pissoff_nojit_value = 160 * CYCLE_UNIT;
-int multithread_enabled = 1;
 
+bool amiberry_dump_config_mode = false;
 static TCHAR* inipath = nullptr;
 extern FILE* debugfile;
 static int forceroms;
@@ -627,7 +695,7 @@ whdload_options whdload_prefs = {};
 struct amiberry_options amiberry_options = {};
 amiberry_gui_theme gui_theme = {};
 amiberry_hotkey enter_gui_key;
-SDL_GamepadButton enter_gui_button;
+SDL_GamepadButton enter_gui_button = SDL_GAMEPAD_BUTTON_INVALID;
 amiberry_hotkey quit_key;
 amiberry_hotkey action_replay_key;
 amiberry_hotkey fullscreen_key;
@@ -635,7 +703,7 @@ amiberry_hotkey minimize_key;
 amiberry_hotkey left_amiga_key;
 amiberry_hotkey right_amiga_key;
 amiberry_hotkey vkbd_key;
-SDL_GamepadButton vkbd_button;
+SDL_GamepadButton vkbd_button = SDL_GAMEPAD_BUTTON_INVALID;
 amiberry_hotkey screenshot_key;
 amiberry_hotkey debugger_key;
 
@@ -672,6 +740,19 @@ std::vector<int> parse_color_string(const std::string& input)
 		result.push_back(std::stoi(token));
 	}
 	return result;
+}
+
+// The gamepad button a shortcut value names. SDL reads button names without
+// regard to case, so a letter key ("A", "B", "X", "Y" as the key captures
+// record them) would also be the South, East, West or North button; a
+// one-letter value names a button only spelled as SDL spells it ("a").
+SDL_GamepadButton gamepad_button_from_config(const std::string& value)
+{
+	const SDL_GamepadButton button = SDL_GetGamepadButtonFromString(value.c_str());
+	if (button == SDL_GAMEPAD_BUTTON_INVALID || value.size() != 1)
+		return button;
+	const char* name = SDL_GetGamepadStringForButton(button);
+	return name && value == name ? button : SDL_GAMEPAD_BUTTON_INVALID;
 }
 
 amiberry_hotkey get_hotkey_from_config(const std::string& config_option)
@@ -760,9 +841,11 @@ amiberry_hotkey get_hotkey_from_config(const std::string& config_option)
 	const auto sdl_it = sdl_key_name_map.find(hotkey.key_name);
 	const char* sdl_key_name = (sdl_it != sdl_key_name_map.end()) ? sdl_it->second : hotkey.key_name.c_str();
 
-	hotkey.scancode = SDL_GetScancodeFromName(sdl_key_name);
-	hotkey.button = SDL_GetGamepadButtonFromString(hotkey.key_name.c_str());
-	
+	// A value naming a gamepad button ("a", the South button) is that
+	// button, not also the key SDL reads the name as regardless of case.
+	hotkey.button = gamepad_button_from_config(hotkey.key_name);
+	hotkey.scancode = hotkey.button >= 0 ? SDL_SCANCODE_UNKNOWN : SDL_GetScancodeFromName(sdl_key_name);
+
 	return hotkey;
 }
 
@@ -779,25 +862,30 @@ static void set_key_configs(const uae_prefs* p)
 	if (enter_gui_key.scancode == 0)
 		enter_gui_key.scancode = SDL_SCANCODE_F12;
 
-	enter_gui_button = SDL_GetGamepadButtonFromString(p->open_gui);
+	// Install the OSK toggle button only while the on-screen keyboard is
+	// enabled: with it disabled, intercepting the button would swallow input
+	// games could use (AKS_OSK does nothing in that state). Enabling the
+	// keyboard later reinstalls it (gfx_prefs_check).
+	if (p->vkbd_enabled)
+	{
+		vkbd_key = get_hotkey_from_config(p->vkbd_toggle);
+		vkbd_button = gamepad_button_from_config(p->vkbd_toggle);
+	}
+	else
+	{
+		vkbd_key = {};
+		vkbd_button = SDL_GAMEPAD_BUTTON_INVALID;
+	}
+
+	enter_gui_button = gamepad_button_from_config(p->open_gui);
 #ifdef __ANDROID__
 	// Android: default Start button as pause/GUI toggle for hardware controllers
-	// (no F12 key available, and software back button isn't accessible from gamepads)
-	if (enter_gui_button == SDL_GAMEPAD_BUTTON_INVALID)
+	// (no F12 key available, and software back button isn't accessible from gamepads).
+	// An explicitly selected Start keyboard toggle wins over that fallback; Guide
+	// and Back remain available as menu triggers.
+	if (enter_gui_button == SDL_GAMEPAD_BUTTON_INVALID && vkbd_button != SDL_GAMEPAD_BUTTON_START)
 		enter_gui_button = SDL_GAMEPAD_BUTTON_START;
 #endif
-	if (enter_gui_button != SDL_GAMEPAD_BUTTON_INVALID)
-	{
-		for (int port = 0; port < 2; port++)
-		{
-			const auto host_joy_id = p->jports[port].id - JSEM_JOYS;
-			if (host_joy_id >= 0 && host_joy_id < MAX_INPUT_DEVICES)
-			{
-				didata* did = &di_joystick[host_joy_id];
-				did->mapping.menu_button = enter_gui_button;
-			}
-		}
-	}
 	
 	quit_key = get_hotkey_from_config(p->quit_amiberry);
 
@@ -814,30 +902,74 @@ static void set_key_configs(const uae_prefs* p)
 
 	debugger_key = get_hotkey_from_config(p->debugger_trigger);
 
-	vkbd_key = get_hotkey_from_config(p->vkbd_toggle);
-
-	vkbd_button = SDL_GetGamepadButtonFromString(p->vkbd_toggle);
-	if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID)
-	{
-		for (int port = 0; port < 2; port++)
-		{
-			const auto host_joy_id = p->jports[port].id - JSEM_JOYS;
-			if (host_joy_id >= 0 && host_joy_id < MAX_INPUT_DEVICES)
-			{
-				didata* did = &di_joystick[host_joy_id];
-				did->mapping.vkbd_button = vkbd_button;
-			}
-		}
-	}
+	for (auto& did : di_joystick)
+		sync_controller_shortcuts(&did);
 }
 
-#ifndef _WIN32
+void target_hotkeys_changed(const uae_prefs* p)
+{
+	set_key_configs(p);
+}
+
+// Fault and SIGTERM handlers: on 64-bit ARM hosts with signals, for the JIT.
+#if defined(CPU_AARCH64) && !defined(_WIN32) && !defined(AMIBERRY_NO_HOST_SIGNALS)
+#define AMIBERRY_FAULT_SIGNAL_HANDLERS
+#endif
+
+#ifdef AMIBERRY_FAULT_SIGNAL_HANDLERS
 extern void signal_segv(int signum, siginfo_t* info, void* ptr);
 extern void signal_buserror(int signum, siginfo_t* info, void* ptr);
 extern void signal_term(int signum, siginfo_t* info, void* ptr);
+
+#if defined(JIT) && defined(JIT_DEBUG_MEM_CORRUPTION)
+extern bool jit_dbg_is_sigsegv_handler(void (*handler)(int, siginfo_t*, void*));
 #endif
 
-extern void set_last_active_config(const char* filename);
+static bool install_fault_signal_handler(const int signum, const char* name,
+	void (*handler)(int, siginfo_t*, void*))
+{
+	struct sigaction current{};
+	if (sigaction(signum, nullptr, &current) == 0) {
+		if ((current.sa_flags & SA_SIGINFO) && current.sa_sigaction == handler)
+			return true;
+#if defined(JIT) && defined(JIT_DEBUG_MEM_CORRUPTION)
+		// The JIT page guard chains to signal_segv(); keep it in front.
+		if (signum == SIGSEGV && (current.sa_flags & SA_SIGINFO)
+			&& jit_dbg_is_sigsegv_handler(current.sa_sigaction))
+			return true;
+#endif
+		if (current.sa_handler != SIG_DFL && current.sa_handler != SIG_IGN)
+			write_log("Reclaiming %s handler installed by another component.\n", name);
+	}
+
+	struct sigaction action{};
+	action.sa_sigaction = handler;
+	action.sa_flags = SA_SIGINFO;
+	if (sigaction(signum, &action, nullptr) < 0) {
+		write_log("Failed to set signal handler (%s).\n", name);
+		return false;
+	}
+	return true;
+}
+#endif
+
+// JIT direct memory access depends on our fault handlers seeing the original
+// faulting context (e.g. Kickstart probing past the RAMSEY banks). SDL's evdev
+// console keyboard code (KMSDRM) installs its own SIGSEGV/SIGILL/SIGBUS handlers
+// whenever it mutes a keyboard: they restore the console, reinstate the previous
+// handler and re-raise with raise(), so ours only sees the raise() context and
+// JIT recovery fails. Reinstall ours on top after SDL init and keyboard hotplug.
+// Unhandled faults still restore the console: signal_segv() calls SDL_Quit().
+bool install_fault_signal_handlers()
+{
+#ifdef AMIBERRY_FAULT_SIGNAL_HANDLERS
+	return install_fault_signal_handler(SIGSEGV, "SIGSEGV", signal_segv)
+		&& install_fault_signal_handler(SIGILL, "SIGILL", signal_segv)
+		&& install_fault_signal_handler(SIGBUS, "SIGBUS", signal_buserror);
+#else
+	return true;
+#endif
+}
 
 std::string home_dir;
 std::string current_dir;
@@ -1022,6 +1154,7 @@ std::string harddrive_path;
 std::string cdrom_path;
 std::string logfile_path;
 std::string floppy_sounds_dir;
+static bool floppy_sounds_dir_is_default = true;
 std::string data_dir;
 std::string saveimage_dir;
 std::string savestate_dir;
@@ -1107,12 +1240,16 @@ static bool legacy_cleanup_prompt_enabled = false;
 char last_loaded_config[MAX_DPATH] = {};
 char last_active_config[MAX_DPATH] = {};
 static bool last_loaded_config_is_automatic_default = false;
+// The configuration file the pending configuration was loaded from or last
+// saved to (full path); empty for a default or an RP9 package.
+static std::string current_config_path;
 
 int max_uae_width;
 int max_uae_height;
 
 int main(int argc, char* argv[]);
 static void init_amiberry_dirs(bool portable_mode, bool materialize_host_roots = true);
+static bool is_valid_plugins_override(const std::string& path);
 void save_amiberry_settings();
 
 static const char* get_settings_resolution_source_name(const settings_resolution_source source)
@@ -1194,6 +1331,36 @@ void set_last_loaded_config(const char* filename, const bool automatic_default)
 	extract_filename(filename, last_loaded_config);
 	remove_file_extension(last_loaded_config);
 	last_loaded_config_is_automatic_default = automatic_default;
+	set_current_config_path(automatic_default ? nullptr : filename);
+}
+
+void set_current_config_path(const char* filename)
+{
+	if (!filename || !filename[0]) {
+		current_config_path.clear();
+		return;
+	}
+	// A host path: UTF-8 from the native UI, ANSI from older configurations.
+	// host_path() reads either and the stored path is UTF-8.
+	std::error_code ec;
+	const auto absolute = std::filesystem::absolute(host_path(filename), ec);
+	current_config_path = ec ? std::string(filename) : host_path_utf8(absolute.lexically_normal());
+}
+
+void forget_loaded_config()
+{
+	// A new machine (a model picked, or a file played on its own) is no
+	// file's: its title and save name must not stay the machine loaded
+	// before, and the media it is given may name it.
+	last_loaded_config[0] = 0;
+	last_loaded_config_is_automatic_default = false;
+	last_active_config[0] = 0;
+	set_current_config_path(nullptr);
+}
+
+std::string get_current_config_path()
+{
+	return current_config_path;
 }
 
 void set_last_active_config(const char* filename)
@@ -1469,6 +1636,8 @@ void setsoundpaused()
 #endif
 }
 
+static bool cpu_pause_held;
+
 static bool resumepaused_internal(const int priority, const bool restorecapture)
 {
 	const AmigaMonitor* mon = &AMonitors[0];
@@ -1489,6 +1658,10 @@ static bool resumepaused_internal(const int priority, const bool restorecapture)
 	pause_emulation = 0;
 	setsystime();
 	wait_keyrelease();
+	if (cpu_pause_held) {
+		cpu_pause_held = false;
+		cpu_thread_resume();
+	}
 	return true;
 }
 
@@ -1510,6 +1683,8 @@ bool setpaused(const int priority)
 	if (!pause_emulation) {
 		wait_keyrelease();
 	}
+	if (!cpu_pause_held)
+		cpu_pause_held = cpu_thread_pause();
 	pause_emulation = priority;
 	devices_pause();
 	setsoundpaused();
@@ -1535,18 +1710,14 @@ void unsetminimized(const int monid)
 	minimized = 0;
 }
 
-void refreshtitle()
-{
-	//for (int i = 0; i < MAX_AMIGAMONITORS; i++) {
-	//	struct AmigaMonitor* mon = &AMonitors[i];
-	//	if (mon->sdl_window && isfullscreen() == 0) {
-	//		setmaintitle(mon->monitor_id);
-	//	}
-	//}
-}
-
 void setpriority(const int prio)
 {
+// SDL_SetCurrentThreadPriority() maps to pthread_setschedparam() on macOS,
+// which can block indefinitely in thread_policy while the app transitions to
+// the background (e.g. AppNap), stalling the emulation thread. Raising to
+// HIGH requires SCHED_RR there, which macOS rejects for non-root processes,
+// so the boost never worked anyway. See GitHub issue #2590.
+#ifndef __APPLE__
 	if (prio >= 0 && prio <= 2)
 	{
 		switch (prio)
@@ -1564,6 +1735,9 @@ void setpriority(const int prio)
 			break;
 		}
 	}
+#else
+	(void)prio;
+#endif
 }
 
 static void setcursorshape(const int monid)
@@ -1635,7 +1809,20 @@ static bool apply_mouse_capture_grabs(AmigaMonitor* mon)
 	// from the previous one.
 	amiberry_android_reset_mouse_deltas();
 #endif
-	const bool mouse_grab_ok = SDL_SetWindowMouseGrab(mon->amiga_window, true);
+	// SDL3's Haiku backend cannot confine the pointer: HAIKU_SetWindowMouseGrab()
+	// returns SDL_Unsupported(), so SDL_SetWindowMouseGrab(true) always fails
+	// there. Treating that as a capture failure cleared focus on every capture
+	// attempt and left the keyboard and mouse buttons dead (#2609). Relative
+	// mode, which the Haiku backend implements by re-centring the pointer,
+	// still keeps it inside the window.
+	constexpr bool capture_requires_mouse_grab =
+#ifdef __HAIKU__
+		false;
+#else
+		true;
+#endif
+	const bool mouse_grab_ok = SDL_SetWindowMouseGrab(mon->amiga_window, true)
+		|| !capture_requires_mouse_grab;
 	if (!mouse_grab_ok) {
 		write_log("SDL_SetWindowMouseGrab(true) failed on monitor %d: %s\n", mon->monitor_id, SDL_GetError());
 	}
@@ -1796,7 +1983,14 @@ static bool accepts_uncaptured_guest_input()
 
 void target_inputdevice_unacquire(const bool full)
 {
+	// Releases consumed by the GUI/background event loop cannot update OSK
+	// ownership. End the session before transferring input away from emulation.
+	imgui_osk_hide();
+#ifdef AMIBERRY_NATIVE_HOST
+	native_host_hide_keyboard();
+#endif
 #ifdef __ANDROID__
+	android_osk_hide();
 	amiberry_android_touch_mouse_neutralize();
 	amiberry_android_clear_all_mouse_button_sources();
 #endif
@@ -1811,6 +2005,7 @@ void target_inputdevice_acquire()
 	const AmigaMonitor* mon = &AMonitors[0];
 	target_inputdevice_unacquire(false);
 	tablet = open_tablet(mon->amiga_window);
+	osk_clear_controller_holds();
 }
 
 static void setmouseactive2(AmigaMonitor* mon, int active, const bool allowpause)
@@ -1955,6 +2150,17 @@ void setmouseactive(const int monid, const int active)
 	setcursorshape(monid);
 }
 
+void setmouseinactive_running(const int monid)
+{
+	AmigaMonitor* mon = &AMonitors[monid];
+	monitor_off = 0;
+	clear_pending_mouse_capture();
+	if (osdep_platform_require_window_for_mouse() && !mon->amiga_window)
+		return;
+	setmouseactive2(mon, 0, false);
+	setcursorshape(monid);
+}
+
 static void amiberry_active(const AmigaMonitor* mon, const int is_minimized)
 {
 	monitor_off = 0;
@@ -1987,7 +2193,6 @@ static void amiberry_active(const AmigaMonitor* mon, const int is_minimized)
 		// click-to-capture, especially after a Full-window focus transition.
 		setmouseactive(mon->monitor_id, -1);
 	}
-	clipboard_active(1, 1);
 }
 
 static void amiberry_inactive(const AmigaMonitor* mon, const int is_minimized)
@@ -1997,7 +2202,6 @@ static void amiberry_inactive(const AmigaMonitor* mon, const int is_minimized)
 	recapture = 0;
 	wait_keyrelease();
 	setmouseactive(mon->monitor_id, 0);
-	clipboard_active(1, 0);
 	auto pri = currprefs.inactive_priority;
 	if (!quit_program) {
 		if (is_minimized) {
@@ -2565,8 +2769,15 @@ static int setsizemove(AmigaMonitor* mon, SDL_Window* hWnd)
 			if (canstretch(mon)) {
 				int w = mon->mainwin_rect.w;
 				int h = mon->mainwin_rect.h;
+#ifdef __ANDROID__
+				// Android's activity surface is already the client area. Desktop frame
+				// deltas are invalid while the surface changes orientation.
+				const int content_w = w;
+				const int content_h = h;
+#else
 				const int content_w = w - mon->window_extra_width;
 				const int content_h = h - mon->window_extra_height;
+#endif
 				if (content_w != changed_prefs.gfx_monitor[mon->monitor_id].gfx_size_win.width ||
 					content_h != changed_prefs.gfx_monitor[mon->monitor_id].gfx_size_win.height) {
 					changed_prefs.gfx_monitor[mon->monitor_id].gfx_size_win.width = content_w;
@@ -2805,222 +3016,405 @@ static void handle_quit_event()
 	uae_quit();
 }
 
-static void handle_clipboard_update_event()
+#ifndef LIBRETRO
+static void handle_clipboard_update_event(const SDL_ClipboardEvent& event)
 {
-	if (currprefs.clipboard_sharing && SDL_HasClipboardText() == true)
-	{
-		const auto* clipboard_host = SDL_GetClipboardText();
-		uae_clipboard_put_text(clipboard_host);
+	osdep_platform_clipboard_update(event);
+}
+#endif
+
+struct OskControllerState {
+	enum AxisOwner { Neutral, Gameplay, Osk };
+	int buttons = 0;
+	int stick = 0;
+	AxisOwner axis_owner[2] = {};
+};
+
+struct OskHatState {
+	int physical = SDL_HAT_CENTERED;
+	int gameplay = SDL_HAT_CENTERED;
+};
+
+static std::unordered_map<SDL_JoystickID, OskControllerState> osk_controllers;
+static std::unordered_map<Uint64, OskHatState> osk_hats;
+
+static void osk_publish_controller_state()
+{
+	int state = 0;
+	for (const auto& entry : osk_controllers)
+		state |= entry.second.buttons | entry.second.stick;
+	const int dx = (state & OSK_LEFT) ? -1 : (state & OSK_RIGHT) ? 1 : 0;
+	const int dy = (state & OSK_UP) ? -1 : (state & OSK_DOWN) ? 1 : 0;
+	osk_control(dx, dy, 0, 0, OskInputSource::Gamepad);
+	osk_control(0, 0, 1, (state & OSK_BUTTON) != 0, OskInputSource::Gamepad);
+}
+
+static bool osk_axis_is_held(const int id, const int axis, const int value)
+{
+	return abs(value) > SDL_JOYSTICK_AXIS_MAX * 2 / 5
+		|| controller_axis_has_gameplay_input(id, axis, value);
+}
+
+void osk_clear_controller_holds()
+{
+	for (auto& entry : osk_controllers) {
+		entry.second.buttons = 0;
+		entry.second.stick = 0;
+	}
+	// Clear session navigation, not gesture ownership. Polling can observe a
+	// release consumed by the GUI, but cannot give a held OSK gesture to UAE.
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || !did.is_controller)
+			continue;
+		auto& state = osk_controllers[did.joystick_id];
+		for (int axis = SDL_GAMEPAD_AXIS_LEFTX; axis <= SDL_GAMEPAD_AXIS_LEFTY; ++axis) {
+			int value = 0;
+			if (did.mapping.is_retroarch) {
+				const int raw = did.mapping.axis[axis];
+				if (raw >= 0 && raw < did.axles)
+					value = SDL_GetJoystickAxis(did.joystick, raw);
+			} else {
+				value = SDL_GetGamepadAxis(did.controller, static_cast<SDL_GamepadAxis>(axis));
+			}
+			if (state.axis_owner[axis] != OskControllerState::Osk
+				|| !osk_axis_is_held(id, axis, value)) {
+				state.axis_owner[axis] = controller_axis_has_gameplay_input(id, axis, value)
+					? OskControllerState::Gameplay : OskControllerState::Neutral;
+			}
+		}
+		if (did.mapping.is_retroarch) {
+			for (int hat = 0; hat < SDL_GetNumJoystickHats(did.joystick); ++hat) {
+				const int value = SDL_GetJoystickHat(did.joystick, hat);
+				const Uint64 key = (static_cast<Uint64>(did.joystick_id) << 8) | hat;
+				auto& state = osk_hats[key];
+				state.gameplay = value & ~(state.physical & ~state.gameplay);
+				state.physical = value;
+			}
+		}
+		// Reconcile the modifier with the physical stick instead of dropping
+		// it: a remapped press must meet its release at the same offset.
+		bool held = false;
+		if (did.mapping.hotkey_button >= 0) {
+			held = did.mapping.is_retroarch
+				? (did.joystick && SDL_GetJoystickButton(did.joystick, did.mapping.hotkey_button))
+				: (did.controller && SDL_GetGamepadButton(did.controller, static_cast<SDL_GamepadButton>(did.mapping.hotkey_button)));
+		}
+		did.hotkey_held = held;
+		if (!held && did.remapped_press_mask) {
+			// The modifier is gone — its release may have been consumed by
+			// another event loop — so pending remapped releases would miss
+			// their offset. Neutralize those presses explicitly.
+			for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button)
+				if (did.remapped_press_mask & (1u << button))
+					setjoybuttonstate(id, button + REMAP_BUTTONS, 0);
+			did.remapped_press_mask = 0;
+		}
 	}
 }
 
 void handle_joy_device_event(const SDL_JoystickID which, const bool removed)
 {
+	if (removed) {
+		osk_controllers.erase(which);
+		for (auto it = osk_hats.begin(); it != osk_hats.end();) {
+			if ((it->first >> 8) == static_cast<Uint64>(which))
+				it = osk_hats.erase(it);
+			else
+				++it;
+		}
+		if (imgui_osk_is_active())
+			osk_publish_controller_state();
+	}
 	bool known_device = false;
-	for (int id = 0; id < MAX_INPUT_DEVICES; ++id)
-	{
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
 		const didata* did = &di_joystick[id];
-		if (!did->guid.empty() && did->joystick_id == which)
-		{
+		if (!did->guid.empty() && did->joystick_id == which) {
 			known_device = true;
 			break;
 		}
 	}
-	if (!known_device || removed)
-	{
+	if (!known_device || removed) {
 		write_log("SDL Gamepad/Joystick added or removed, re-enumerating input devices...\n");
 		if (inputdevice_devicechange(&changed_prefs))
-		{
 			joystick_refresh_needed = true;
-		}
 	}
+}
+
+// Return true only for OSK-owned input. A release of a gameplay-held control
+// continues to the device reader, whose passthrough scope prevents recapture.
+static bool handle_osk_button(const SDL_JoystickID which, const int button, const bool down)
+{
+	if (!imgui_osk_should_render())
+		return false;
+	if (!imgui_osk_is_active())
+		return down;
+
+	int bit = 0;
+	switch (button) {
+	case SDL_GAMEPAD_BUTTON_DPAD_UP: bit = OSK_UP; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_DOWN: bit = OSK_DOWN; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_LEFT: bit = OSK_LEFT; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: bit = OSK_RIGHT; break;
+	case SDL_GAMEPAD_BUTTON_SOUTH: bit = OSK_BUTTON; break;
+	default: break;
+	}
+	if (bit) {
+		auto& state = osk_controllers[which];
+		const bool owned = (state.buttons & bit) != 0;
+		if (down)
+			state.buttons |= bit;
+		else
+			state.buttons &= ~bit;
+		osk_publish_controller_state();
+		return down || owned;
+	}
+	if (button == SDL_GAMEPAD_BUTTON_EAST && down)
+		imgui_osk_hide();
+	return down;
+}
+
+static bool handle_gamepad_button(const SDL_JoystickID which, const int button, const bool down)
+{
+	// Explicit OSK binding wins over menu/other shortcuts. AKS_OSK toggles on
+	// either state, so consume both edges but enqueue only the press.
+	if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID && button == vkbd_button) {
+		if (down)
+			inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+	}
+#ifdef __ANDROID__
+	else if (button == SDL_GAMEPAD_BUTTON_GUIDE) {
+		inputdevice_add_inputcode(AKS_ENTERGUI, down, nullptr);
+	}
+#endif
+	else if (button == enter_gui_button) {
+		inputdevice_add_inputcode(AKS_ENTERGUI, down, nullptr);
+	}
+	else if (quit_key.button >= 0 && button == quit_key.button) {
+		uae_quit();
+	}
+	else if (action_replay_key.button >= 0 && button == action_replay_key.button) {
+		inputdevice_add_inputcode(AKS_FREEZEBUTTON, down, nullptr);
+	}
+	else if (fullscreen_key.button >= 0 && button == fullscreen_key.button) {
+		inputdevice_add_inputcode(AKS_TOGGLEWINDOWFULLWINDOW, down, nullptr);
+	}
+	else if (minimize_key.button >= 0 && button == minimize_key.button) {
+		minimizewindow(0);
+	}
+	else if (screenshot_key.button >= 0 && button == screenshot_key.button) {
+		inputdevice_add_inputcode(AKS_SCREENSHOT_FILE, down, nullptr);
+	}
+	else if (debugger_key.button >= 0 && button == debugger_key.button) {
+		inputdevice_add_inputcode(AKS_ENTERDEBUGGER, down, nullptr);
+	}
+	else if (imgui_osk_should_render()) {
+		return handle_osk_button(which, button, down);
+	}
+	else {
+		return false;
+	}
+	return true;
 }
 
 static void handle_controller_button_event(const SDL_Event& event)
 {
 	const auto button = event.gbutton.button;
-	const auto state = event.gbutton.down;
-	const auto which = event.gbutton.which;
-
-#ifdef __ANDROID__
-	// Guide button: reliable menu trigger on Android gamepads (not used by Amiga software)
-	if (button == SDL_GAMEPAD_BUTTON_GUIDE) {
-		inputdevice_add_inputcode(AKS_ENTERGUI, state, nullptr);
+	const auto down = event.gbutton.down;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.gbutton.which || !did.is_controller)
+			continue;
+		// RetroArch's logical mapping need not match SDL's. Its raw event path
+		// is the sole owner of both OSK navigation and gameplay dispatch.
+		if (did.mapping.is_retroarch)
+			return;
+		if (handle_gamepad_button(did.joystick_id, button, down))
+			return;
+		if (button == did.mapping.hotkey_button)
+			did.hotkey_held = down;
+		else
+			read_controller_button(id, button, down);
 		return;
 	}
-#endif
-
-	if (button == enter_gui_button) {
-		inputdevice_add_inputcode(AKS_ENTERGUI, state, nullptr);
-	}
-	else if (quit_key.button && button == quit_key.button) {
-		uae_quit();
-	}
-	else if (action_replay_key.button && button == action_replay_key.button) {
-		inputdevice_add_inputcode(AKS_FREEZEBUTTON, state, nullptr);
-	}
-	else if (fullscreen_key.button && button == fullscreen_key.button) {
-		inputdevice_add_inputcode(AKS_TOGGLEWINDOWFULLWINDOW, state, nullptr);
-	}
-	else if (minimize_key.button && button == minimize_key.button) {
-		minimizewindow(0);
-	}
-	else if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID && button == vkbd_button) {
-		inputdevice_add_inputcode(AKS_OSK, state, nullptr);
-	}
-	else if (imgui_osk_should_render()) {
-		// When OSK is visible or animating, intercept D-pad and face buttons at the SDL level
-		// before they reach UAE's input system. This ensures immediate response.
-		// Track per-button state so releasing one direction doesn't lose the other.
-		if (!imgui_osk_is_active())
-			return;
-
-		static bool dpad_up = false, dpad_down = false, dpad_left = false, dpad_right = false;
-		bool is_dir = true;
-		switch (button) {
-		case SDL_GAMEPAD_BUTTON_DPAD_UP:    dpad_up    = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  dpad_down  = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  dpad_left  = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: dpad_right = state; break;
-		default: is_dir = false; break;
-		}
-		if (is_dir) {
-			int dx = 0, dy = 0;
-			if (dpad_left)  dx = -1;
-			else if (dpad_right) dx = 1;
-			if (dpad_up)    dy = -1;
-			else if (dpad_down)  dy = 1;
-			osk_control(dx, dy, 0, 0);
-			return; // consume — don't pass to UAE input system
-		}
-		// Fire button (A/South) = press key
-		if (button == SDL_GAMEPAD_BUTTON_SOUTH) {
-			osk_control(0, 0, 1, state);
-			return;
-		}
-		// B/East = close keyboard
-		if (button == SDL_GAMEPAD_BUTTON_EAST && state) {
-			imgui_osk_toggle();
-			return;
-		}
-	}
-	else if (screenshot_key.button && button == screenshot_key.button) {
-		inputdevice_add_inputcode(AKS_SCREENSHOT_FILE, state, nullptr);
-	}
-	else if (debugger_key.button && button == debugger_key.button) {
-		inputdevice_add_inputcode(AKS_ENTERDEBUGGER, state, nullptr);
-	}
-	else {
-		for (auto id = 0; id < MAX_INPUT_DEVICES; id++) {
-			didata* did = &di_joystick[id];
-			if (did->name.empty() || did->joystick_id != which || did->mapping.is_retroarch || !did->is_controller) continue;
-
-			// Update per-device hotkey state in event order
-			if (button == did->mapping.hotkey_button)
-			{
-				did->hotkey_held = state;
-				break;
-			}
-
-			read_controller_button(id, button, state);
-			break;
-		}
-	}
-
 }
 
 static void handle_joy_button_event(const SDL_Event& event)
 {
 	const auto button = event.jbutton.button;
-	const auto state = event.jbutton.down;
-	const auto which = event.jbutton.which;
+	const auto down = event.jbutton.down;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jbutton.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
 
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
+		const bool configured_toggle = vkbd_button != SDL_GAMEPAD_BUTTON_INVALID
+			&& did.mapping.button_unmasked[vkbd_button] == button;
 #ifdef __ANDROID__
-		// On Android, allow menu button without hotkey — devices may have no
-		// accessible hotkey modifier (e.g. built-in gamepad on handhelds).
-		if (button == did->mapping.menu_button && state)
-		{
+		const bool direct_toggle = configured_toggle;
+#else
+		const bool direct_toggle = configured_toggle && did.is_controller;
+#endif
+		if (direct_toggle) {
+			if (down)
+				inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+			return;
+		}
+		// Raw shortcuts are independent of the global-derived mapping.
+		// Do not destroy RetroArch's saved binding on disable, but do gate use.
+		if (button == did.mapping.vkbd_button && currprefs.vkbd_enabled
+			&& currprefs.vkbd_toggle[0]
+			&& (did.hotkey_held || did.mapping.hotkey_button == SDL_GAMEPAD_BUTTON_INVALID)) {
+			if (down)
+				inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+			return;
+		}
+#ifdef __ANDROID__
+		if (button == did.mapping.menu_button && down) {
 			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
-			break;
+			return;
 		}
 #endif
-
-		// Update per-device hotkey state in event order (not polled)
-		if (button == did->mapping.hotkey_button)
-		{
-			did->hotkey_held = state;
-			break;
+		if (button == did.mapping.hotkey_button) {
+			did.hotkey_held = down;
+			return;
 		}
-		if (button == did->mapping.menu_button && did->hotkey_held && state)
-		{
-			did->hotkey_held = false;
+		if (button == did.mapping.menu_button && did.hotkey_held && down) {
+			did.hotkey_held = false;
 			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
-			break;
+			return;
 		}
-		if (button == did->mapping.vkbd_button && did->hotkey_held && state)
-		{
-			did->hotkey_held = false;
-			inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
-			break;
+		if (did.is_controller) {
+			const int logical = find_in_array(did.mapping.button_unmasked.data(), SDL_GAMEPAD_BUTTON_COUNT, button);
+			if (handle_gamepad_button(did.joystick_id, logical, down))
+				return;
 		}
-
-		read_joystick_button_single(id, button, state);
-		break;
+		read_joystick_button_single(id, button, down);
+		return;
 	}
+}
 
+static bool handle_osk_axis(const int id, const int axis, int& value)
+{
+	if (axis != SDL_GAMEPAD_AXIS_LEFTX && axis != SDL_GAMEPAD_AXIS_LEFTY)
+		return false;
+	auto& state = osk_controllers[di_joystick[id].joystick_id];
+	const int mask = axis == SDL_GAMEPAD_AXIS_LEFTX ? OSK_LEFT | OSK_RIGHT : OSK_UP | OSK_DOWN;
+	state.stick &= ~mask;
+	if (!imgui_osk_is_active()) {
+		if (state.axis_owner[axis] == OskControllerState::Osk) {
+			if (!osk_axis_is_held(id, axis, value))
+				state.axis_owner[axis] = OskControllerState::Neutral;
+			return true;
+		}
+		// Closing animation still owns navigation. Only neutralization may
+		// reach gameplay until the keyboard has left the screen.
+		if (imgui_osk_should_render())
+			value = 0;
+		state.axis_owner[axis] = controller_axis_has_gameplay_input(id, axis, value)
+			? OskControllerState::Gameplay : OskControllerState::Neutral;
+		return false;
+	}
+	const bool pressed = abs(value) > SDL_JOYSTICK_AXIS_MAX * 2 / 5;
+	if (state.axis_owner[axis] == OskControllerState::Gameplay) {
+		if (!pressed) {
+			// Explicitly neutralize the mapped consumer before handing the
+			// axis to the OSK; forwarding a small nonzero value can keep a
+			// mouse-mode controller moving indefinitely.
+			value = 0;
+			state.axis_owner[axis] = OskControllerState::Neutral;
+		}
+		return false;
+	}
+	state.axis_owner[axis] = osk_axis_is_held(id, axis, value)
+		? OskControllerState::Osk : OskControllerState::Neutral;
+	if (pressed) {
+		if (axis == SDL_GAMEPAD_AXIS_LEFTX)
+			state.stick |= value < 0 ? OSK_LEFT : OSK_RIGHT;
+		else
+			state.stick |= value < 0 ? OSK_UP : OSK_DOWN;
+	}
+	osk_publish_controller_state();
+	return true;
 }
 
 static void handle_controller_axis_motion_event(const SDL_Event& event)
 {
-	const auto axis = event.gaxis.axis;
-	const auto value = event.gaxis.value;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != event.gaxis.which || did->mapping.is_retroarch || !did->is_controller) continue;
-
-		read_controller_axis(id, axis, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.gaxis.which
+			|| did.mapping.is_retroarch || !did.is_controller)
+			continue;
+		int value = event.gaxis.value;
+		const bool invert = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ? did.mapping.lstick_axis_x_invert
+			: event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY && did.mapping.lstick_axis_y_invert;
+		int normalized = invert ? -value : value;
+		if (!handle_osk_axis(id, event.gaxis.axis, normalized)) {
+			if (normalized == 0)
+				value = 0;
+			read_controller_axis(id, event.gaxis.axis, value);
+		}
+		return;
 	}
-
 }
 
 static void handle_joy_axis_motion_event(const SDL_Event& event)
 {
-	const auto axis = event.jaxis.axis;
-	const auto value = event.jaxis.value;
-	const auto which = event.jaxis.which;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
-		read_joystick_axis(id, axis, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jaxis.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
+		int value = event.jaxis.value;
+		if (did.is_controller) {
+			for (int axis = 0; axis < SDL_GAMEPAD_AXIS_COUNT; ++axis) {
+				if (did.mapping.axis[axis] != event.jaxis.axis)
+					continue;
+				const bool invert = axis == SDL_GAMEPAD_AXIS_LEFTX ? did.mapping.lstick_axis_x_invert
+					: axis == SDL_GAMEPAD_AXIS_LEFTY && did.mapping.lstick_axis_y_invert;
+				int normalized = invert ? -value : value;
+				if (handle_osk_axis(id, axis, normalized))
+					return;
+				if (normalized == 0)
+					value = 0;
+				break;
+			}
+		}
+		read_joystick_axis(id, event.jaxis.axis, value);
+		return;
 	}
-
 }
 
 static void handle_joy_hat_motion_event(const SDL_Event& event)
 {
-	const auto hat = event.jhat.hat;
-	const auto value = event.jhat.value;
-	const auto which = event.jhat.which;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
-		read_joystick_hat(id, hat, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jhat.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
+		int value = event.jhat.value;
+		if (did.is_controller) {
+			const Uint64 key = (static_cast<Uint64>(did.joystick_id) << 8) | event.jhat.hat;
+			auto& hat = osk_hats[key];
+			const int changed = hat.physical ^ value;
+			const int osk_owned = hat.physical & ~hat.gameplay;
+			hat.physical = value;
+			constexpr int bits[] = {SDL_HAT_UP, SDL_HAT_DOWN, SDL_HAT_LEFT, SDL_HAT_RIGHT};
+			for (int b = 0; b < 4; ++b) {
+				if (changed & bits[b])
+					handle_osk_button(did.joystick_id, SDL_GAMEPAD_BUTTON_DPAD_UP + b, (value & bits[b]) != 0);
+			}
+			// While captured, raw hats may only release guest-held directions.
+			// A diagonal snapshot must never assert an OSK-owned direction.
+			if (imgui_osk_should_render())
+				value &= hat.gameplay;
+			else
+				value &= ~osk_owned;
+			hat.gameplay = value;
+		}
+		read_joystick_hat(id, event.jhat.hat, value);
+		return;
 	}
 }
 
@@ -3107,7 +3501,11 @@ static void handle_key_event(const SDL_Event& event)
 	// keyboard while it is visible or animating, then keep Back as the GUI shortcut.
 	if (event.key.scancode == SDL_SCANCODE_AC_BACK) {
 		if (event.key.down && !event.key.repeat) {
-			if (imgui_osk_should_render())
+			// The native keyboard takes Back while it shows (the overlay
+			// has the focus); a predictive Back reaches SDL directly.
+			if (android_osk_is_active())
+				android_osk_hide();
+			else if (imgui_osk_should_render())
 				imgui_osk_hide();
 			else
 				inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
@@ -3173,6 +3571,23 @@ static void handle_key_event(const SDL_Event& event)
 
 #ifndef LIBRETRO
 static int pen_in_proximity;
+#endif
+
+#ifndef LIBRETRO
+// With a tablet mode active the pen is driven by handle_pen_event(), so SDL's
+// pen-synthesized mouse events are duplicates, and touch-synthesized ones are
+// palm contacts while the pen hovers. Real mice are never gated on pen
+// proximity: a pen resting on the tablet stays in range, and SDL's X11 backend
+// reports pens whose proximity it cannot query as permanently in range, which
+// left the mouse buttons dead whenever the virtual mouse driver was on (#2512).
+static bool pen_suppresses_mouse_event(const SDL_MouseID which)
+{
+	if (currprefs.input_tablet <= 0)
+		return false;
+	if (which == SDL_PEN_MOUSEID)
+		return true;
+	return which == SDL_TOUCH_MOUSEID && pen_in_proximity;
+}
 #endif
 
 #ifndef __ANDROID__
@@ -3323,7 +3738,7 @@ static void set_host_mouse_button_state(const int mouse, const int button,
 static void handle_mouse_button_event(const SDL_Event& event, const AmigaMonitor* mon)
 {
 #ifndef LIBRETRO
-	if (pen_in_proximity && currprefs.input_tablet > 0)
+	if (pen_suppresses_mouse_event(event.button.which))
 		return;
 #endif
 
@@ -3459,7 +3874,7 @@ static bool handle_mouse_motion_event(const SDL_Event& event, const AmigaMonitor
 	monitor_off = 0;
 
 #ifndef LIBRETRO
-	if (pen_in_proximity && currprefs.input_tablet > 0)
+	if (pen_suppresses_mouse_event(event.motion.which))
 		return false;
 #endif
 
@@ -3902,6 +4317,9 @@ static void handle_drop_file_event(const SDL_Event& event)
 {
 	const char* dropped_file = event.drop.data;
 	const auto ext = get_filename_extension(dropped_file);
+	// A drop grants a Mac App Store build the file for this run only; the
+	// bookmark keeps it usable after a restart (a no-op elsewhere).
+	macos_bookmark_store(dropped_file);
 
 	if (strcasecmp(ext.c_str(), ".uae") == 0 || strcasecmp(ext.c_str(), ".rp9") == 0)
 	{
@@ -3968,25 +4386,13 @@ static void process_event(const SDL_Event& event)
 			handle_quit_event();
 			break;
 
-		case SDL_EVENT_WILL_ENTER_BACKGROUND:
-		case SDL_EVENT_DID_ENTER_BACKGROUND:
-			neutralize_touch_controls();
-			pause_sound();
-			pause_emulation = 1;
-			break;
-
-		case SDL_EVENT_WILL_ENTER_FOREGROUND:
-		case SDL_EVENT_DID_ENTER_FOREGROUND:
-			neutralize_touch_controls();
-#ifdef __ANDROID__
-			amiberry_android_clear_touch_drain();
-#endif
-			pause_emulation = 0;
-			resume_sound();
-			break;
+		// The app lifecycle events (background, foreground) never reach the
+		// queue in SDL3: see app_lifecycle_watch(), and Android's event filter.
 
 		case SDL_EVENT_CLIPBOARD_UPDATE:
-			handle_clipboard_update_event();
+#ifndef LIBRETRO
+			handle_clipboard_update_event(event.clipboard);
+#endif
 			break;
 
 #ifndef LIBRETRO
@@ -4002,6 +4408,13 @@ static void process_event(const SDL_Event& event)
 		case SDL_EVENT_JOYSTICK_ADDED:
 			handle_joy_device_event(event.jdevice.which, false);
 			break;
+
+#ifndef LIBRETRO
+		case SDL_EVENT_KEYBOARD_ADDED:
+			install_fault_signal_handlers();
+			break;
+#endif
+
 		case SDL_EVENT_JOYSTICK_REMOVED:
 			handle_joy_device_event(event.jdevice.which, true);
 			break;
@@ -4084,7 +4497,13 @@ static void process_event(const SDL_Event& event)
 			if (on_screen_joystick_keyboard_tapped()) {
 				if (vkbd_allowed(0)) {
 					neutralize_touch_controls();
+#if defined(AMIBERRY_NATIVE_HOST)
+					native_host_toggle_keyboard();
+#elif defined(__ANDROID__)
+					android_osk_toggle();
+#else
 					imgui_osk_toggle();
+#endif
 				}
 			}
 			if (!consumed) {
@@ -4228,6 +4647,19 @@ int handle_msgpump(bool vblank)
 	 * every frame, so skipping it on any other thread is safe. */
 	if (!is_mainthread())
 		return 0;
+	if (vblank) {
+		// inputdevice_read_msg() calls this repeatedly in one vblank until the
+		// event queue is drained; advance the latch clock once per frame so a
+		// release deferred by the first call is not delivered by the next one.
+		static uae_u32 osj_latch_vsync = ~0u;
+		if (vsync_counter != osj_latch_vsync) {
+			osj_latch_vsync = vsync_counter;
+			on_screen_joystick_advance_frame();
+		}
+#ifdef __ANDROID__
+		android_remote_joystick_pump();
+#endif
+	}
 #if defined(AMIBERRY_MACOS) && !defined(LIBRETRO)
 	flush_macos_synthetic_mouse_releases();
 #endif
@@ -4245,17 +4677,19 @@ int handle_msgpump(bool vblank)
 		got_event = 1;
 		process_event(event);
 	}
+	imgui_osk_update();
 	drain_pending_touch_neutralization();
 #ifdef __ANDROID__
 	amiberry_android_touch_mouse_tick();
 #endif
-	if (got_event && currprefs.clipboard_sharing)
+	if (currprefs.clipboard_sharing)
 		update_clipboard();
 	return got_event;
 }
 
 bool handle_events()
 {
+	gdb_server_poll();
 	const AmigaMonitor* mon = &AMonitors[0];
 	static auto was_paused = 0;
 
@@ -4264,11 +4698,18 @@ bool handle_events()
 		flush_macos_synthetic_mouse_releases();
 #endif
 
-#ifdef USE_DBUS
-	DBusHandle();
-#endif
 #ifdef USE_IPC_SOCKET
 	Amiberry::IPC::IPCHandle();
+#endif
+	// Runtime actions posted from other threads (native front ends, IPC)
+	// run here, in order, between frames; this also refreshes the status
+	// snapshot. Runs in every handle_events() pass, including while paused.
+	amiberry_actions_run_pending();
+#ifdef AMIBERRY_NATIVE_HOST
+	native_host_service_autosave();
+#endif
+#if defined(__ANDROID__) && !defined(LIBRETRO)
+	android_overlay_service();
 #endif
 
 	if (pause_emulation)
@@ -4289,6 +4730,7 @@ bool handle_events()
 			{
 				process_event(event);
 			}
+			imgui_osk_update();
 		}
 
 		// Keyboard, mouse and joystick read events are handled in process_event in Amiberry
@@ -4316,9 +4758,12 @@ void logging_init()
 	if (amiberry_options.write_logfile)
 	{
 		static int first = 0;
-		if (first > 1)
+		// A later amiberry_main() run (libretro reload) arrives here after
+		// logging_cleanup() closed the file, so only skip reopening while it is open.
+		if (first > 1 && debugfile)
 		{
 			write_log("***** RESTART *****\n");
+			write_log_end_startup_capture();
 			return;
 		}
 		if (first == 1)
@@ -4335,7 +4780,12 @@ void logging_init()
 		first++;
 		write_log("%s Logfile\n\n", VersionStr);
 		write_log("%s\n", get_sdl_version_string().c_str());
+		write_log_end_startup_capture();
 		regstatus();
+	}
+	else
+	{
+		write_log_end_startup_capture();
 	}
 }
 
@@ -4387,8 +4837,16 @@ uae_u8* save_log(int bootlog, size_t* len)
 
 void strip_slashes(TCHAR* p)
 {
-	while (_tcslen(p) > 0 && (p[_tcslen(p) - 1] == '\\' || p[_tcslen(p) - 1] == '/'))
-		p[_tcslen(p) - 1] = 0;
+	// Remove trailing path separators, but keep a bare root "/".
+	size_t len = _tcslen(p);
+	while (len > 1 && (p[len - 1] == '/' || p[len - 1] == '\\')) {
+		p[--len] = 0;
+	}
+}
+
+void stripslashes(TCHAR* p)
+{
+	strip_slashes(p);
 }
 
 void fix_trailing(TCHAR* p)
@@ -4440,7 +4898,7 @@ static void ensure_directory_exists(const std::string& directory_path)
 		return;
 
 	std::error_code ec;
-	std::filesystem::create_directories(directory_path, ec);
+	std::filesystem::create_directories(host_path(directory_path), ec);
 }
 
 static void ensure_parent_directory_exists(const std::string& file_path)
@@ -4556,7 +5014,9 @@ static const char* get_screenshots_directory_name()
 	return "Screenshots";
 }
 
-static const char* get_nvram_directory_name()
+// The NVRAM directory's name in the content base (the default nvram_dir),
+// also the base-relative spelling of NVRAM files the settings schema exports.
+const char* get_nvram_directory_name()
 {
 	return "NVRAM";
 }
@@ -4824,6 +5284,51 @@ static std::string normalize_path_for_compare(const std::string& input)
 static bool path_strings_match(const std::string& lhs, const std::string& rhs)
 {
 	return normalize_path_for_compare(lhs) == normalize_path_for_compare(rhs);
+}
+
+static const char* get_configured_install_datadir();
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+static std::string get_relocated_installed_data_root();
+#endif
+
+// Earlier versions persisted the derived floppy-sound location. A saved value
+// is a stale default only where Amiberry itself computed it: a known
+// installation root or an AppImage runtime directory. Any other directory is a
+// user choice, even when it is temporarily unavailable.
+static bool is_computed_floppy_sounds_dir(const std::string& path)
+{
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	if (path.empty())
+		return false;
+
+	const auto normalized = normalize_path_for_compare(path);
+	const auto is_floppy_sounds_of = [&](const std::string& root)
+	{
+		return !root.empty()
+			&& path_strings_match(normalized, join_path(join_path(root, "data"), "floppy_sounds"));
+	};
+	if (is_floppy_sounds_of(AMIBERRY_DATADIR)
+		|| is_floppy_sounds_of(get_relocated_installed_data_root())
+		|| is_floppy_sounds_of("/usr/share/amiberry")
+		|| is_floppy_sounds_of("/usr/local/share/amiberry"))
+		return true;
+
+	// The AppImage runtime mounts or extracts the image to a fresh
+	// <tmp>/.mount_*/usr/<datadir>/amiberry directory on every launch.
+	const std::filesystem::path normalized_path(normalized);
+	const auto appdir_suffix = (std::filesystem::path("usr") / get_configured_install_datadir()
+		/ "amiberry" / "data" / "floppy_sounds").lexically_normal();
+	const std::vector<std::filesystem::path> path_components(normalized_path.begin(), normalized_path.end());
+	const std::vector<std::filesystem::path> suffix_components(appdir_suffix.begin(), appdir_suffix.end());
+	if (suffix_components.size() >= path_components.size()
+		|| !std::equal(suffix_components.rbegin(), suffix_components.rend(), path_components.rbegin()))
+		return false;
+	const auto appdir_name = path_components[path_components.size() - suffix_components.size() - 1].string();
+	return appdir_name.rfind(".mount_", 0) == 0 || appdir_name.rfind("appimage_extracted_", 0) == 0;
+#else
+	(void)path;
+	return false;
+#endif
 }
 
 static std::string lowercase_path_for_compare(const std::string& path)
@@ -5122,6 +5627,7 @@ static void clear_base_content_path_preserving_overrides()
 
 	const auto previous_retroarch_file = retroarch_file;
 	const auto previous_floppy_sounds_dir = floppy_sounds_dir;
+	const auto previous_floppy_sounds_dir_is_default = floppy_sounds_dir_is_default;
 	const auto previous_plugins_dir = plugins_dir;
 
 	base_content_path.clear();
@@ -5129,41 +5635,293 @@ static void clear_base_content_path_preserving_overrides()
 
 	retroarch_file = previous_retroarch_file;
 	floppy_sounds_dir = previous_floppy_sounds_dir;
+	floppy_sounds_dir_is_default = previous_floppy_sounds_dir_is_default;
 	plugins_dir = previous_plugins_dir;
 	apply_base_content_path_set(merge_base_content_path_overrides(get_current_base_content_path_set(),
 		previous_paths, previous_baseline_paths));
 }
 
-// convert path to absolute
-void fullpath(TCHAR* path, int size, bool userelative)
+static std::string get_portable_root_directory();
+
+static bool is_path_separator(const TCHAR c)
 {
-	// Resolve absolute path
-	TCHAR tmp1[MAX_DPATH];
-	tmp1[0] = 0;
-#ifdef _WIN32
-	if (_fullpath(tmp1, path, MAX_DPATH) != nullptr)
-#else
-	if (realpath(path, tmp1) != nullptr)
-#endif
-	{
-		if (_tcsnicmp(path, tmp1, _tcslen(tmp1)) != 0)
-			_tcscpy(path, tmp1);
-	}
-	else if (path[0] != 0)
-	{
-		const auto path_len = _tcslen(path);
-		const bool pseudo_path = path[0] == ':';
-		const bool optional_geometry_file = errno == ENOENT && path_len >= 4
-			&& _tcsicmp(path + path_len - 4, _T(".geo")) == 0;
-		if (!pseudo_path && !optional_geometry_file)
-			write_log("fullpath: realpath() failed for '%s' (errno=%d), using path as-is.\n", path, errno);
-	}
+	return c == '/' || c == '\\';
 }
 
-// convert path to absolute
+// "./", ".\", "../" and "..\" prefixes mark paths relative to the relative path base.
+static bool is_base_relative_path(const TCHAR* path)
+{
+	if (path[0] != '.')
+		return false;
+	const int dots = path[1] == '.' ? 2 : 1;
+	return is_path_separator(path[dots]);
+}
+
+static bool get_absolute_path(const TCHAR* path, TCHAR* out)
+{
+#ifdef _WIN32
+	return _fullpath(out, path, MAX_DPATH) != nullptr;
+#else
+	// "/dev/fd/N" names an inherited descriptor, not the file behind it, and is already
+	// absolute. macOS realpath() turns it into "/dev/fd/<file name>", which does not exist.
+	if (!_tcsncmp(path, _T("/dev/fd/"), 8) && _tcslen(path) < MAX_DPATH) {
+		_tcscpy(out, path);
+		return true;
+	}
+	return realpath(path, out) != nullptr;
+#endif
+}
+
+static bool host_path_exists(const std::string& path)
+{
+	std::error_code ec;
+	return std::filesystem::exists(path, ec);
+}
+
+// While command-line arguments are parsed, "./" paths mean what the user typed: relative
+// to the working directory. Configuration files switch this off while they load.
+static bool cmdline_path_mode = false;
+
+bool target_set_cmdline_path_mode(const bool enable)
+{
+	const bool previous = cmdline_path_mode;
+	cmdline_path_mode = enable;
+	return previous;
+}
+
+// Existing paths become absolute now, so later loads cannot re-resolve them against the
+// relative path base. Missing paths keep the pre-relative-paths handling of their option.
+static bool resolve_path_from_working_directory(TCHAR* path, const int size)
+{
+	TCHAR absolute[MAX_DPATH];
+	if (!host_path_exists(path) || !get_absolute_path(path, absolute)
+		|| _tcslen(absolute) >= static_cast<size_t>(size))
+		return false;
+	_tcscpy(path, absolute);
+	return true;
+}
+
+// Portable installs anchor relative paths to the executable directory, so they survive
+// drive letter and mount point changes. Other installs anchor them to the content home.
+std::string get_relative_path_base()
+{
+	if (g_portable_mode)
+	{
+		static const std::string portable_root = get_portable_root_directory();
+		if (!portable_root.empty())
+			return portable_root;
+	}
+	return home_dir;
+}
+
+#ifdef _WIN32
+static constexpr char native_path_separator = '\\';
+#else
+static constexpr char native_path_separator = '/';
+#endif
+
+static std::string strip_trailing_separators(std::string path)
+{
+	while (!path.empty() && is_path_separator(path.back()))
+		path.pop_back();
+	return path;
+}
+
+// The relative path base without trailing separators, as configured and in canonical form.
+// The spellings differ when the base is reached through a symlink.
+struct relative_path_base_spellings
+{
+	bool available = false;
+	std::string configured;
+	std::string canonical;
+};
+
+static relative_path_base_spellings get_relative_path_base_spellings()
+{
+	relative_path_base_spellings base;
+	const auto configured = get_relative_path_base();
+	if (configured.empty())
+		return base;
+	base.available = true;
+	base.configured = strip_trailing_separators(configured);
+	TCHAR absolute[MAX_DPATH];
+	base.canonical = strip_trailing_separators(
+		get_absolute_path(configured.c_str(), absolute) ? std::string(absolute) : configured);
+	return base;
+}
+
+// Roots keep their separator: "E:" alone names the drive's current directory, not its root.
+static std::string get_base_directory_path(const std::string& stripped_base)
+{
+	if (stripped_base.empty() || (stripped_base.size() == 2 && stripped_base[1] == ':'))
+		return stripped_base + native_path_separator;
+	return stripped_base;
+}
+
+static bool path_chars_match(const TCHAR a, const TCHAR b)
+{
+	if (is_path_separator(a) && is_path_separator(b))
+		return true;
+#if defined(_WIN32) || defined(__APPLE__)
+	return _totlower(a) == _totlower(b);
+#else
+	return a == b;
+#endif
+}
+
+#ifdef AMIBERRY_IOS
+// The iOS app's container moves (reinstall, update, restore). A path stored
+// absolute in an earlier container of the app (before paths were stored
+// relative) is re-rooted at the current one: the part after
+// .../Containers/Data/Application/<id> is kept.
+static bool rebase_ios_container_path(TCHAR* path, const int size)
+{
+	static const std::string marker = "/Containers/Data/Application/";
+	const char* home = getenv("HOME");
+	if (!home || !home[0])
+		return false;
+	const std::string current = strip_trailing_separators(home);
+	const std::string text = path;
+	const auto at = text.find(marker);
+	if (at == std::string::npos || current.find(marker) == std::string::npos)
+		return false;
+	const auto id_end = text.find('/', at + marker.size());
+	if (id_end == std::string::npos)
+		return false;
+	const std::string rebased = current + text.substr(id_end);
+	if (rebased == text || text.compare(0, current.size(), current) == 0
+		|| rebased.size() >= static_cast<size_t>(size))
+		return false;
+	_tcscpy(path, rebased.c_str());
+	return true;
+}
+#endif
+
+bool target_resolve_relative_path(TCHAR* path, const int size)
+{
+#ifdef AMIBERRY_IOS
+	if (rebase_ios_container_path(path, size))
+		return true;
+#endif
+	if (!is_base_relative_path(path))
+		return false;
+	if (cmdline_path_mode)
+		return resolve_path_from_working_directory(path, size);
+	const auto base = get_relative_path_base_spellings();
+	if (!base.available)
+		return false;
+
+	// "./" alone names the base itself.
+	const TCHAR* rest = path[1] == '.' ? path : path + 2;
+	if (!rest[0])
+	{
+		const auto directory = get_base_directory_path(base.canonical);
+		if (directory.size() >= static_cast<size_t>(size))
+			return false;
+		_tcscpy(path, directory.c_str());
+		return true;
+	}
+
+	std::string candidate = base.canonical + native_path_separator + rest;
+	// A path typed relative to the working directory (command line, launcher) still wins
+	// when it only exists there.
+	if (!host_path_exists(candidate) && host_path_exists(path))
+		return false;
+
+	TCHAR absolute[MAX_DPATH];
+	if (get_absolute_path(candidate.c_str(), absolute))
+	{
+		candidate = absolute;
+		// Directory entries keep their trailing separator, as callers append file names.
+		if (is_path_separator(path[_tcslen(path) - 1]) && !is_path_separator(candidate.back()))
+			candidate += native_path_separator;
+	}
+	if (candidate.size() >= static_cast<size_t>(size))
+		return false;
+	_tcscpy(path, candidate.c_str());
+	return true;
+}
+
+static bool make_path_relative_to(const TCHAR* path, const std::string& stripped_base, std::string& relative)
+{
+	const size_t path_len = _tcslen(path);
+	if (path_len < stripped_base.size())
+		return false;
+	for (size_t i = 0; i < stripped_base.size(); i++)
+	{
+		if (!path_chars_match(path[i], stripped_base[i]))
+			return false;
+	}
+	if (path_len > stripped_base.size() && !is_path_separator(path[stripped_base.size()]))
+		return false;
+
+	// Forward slashes keep the stored path usable on every host.
+	relative = "./";
+	const TCHAR* rest = path + stripped_base.size();
+	while (is_path_separator(*rest))
+		rest++;
+	for (; *rest; rest++)
+		relative += is_path_separator(*rest) ? '/' : *rest;
+	return true;
+}
+
+bool target_make_relative_path(TCHAR* path, const int size)
+{
+	if (!path[0] || is_base_relative_path(path))
+		return false;
+	const auto base = get_relative_path_base_spellings();
+	if (!base.available)
+		return false;
+
+	// Paths derived from the configured base keep its spelling; resolved paths are canonical.
+	std::string relative;
+	if (!make_path_relative_to(path, base.configured, relative)
+		&& !make_path_relative_to(path, base.canonical, relative))
+	{
+		TCHAR canonical[MAX_DPATH];
+		if (!get_absolute_path(path, canonical) || !make_path_relative_to(canonical, base.canonical, relative))
+			return false;
+	}
+	if (relative.size() >= static_cast<size_t>(size))
+		return false;
+	_tcscpy(path, relative.c_str());
+	return true;
+}
+
+// convert path to absolute, or to base-relative when userelative is set
+void fullpath(TCHAR* path, int size, bool userelative)
+{
+	// Empty means unset; _fullpath() would turn it into the working directory.
+	if (!path[0])
+		return;
+	if (!target_resolve_relative_path(path, size))
+	{
+		TCHAR tmp1[MAX_DPATH];
+		tmp1[0] = 0;
+		if (get_absolute_path(path, tmp1))
+		{
+			if (_tcsnicmp(path, tmp1, _tcslen(tmp1)) != 0)
+				_tcscpy(path, tmp1);
+		}
+		else
+		{
+			const auto path_len = _tcslen(path);
+			const bool pseudo_path = path[0] == ':';
+			const bool optional_geometry_file = errno == ENOENT && path_len >= 4
+				&& _tcsicmp(path + path_len - 4, _T(".geo")) == 0;
+			if (!pseudo_path && !optional_geometry_file)
+				write_log("fullpath: realpath() failed for '%s' (errno=%d), using path as-is.\n", path, errno);
+		}
+	}
+	if (userelative)
+		target_make_relative_path(path, size);
+}
+
+// Amiberry never changes into the relative path base, so paths used at runtime stay
+// absolute. The relative form is produced only when configurations are written.
 void fullpath(TCHAR* path, const int size)
 {
-	fullpath(path, size, relativepaths);
+	fullpath(path, size, false);
 }
 
 bool target_isrelativemode()
@@ -5229,7 +5987,26 @@ bool target_execute(const char* command)
 	disablecapture();
 
 	write_log("Target_execute received: %s\n", command);
-	
+
+#ifdef _WIN32
+	// cmd.exe has no background operator: a trailing "&" only separates
+	// commands, so system() would hold the emulation thread until the
+	// program exits. Start the command interpreter detached instead.
+	const char* comspec = getenv("COMSPEC");
+	if (!comspec)
+		comspec = "cmd.exe";
+	std::string cmdline = std::string("\"") + comspec + "\" /S /C \"" + command + "\"";
+	STARTUPINFOA si = {};
+	si.cb = sizeof si;
+	PROCESS_INFORMATION pi = {};
+	if (!CreateProcessA(nullptr, &cmdline[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+			nullptr, nullptr, &si, &pi)) {
+		write_log("CreateProcess failed when trying to execute: %s. Error: %lu\n", command, GetLastError());
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+#else
 	std::string final_command = command;
 	// Ensure this runs in the background
 	final_command += " &";
@@ -5253,6 +6030,7 @@ bool target_execute(const char* command)
 		write_log("Exception thrown when trying to execute: %s. Exception: %s", command, e.what());
 		return false;
 	}
+#endif
 	return true;
 }
 
@@ -5378,7 +6156,7 @@ static void boost_emulation_thread_frequency()
 
 // Tune the CALLING thread for sustained emulation performance.  Called on the
 // main thread from target_run(); also called on the dedicated CPU thread (when
-// cpu_threaded is enabled) so the thread actually executing the m68k core is
+// the CPU emulation runs on it) so the thread actually executing the m68k core is
 // covered - target_run() runs before that thread exists, so it cannot tune it.
 // On API 31+ the OS adaptively manages CPU frequency and core placement through
 // the ADPF hint session.  When ADPF is unavailable for this thread (older API,
@@ -5406,22 +6184,40 @@ void target_run()
 
 void target_quit()
 {
-	cancel_async_update_check();
+#ifdef AMIBERRY_NATIVE_WINDOWS_UI
+	// Join downloads before teardown: they use the core's archive state.
+	if (!uae_restart_pending())
+		windows_native_shutdown_bridge();
+#endif
+	// A quit waits for the update check so the process exits cleanly; a
+	// restart replaces the session and must not block on the network.
+	cancel_async_update_check(!uae_restart_pending());
 
 #ifdef __ANDROID__
 	adpf_cleanup();
-	// Write a clean-exit marker so the Kotlin launcher knows this was
-	// an intentional quit, not a crash.  SDL3's SDLActivity calls
-	// System.exit(0) after native main() returns, which kills the
-	// process without running onDestroy() — so marker cleanup from
-	// Java never executes.  Write from native code instead.
-	const char* ext = SDL_GetAndroidExternalStoragePath();
-	if (ext) {
-		std::string marker = std::string(ext) + "/.clean_exit";
-		FILE* f = fopen(marker.c_str(), "w");
-		if (f) {
-			fputs("1", f);
-			fclose(f);
+	// A normal exit consumes the background recovery state. A restart keeps
+	// it: the next emulation instance is still the same session.
+	if (!uae_restart_pending()) {
+		android_overlay_disable_autosave();
+		const std::string autosave = android_overlay_autosave_path();
+		if (!autosave.empty()) {
+			std::remove(autosave.c_str());
+			std::remove((autosave + ".partial").c_str());
+			std::remove((autosave + ".uae").c_str());
+		}
+		// Write a clean-exit marker so the Kotlin launcher knows this was
+		// an intentional quit, not a crash. SDL3's SDLActivity calls
+		// System.exit(0) after native main() returns, which kills the
+		// process without running onDestroy() — so marker cleanup from
+		// Java never executes. Write from native code instead.
+		const char* ext = SDL_GetAndroidExternalStoragePath();
+		if (ext) {
+			std::string marker = std::string(ext) + "/.clean_exit";
+			FILE* f = fopen(marker.c_str(), "w");
+			if (f) {
+				fputs("1", f);
+				fclose(f);
+			}
 		}
 	}
 #endif
@@ -5483,6 +6279,9 @@ void target_fixup_options(uae_prefs* p)
 	{
 		// Make sure that Auto-Center is disabled
 		p->gfx_xcenter = p->gfx_ycenter = 0;
+		// One cropping at a time (a default_auto_crop application setting
+		// with a configuration's manual crop): the writer keeps auto crop.
+		p->gfx_manual_crop = false;
 	}
 	heal_unavailable_display_index(p->gfx_apmode[APMODE_NATIVE].gfx_display, "native");
 	heal_unavailable_display_index(p->gfx_apmode[APMODE_RTG].gfx_display, "RTG");
@@ -5490,11 +6289,9 @@ void target_fixup_options(uae_prefs* p)
 		if (p->gfx_monitor[i].enabled)
 			heal_unavailable_display_index(p->gfx_monitor[i].gfx_display, "monitor");
 	}
-#ifdef WITH_THREADED_CPU
 	// JIT and CPU Thread can now work together.
 	// cpu_thread_run_jit() handles JIT execution on a separate thread,
 	// while run_cpu_thread() manages cycle timing on the main thread.
-#endif
 #endif
 	
 	if (p->rtgboards[0].rtgmem_type >= GFXBOARD_HARDWARE) {
@@ -5523,11 +6320,17 @@ void target_fixup_options(uae_prefs* p)
 	}
 
 	if ((p->gfx_apmode[0].gfx_vsyncmode || p->gfx_apmode[1].gfx_vsyncmode)) {
-		if (p->produce_sound && sound_devices[p->soundcard]->type == SOUND_DEVICE_SDL2) {
+		if (p->produce_sound && sound_devices[p->soundcard]
+			&& sound_devices[p->soundcard]->type == SOUND_DEVICE_SDL) {
 			p->soundcard = 0;
 		}
 	}
 #ifdef AMIBERRY
+	// Drawbridge profiles and hotkeys are global state; a settings preview
+	// leaves them alone.
+	if (fixup_prefs_preview_active)
+		return;
+
 	// Initialize Drawbridge if needed
 	for (const auto& floppyslot : p->floppyslots)
 	{
@@ -5537,6 +6340,8 @@ void target_fixup_options(uae_prefs* p)
 
 	set_key_configs(p);
 #endif
+	if (p == &currprefs && !fixup_prefs_preview_active)
+		set_multithreaded_denise(p->multithreaded_denise);
 }
 
 void target_default_options(uae_prefs* p, const int type)
@@ -5582,7 +6387,13 @@ void target_default_options(uae_prefs* p, const int type)
 		p->rtgallowscaling = false;
 		p->rtgscaleaspectratio = -1;
 		p->rtgvblankrate = 0;
+#ifdef LIBRETRO
+		// libretro presents the raw surface without the RTG cursor overlay,
+		// so Picasso96 must keep drawing the pointer into video memory.
 		p->rtg_hardwaresprite = false;
+#else
+		p->rtg_hardwaresprite = true;
+#endif
 		p->rtg_overlay = true;
 		p->rtg_vgascreensplit = true;
 		p->rtg_paletteswitch = true;
@@ -5612,6 +6423,8 @@ void target_default_options(uae_prefs* p, const int type)
 		//	_sntprintf(p->input_config_name[i], sizeof p->input_config_name[i] / sizeof(TCHAR), buf, i + 1);
 		//p->aviout_xoffset = -1;
 		//p->aviout_yoffset = -1;
+
+		p->ipc_disable_logging=false;
 	}
 	if (type == 1 || type == 0 || type == 3) {
 		p->uaescsimode = UAESCSI_CDEMU;
@@ -5625,10 +6438,16 @@ void target_default_options(uae_prefs* p, const int type)
 		//p->filesystem_mangle_reserved_names = true;
 	}
 
+	// Global state, not prefs: a settings preview (built_in_prefs_preview)
+	// computes defaults for a copy and must leave it alone.
+	const bool write_globals = !fixup_prefs_preview_active;
+
+	// libretro keeps Denise on the emulation thread: the queue flush on
+	// reset stalls there.
 #ifdef LIBRETRO
-	multithread_enabled = false;
+	p->multithreaded_denise = false;
 #else
-	multithread_enabled = true;
+	p->multithreaded_denise = amiberry_options.default_multithreaded_denise;
 #endif
 
 	p->kbd_led_num = -1; // No status on numlock
@@ -5639,8 +6458,6 @@ void target_default_options(uae_prefs* p, const int type)
 	p->gfx_monitor[0].gfx_size_win.height = amiberry_options.default_height;
 
 	p->gfx_manual_crop = false;
-	p->gfx_manual_crop_width = AMIGA_WIDTH_MAX << p->gfx_resolution;
-	p->gfx_manual_crop_height = AMIGA_HEIGHT_MAX << p->gfx_vresolution;
 	p->gfx_horizontal_offset = 0;
 	p->gfx_vertical_offset = 0;
 	if (amiberry_options.default_auto_crop)
@@ -5703,15 +6520,15 @@ void target_default_options(uae_prefs* p, const int type)
 		p->gfx_vresolution = VRES_NONDOUBLE;
 		p->gfx_pscanlines = 0;
 	}
+	// The whole frame at the default resolution and line mode.
+	p->gfx_manual_crop_width = AMIGA_WIDTH_MAX << p->gfx_resolution;
+	p->gfx_manual_crop_height = AMIGA_HEIGHT_MAX << p->gfx_vresolution;
 
 	if (amiberry_options.default_horizontal_centering)
 		p->gfx_xcenter = 2;
 
 	if (amiberry_options.default_vertical_centering)
 		p->gfx_ycenter = 2;
-
-	if (amiberry_options.default_frameskip)
-		p->gfx_framerate = 2;
 
 	p->soundcard_default = true;
 
@@ -5736,6 +6553,7 @@ void target_default_options(uae_prefs* p, const int type)
 	_tcscpy(p->quit_amiberry, amiberry_options.default_quit_key);
 	_tcscpy(p->action_replay, amiberry_options.default_ar_key);
 	_tcscpy(p->fullscreen_toggle, amiberry_options.default_fullscreen_toggle_key);
+	_tcscpy(p->screenshot, amiberry_options.default_screenshot_key);
 
 	p->drawbridge_serial_auto = true;
 	p->drawbridge_smartspeed = false;
@@ -5743,7 +6561,8 @@ void target_default_options(uae_prefs* p, const int type)
 	p->drawbridge_drive_cable = 0;
 	p->drawbridge_driver = 0;
 
-	drawbridge_update_profiles(p);
+	if (write_globals)
+		drawbridge_update_profiles(p); // reconfigures the FloppyBridge drivers
 
 	p->alt_tab_release = false;
 	p->ctrl_alt_release = true;
@@ -5757,12 +6576,36 @@ void target_default_options(uae_prefs* p, const int type)
 	// Default IDs for ports 0 and 1: Mouse and first joystick
 	p->jports[0].id = JSEM_MICE;
 	p->jports[1].id = JSEM_JOYS;
+#ifndef LIBRETRO
+	// Global device choices are defaults for normal startup too, not just
+	// autobooted content. Keep IDs and config identities in sync so a later
+	// input fixup cannot restore an old device over the selected default.
+	const char* const devices[MAX_JPORTS] = {
+		amiberry_options.default_mouse1,
+		amiberry_options.default_controller1,
+		amiberry_options.default_controller3,
+		amiberry_options.default_controller4
+	};
+	const char* const fallbacks[MAX_JPORTS] = { "mouse", "joy0", "none", "none" };
+	for (int port = 0; port < MAX_JPORTS; ++port) {
+		const char* value = devices[port];
+		// Global option buffers are larger than the port's short ID buffer.
+		// Reject oversized values rather than truncating them into a new token.
+		if (!value[0] || strlen(value) >= sizeof p->jports[port].idc.shortid)
+			value = fallbacks[port];
+		p->jports[port].idc = {};
+		inputdevice_joyport_config_store(p, value, port, -1, -1, 0);
+		inputdevice_joyport_config(p, value, nullptr, port, -1, -1, 0, false);
+	}
+#endif
 
-	whdload_prefs.button_wait = amiberry_options.default_whd_buttonwait;
-	whdload_prefs.show_splash = amiberry_options.default_whd_showsplash;
-	whdload_prefs.config_delay = amiberry_options.default_whd_configdelay;
-	whdload_prefs.write_cache = amiberry_options.default_whd_writecache;
-	whdload_prefs.quit_on_exit = amiberry_options.default_whd_quit_on_exit;
+	if (write_globals) {
+		whdload_prefs.button_wait = amiberry_options.default_whd_buttonwait;
+		whdload_prefs.show_splash = amiberry_options.default_whd_showsplash;
+		whdload_prefs.config_delay = amiberry_options.default_whd_configdelay;
+		whdload_prefs.write_cache = amiberry_options.default_whd_writecache;
+		whdload_prefs.quit_on_exit = amiberry_options.default_whd_quit_on_exit;
+	}
 
 	if (amiberry_options.default_soundcard > 0) p->soundcard = amiberry_options.default_soundcard;
 
@@ -5771,16 +6614,18 @@ void target_default_options(uae_prefs* p, const int type)
 
 	// On-screen keyboard default options
 	p->vkbd_enabled = amiberry_options.default_vkbd_enabled;
+	p->vkbd_touch_button = true;
 	p->vkbd_numpad = false;
 
 #ifdef __ANDROID__
 	// Touch-only Android: enable on-screen controls by default. If a physical
-	// gamepad is already connected at startup, disable them so they don't
-	// obscure the emulation for users who have real hardware. User overrides
-	// from a loaded .uae config still take precedence (applied after defaults).
+	// gamepad is already connected at startup, hide the touch joystick so it
+	// doesn't obscure the emulation for users who have real hardware. The
+	// on-screen keyboard stays available: a gamepad-only device (e.g. Android
+	// TV) has no other way to type. User overrides from a loaded .uae config
+	// still take precedence (applied after defaults).
 	if (SDL_HasJoystick()) {
 		p->onscreen_joystick = false;
-		p->vkbd_enabled = false;
 	}
 #endif
 	if (amiberry_options.default_vkbd_language[0])
@@ -5852,6 +6697,8 @@ void target_save_options(zfile* f, uae_prefs* p)
 	cfgfile_target_dwrite_str_escape(f, _T("parallel_port"), p->prtname[0] ? p->prtname : _T("none"));
 	cfgfile_target_dwrite_str_escape(f, _T("midiout_device_name"), p->midioutdev[0] ? p->midioutdev : _T("none"));
 	cfgfile_target_dwrite_str_escape(f, _T("midiin_device_name"), p->midiindev[0] ? p->midiindev : _T("none"));
+
+	cfgfile_target_dwrite_bool(f, _T("ipc_disable_logging"), p->ipc_disable_logging);
 #else
 	cfgfile_target_dwrite (f, _T("midiout_device"), _T("%d"), p->midioutdev);
 	cfgfile_target_dwrite (f, _T("midiin_device"), _T("%d"), p->midiindev);
@@ -5901,11 +6748,13 @@ void target_save_options(zfile* f, uae_prefs* p)
 
 	cfgfile_target_dwrite(f, _T("gfx_horizontal_offset"), _T("%d"), p->gfx_horizontal_offset);
 	cfgfile_target_dwrite(f, _T("gfx_vertical_offset"), _T("%d"), p->gfx_vertical_offset);
-	if (p->gfx_auto_crop)
-	{
-		cfgfile_target_dwrite_bool(f, _T("gfx_auto_crop"), p->gfx_auto_crop);
-	}
-	else if (p->gfx_manual_crop)
+	// Written either way: a default_auto_crop application setting would
+	// otherwise turn auto crop back on for a configuration without it.
+	cfgfile_target_dwrite_bool(f, _T("gfx_auto_crop"), p->gfx_auto_crop);
+	// Written either way: a global default would otherwise turn it back on
+	// for a configuration without it.
+	cfgfile_target_write_bool(f, _T("multithreaded_denise"), p->multithreaded_denise);
+	if (!p->gfx_auto_crop && p->gfx_manual_crop)
 	{
 		cfgfile_target_dwrite_bool(f, _T("gfx_manual_crop"), p->gfx_manual_crop);
 		cfgfile_target_dwrite(f, _T("gfx_manual_crop_width"), _T("%d"), p->gfx_manual_crop_width);
@@ -5932,7 +6781,11 @@ void target_save_options(zfile* f, uae_prefs* p)
 	cfgfile_target_dwrite_str(f, _T("screenshot"), p->screenshot);
 	cfgfile_target_dwrite_str(f, _T("debugger_trigger"), p->debugger_trigger);
 
-	if (p->drawbridge_driver > 0)
+	// Driver 0 is a real driver (the first one), so the block is written
+	// whenever any option differs from its default, not only for driver 1
+	// and up: driver 0's serial port, speed and cable settings were lost.
+	if (p->drawbridge_driver != 0 || !p->drawbridge_serial_auto || p->drawbridge_serial_port[0]
+		|| p->drawbridge_smartspeed || p->drawbridge_autocache || p->drawbridge_drive_cable != 0)
 	{
 		cfgfile_target_dwrite(f, _T("drawbridge_driver"), _T("%d"), p->drawbridge_driver);
 		cfgfile_target_dwrite_bool(f, _T("drawbridge_serial_autodetect"), p->drawbridge_serial_auto);
@@ -5955,10 +6808,16 @@ void target_save_options(zfile* f, uae_prefs* p)
 
 	cfgfile_target_dwrite_bool(f, _T("onscreen_joystick"), p->onscreen_joystick);
 	cfgfile_target_dwrite_bool(f, _T("vkbd_enabled"), p->vkbd_enabled);
+	cfgfile_target_dwrite_bool(f, _T("vkbd_touch_button"), p->vkbd_touch_button);
 	cfgfile_target_dwrite_bool(f, _T("vkbd_numpad"), p->vkbd_numpad);
 	cfgfile_target_dwrite(f, _T("vkbd_transparency"), "%d", p->vkbd_transparency);
 	cfgfile_target_dwrite_str(f, _T("vkbd_language"), p->vkbd_language);
 	cfgfile_target_dwrite_str(f, _T("vkbd_toggle"), p->vkbd_toggle);
+	// Legacy keys parsed from older configurations; written back so a
+	// round-trip through the current version keeps them.
+	cfgfile_target_dwrite_bool(f, _T("vkbd_hires"), p->vkbd_hires);
+	cfgfile_target_dwrite_bool(f, _T("vkbd_exit"), p->vkbd_exit);
+	cfgfile_target_dwrite_str(f, _T("vkbd_style"), p->vkbd_style);
 }
 
 void target_restart()
@@ -6028,15 +6887,16 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		|| cfgfile_yesno(option, value, _T("blank_monitors"), &p->blankmonitors)
 		|| cfgfile_yesno(option, value, _T("active_nocapture_pause"), &p->active_nocapture_pause)
 		|| cfgfile_yesno(option, value, _T("active_nocapture_nosound"), &p->active_nocapture_nosound)
+		// The spellings the writer uses; the ones above are older.
+		|| cfgfile_yesno(option, value, _T("active_not_captured_pause"), &p->active_nocapture_pause)
+		|| cfgfile_yesno(option, value, _T("active_not_captured_nosound"), &p->active_nocapture_nosound)
+		|| cfgfile_yesno(option, value, _T("inactive_minimize"), &p->minimize_inactive)
 		|| cfgfile_yesno(option, value, _T("inactive_pause"), &p->inactive_pause)
 		|| cfgfile_yesno(option, value, _T("inactive_nosound"), &p->inactive_nosound)
 		|| cfgfile_intval(option, value, _T("inactive_input"), &p->inactive_input, 1)
 		|| cfgfile_yesno(option, value, _T("minimized_pause"), &p->minimized_pause)
 		|| cfgfile_yesno(option, value, _T("minimized_nosound"), &p->minimized_nosound)
 		|| cfgfile_intval(option, value, _T("minimized_input"), &p->minimized_input, 1)
-		|| cfgfile_string(option, value, _T("midi_device"), p->midioutdev, sizeof p->midioutdev)
-		|| cfgfile_string(option, value, _T("midiout_device_name"), p->midioutdev, sizeof p->midioutdev)
-		|| cfgfile_string(option, value, _T("midiin_device_name"), p->midiindev, sizeof p->midiindev)
 		|| cfgfile_yesno(option, value, _T("midirouter"), &p->midirouter)
 		|| cfgfile_yesno(option, value, _T("right_control_is_right_win"), &p->right_control_is_right_win_key)
 		|| cfgfile_yesno(option, value, _T("always_on_top"), &p->main_alwaysontop)
@@ -6064,6 +6924,7 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		|| cfgfile_yesno(option, value, _T("gfx_auto_height"), &p->gfx_auto_crop)
 		|| cfgfile_yesno(option, value, _T("gfx_auto_crop"), &p->gfx_auto_crop)
 		|| cfgfile_yesno(option, value, _T("gfx_manual_crop"), &p->gfx_manual_crop)
+		|| cfgfile_yesno(option, value, _T("multithreaded_denise"), &p->multithreaded_denise)
 		|| cfgfile_intval(option, value, "gfx_correct_aspect", &p->gfx_correct_aspect, 1)
 		|| cfgfile_intval(option, value, "scaling_method", &p->scaling_method, 1)
 		|| cfgfile_string(option, value, "open_gui", p->open_gui, sizeof p->open_gui)
@@ -6075,9 +6936,30 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		|| cfgfile_string(option, value, "right_amiga", p->right_amiga, sizeof p->right_amiga)
 		|| cfgfile_string(option, value, "screenshot", p->screenshot, sizeof p->screenshot)
 		|| cfgfile_string(option, value, "debugger_trigger", p->debugger_trigger, sizeof p->debugger_trigger)
+		// Android launcher records (its joyport 1 choice and the preset it
+		// started from, "<id>:<configuration>"): accepted and not kept.
 		|| cfgfile_string(option, value, "android_joyport1", tmpbuf, sizeof tmpbuf)
+		|| cfgfile_string(option, value, "android_preset", tmpbuf, sizeof tmpbuf)
 		|| cfgfile_intval(option, value, _T("cpu_idle"), &p->cpu_idle, 1))
 		return 1;
+
+	// The MIDI device names, written escaped and as "none" when there is
+	// none (which the MIDI emulation would try to open as a device).
+	{
+		struct named_device { const TCHAR* name; TCHAR* field; int size; };
+		const named_device devices[] = {
+			{_T("midi_device"), p->midioutdev, static_cast<int>(sizeof p->midioutdev)},
+			{_T("midiout_device_name"), p->midioutdev, static_cast<int>(sizeof p->midioutdev)},
+			{_T("midiin_device_name"), p->midiindev, static_cast<int>(sizeof p->midiindev)},
+		};
+		for (const named_device& d : devices) {
+			if (cfgfile_string_escape(option, value, d.name, d.field, d.size)) {
+				if (!_tcsicmp(d.field, _T("none")))
+					d.field[0] = 0;
+				return 1;
+			}
+		}
+	}
 
 	if (cfgfile_string(option, value, _T("shader"), p->shader, sizeof p->shader)) {
 		if (!p->shader[0])
@@ -6115,6 +6997,7 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		return 1;
 
 	if (cfgfile_yesno(option, value, _T("vkbd_enabled"), &p->vkbd_enabled)
+		|| cfgfile_yesno(option, value, _T("vkbd_touch_button"), &p->vkbd_touch_button)
 		|| cfgfile_yesno(option, value, _T("vkbd_numpad"), &p->vkbd_numpad)
 		|| cfgfile_yesno(option, value, _T("vkbd_hires"), &p->vkbd_hires)
 		|| cfgfile_yesno(option, value, _T("vkbd_exit"), &p->vkbd_exit)
@@ -6122,7 +7005,13 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		|| cfgfile_string(option, value, _T("vkbd_language"), p->vkbd_language, sizeof p->vkbd_language)
 		|| cfgfile_string(option, value, _T("vkbd_style"), p->vkbd_style, sizeof p->vkbd_style)
 		|| cfgfile_string(option, value, _T("vkbd_toggle"), p->vkbd_toggle, sizeof p->vkbd_toggle))
+	{
+		// "default" resolves to the live emulator default, letting a launcher
+		// override reset a value explicitly set in a backing configuration.
+		if (_tcscmp(p->vkbd_toggle, _T("default")) == 0)
+			_tcscpy(p->vkbd_toggle, amiberry_options.default_vkbd_toggle);
 		return 1;
+	}
 
 	if (cfgfile_string(option, value, _T("expansion_gui_page"), tmpbuf, sizeof tmpbuf / sizeof(TCHAR))) {
 		TCHAR* p = _tcschr(tmpbuf, ',');
@@ -6260,6 +7149,9 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 	if (cfgfile_yesno(option, value, _T("start_not_captured"), &p->start_uncaptured))
 		return 1;
 	if (cfgfile_string(option, value, _T("serial_port"), &p->sername[0], sizeof p->sername / sizeof(TCHAR))) {
+		// "none" is no port, as the settings layer and the GUI spell it.
+		if (!_tcsicmp(p->sername, _T("none")))
+			p->sername[0] = 0;
 		if (p->sername[0])
 			p->use_serial = true;
 		else
@@ -6277,6 +7169,9 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		}
 		return 1;
 	}
+
+	if (cfgfile_yesno(option, value, _T("ipc_disable_logging"), &p->ipc_disable_logging))
+		return 1;
 
 	return 0;
 }
@@ -6303,6 +7198,47 @@ int target_parse_option(uae_prefs *p, const TCHAR *option, const TCHAR *value, c
 	}
 	return 0;
 }
+// win32.* settings that mean the same in Amiberry. Paths and host device
+// names or indexes (sound cards, MIDI, serial and parallel ports) are
+// left out because a Windows value would select the wrong device here.
+static const TCHAR *compat_options[] = {
+	_T("active_not_captured_nosound"), _T("active_not_captured_pause"), _T("active_priority"),
+	_T("inactive_input"), _T("inactive_nosound"), _T("inactive_pause"), _T("inactive_priority"),
+	_T("iconified_input"), _T("iconified_nosound"), _T("iconified_pause"), _T("iconified_priority"),
+	_T("middle_mouse"),
+	_T("rtg_vblank"),
+	_T("uaescsimode"),
+	nullptr
+};
+
+bool amiberry_config_is_compat_option(const TCHAR *option)
+{
+	for (int i = 0; compat_options[i]; i++) {
+		if (!_tcsicmp(option, compat_options[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int target_parse_compat_option(struct uae_prefs *p, const TCHAR *option, const TCHAR *value, int type)
+{
+	if (!amiberry_config_is_compat_option(option)) {
+		return 0;
+	}
+	/* win32.iconified_* maps to Amiberry's minimized_* host settings. */
+	if ((type & CONFIG_TYPE_HOST)
+		&& (cfgfile_yesno(option, value, _T("iconified_pause"), &p->minimized_pause)
+			|| cfgfile_yesno(option, value, _T("iconified_nosound"), &p->minimized_nosound)
+			|| cfgfile_intval(option, value, _T("iconified_input"), &p->minimized_input, 1)
+			|| cfgfile_intval(option, value, _T("iconified_priority"), &p->minimized_priority, 1)))
+		return 1;
+	/* Keep the caller's type: a hardware-only linked load applies only the
+	 * hardware settings, a host-only one only the host settings, exactly
+	 * like the native amiberry.* options. */
+	return target_parse_option(p, option, value, type);
+}
+
 
 std::string get_data_path()
 {
@@ -6312,6 +7248,7 @@ std::string get_data_path()
 void get_saveimage_path(char* out, const int size, int dir)
 {
 	_tcsncpy(out, fix_trailing(saveimage_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 std::string get_configuration_path()
@@ -6339,6 +7276,7 @@ std::vector<std::string> get_base_content_missing_directories(const std::string&
 void get_configuration_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(config_path).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 void set_base_content_path(const std::string& newpath)
@@ -6381,8 +7319,12 @@ void set_nvram_path(const std::string& newpath)
 
 void set_plugins_path(const std::string& newpath)
 {
-	plugins_dir = newpath;
-	macos_bookmark_store(newpath);
+	if (is_valid_plugins_override(newpath)) {
+		plugins_dir = normalize_path_string(newpath);
+		macos_bookmark_store(plugins_dir);
+	} else {
+		plugins_dir.clear();
+	}
 }
 
 void set_video_path(const std::string& newpath)
@@ -6606,6 +7548,7 @@ std::string get_rom_path()
 void get_rom_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(rom_path).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 void set_rom_path(const std::string& newpath)
@@ -6622,6 +7565,7 @@ std::string get_rp9_path()
 void get_rp9_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(rp9_path).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 void set_rp9_path(const std::string& newpath)
@@ -6644,16 +7588,25 @@ void set_saveimage_path(const std::string& newpath)
 void get_savestate_path(char* out, const int size)
 {
 	if (path_statefile[0]) {
-		_tcsncpy(out, path_statefile, size);
+		_tcsncpy(out, path_statefile, size - 1);
+		out[size - 1] = 0;
 		return;
 	}
 	_tcsncpy(out, fix_trailing(savestate_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 std::string get_savestate_path()
 {
 	if (path_statefile[0])
 		return path_statefile;
+	return fix_trailing(savestate_dir);
+}
+
+// The save states folder itself, without the configuration's
+// statefile_path override get_savestate_path() applies.
+std::string get_savestate_folder()
+{
 	return fix_trailing(savestate_dir);
 }
 
@@ -6665,6 +7618,7 @@ std::string get_ripper_path()
 void fetch_ripperpath(TCHAR* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(ripper_path).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 void set_ripper_path(const std::string& newpath)
@@ -6681,6 +7635,7 @@ std::string get_inputrecordings_path()
 void fetch_inputfilepath(TCHAR* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(input_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 void set_inputrecordings_path(const std::string& newpath)
@@ -6692,6 +7647,7 @@ void set_inputrecordings_path(const std::string& newpath)
 void get_nvram_path(TCHAR* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(nvram_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 std::string get_nvram_path()
@@ -6699,16 +7655,9 @@ std::string get_nvram_path()
 	return fix_trailing(nvram_dir);
 }
 
-std::string get_plugins_path()
+std::string get_plugins_override_path()
 {
-	const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
-	if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
-	{
-		std::string path = env_plugins_dir;
-		return fix_trailing(path);
-	}
-
-	return fix_trailing(plugins_dir);
+	return plugins_dir;
 }
 
 std::string get_screenshot_path()
@@ -6724,6 +7673,7 @@ std::string get_ini_file_path()
 void get_video_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(video_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 std::string get_video_path()
@@ -6749,6 +7699,7 @@ std::string get_bezels_path()
 void get_floppy_sounds_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(floppy_sounds_dir).c_str(), size - 1);
+	out[size - 1] = 0;
 }
 
 std::string get_floppy_sounds_path()
@@ -6759,6 +7710,7 @@ std::string get_floppy_sounds_path()
 void set_floppy_sounds_path(const std::string& newpath)
 {
 	floppy_sounds_dir = newpath;
+	floppy_sounds_dir_is_default = false;
 	macos_bookmark_store(newpath);
 }
 
@@ -6852,6 +7804,7 @@ int target_cfgfile_load(uae_prefs* p, const char* filename, int type, const int 
 	if (is_rp9) {
 		last_loaded_config[0] = 0;
 		last_loaded_config_is_automatic_default = false;
+		set_current_config_path(nullptr);
 	} else {
 		set_last_loaded_config(filename, isdefault != 0);
 	}
@@ -6945,6 +7898,20 @@ std::string remove_file_extension(const std::string& filename)
 	return filename.substr(0, last_dot);
 }
 
+// The name screenshots and save states take after the running content:
+// DF0's disk, the CD, the WHDLoad game, else the configuration. Empty when
+// nothing names it.
+std::string current_content_name()
+{
+	if (currprefs.floppyslots[0].df[0])
+		return remove_file_extension(extract_filename(currprefs.floppyslots[0].df));
+	if (currprefs.cdslots[0].inuse && currprefs.cdslots[0].name[0])
+		return remove_file_extension(extract_filename(currprefs.cdslots[0].name));
+	if (!whdload_prefs.whdload_filename.empty())
+		return remove_file_extension(extract_filename(whdload_prefs.whdload_filename));
+	return last_active_config;
+}
+
 void read_directory(const std::string& path, std::vector<std::string>* dirs, std::vector<std::string>* files)
 {
 	if (dirs != nullptr)
@@ -6994,33 +7961,102 @@ void read_directory(const std::string& path, std::vector<std::string>* dirs, std
 		sort(files->begin(), files->end());
 }
 
-bool save_amiberry_settings_with_result()
+// Portable installs store amiberry.conf paths relative to the executable directory when
+// relative paths are enabled, so the whole folder can move to another drive or mount point.
+// The iOS app does so always: its container moves.
+static std::string get_settings_path_for_save(const std::string& value)
+{
+#ifdef AMIBERRY_IOS
+	const bool relative_settings = true;
+#else
+	const bool relative_settings = g_portable_mode && relativepaths;
+#endif
+	if (!relative_settings || value.empty() || value.size() >= MAX_DPATH)
+		return value;
+	TCHAR path[MAX_DPATH];
+	_tcscpy(path, value.c_str());
+	target_make_relative_path(path, MAX_DPATH);
+	return path;
+}
+
+// Rewrites path with content in place, as the settings file was always
+// written (fopen "w"), so the file keeps its identity: symbolic and hard
+// links, owner, permissions, ACLs and extended attributes, and a special
+// file stays one. A regular file's old content is read first and written
+// back when the new content cannot be written, so a failed save reports
+// the failure with the file as it was. A file that cannot be read (write
+// permission only) is written without that backup, as before.
+static bool replace_file_contents(const std::string& path, const std::string& content)
+{
+	std::string old_content;
+	bool have_old = false;
+	std::error_code ec;
+	if (std::filesystem::is_regular_file(path, ec)) {
+		if (FILE* in = uae_fopen(path.c_str(), "rbe")) {
+			char block[16384];
+			size_t n;
+			while ((n = fread(block, 1, sizeof block, in)) > 0)
+				old_content.append(block, n);
+			const bool read_ok = ferror(in) == 0;
+			fclose(in);
+			// A file that cannot be read back whole is not risked.
+			if (!read_ok)
+				return false;
+			have_old = true;
+		}
+	}
+	auto write_all = [&path](const std::string& text, const char* mode) {
+		FILE* out = uae_fopen(path.c_str(), mode);
+		if (!out)
+			return false;
+		const bool written = fwrite(text.data(), 1, text.size(), out) == text.size() && fflush(out) == 0;
+		const bool closed = fclose(out) == 0;
+		return written && closed;
+	};
+	// Text mode, as before (line ends on Windows); the backup goes back
+	// byte for byte.
+	if (write_all(content, "we"))
+		return true;
+	if (have_old && !write_all(old_content, "wbe"))
+		write_log("Settings file '%s' could not be written, nor its previous content restored\n", path.c_str());
+	return false;
+}
+
+static bool write_amiberry_settings()
 {
 	ensure_parent_directory_exists(amiberry_conf_file);
-	auto* const f = uae_fopen(amiberry_conf_file.c_str(), "we");
-	if (!f)
-		return false;
+	// Built in memory first, so the file is only opened for writing once
+	// the whole content exists (replace_file_contents).
+	std::string content;
 
 	char buffer[MAX_DPATH];
 
 	auto write_bool_option = [&](const char* name, const bool value) {
 		_sntprintf(buffer, MAX_DPATH, "%s=%s\n", name, value ? "yes" : "no");
-		fputs(buffer, f);
+		content += buffer;
 		};
 
 	auto write_int_option = [&](const char* name, const int value) {
 		_sntprintf(buffer, MAX_DPATH, "%s=%d\n", name, value);
-		fputs(buffer, f);
+		content += buffer;
 		};
 
+	// Written whole: a value cut at the buffer lost its newline, and the
+	// next setting was read as part of it.
 	auto write_string_option = [&](const char* name, const std::string& value) {
-		_sntprintf(buffer, MAX_DPATH, "%s=%s\n", name, value.c_str());
-		fputs(buffer, f);
+		content += name;
+		content += '=';
+		content += value;
+		content += '\n';
+		};
+
+	auto write_path_option = [&](const char* name, const std::string& value) {
+		write_string_option(name, get_settings_path_for_save(value));
 		};
 
 	auto write_float_option = [&](const char* name, const float value) {
 		_sntprintf(buffer, MAX_DPATH, "%s=%f\n", name, value);
-		fputs(buffer, f);
+		content += buffer;
 		};
 
 	// Should the Quickstart Panel be the default when opening the GUI?
@@ -7029,6 +8065,8 @@ bool save_amiberry_settings_with_result()
 	// Open each config file and read the Description field? 
 	// This will slow down scanning the config list if it's very large
 	write_bool_option("read_config_descriptions", amiberry_options.read_config_descriptions);
+	for (const auto& group : amiberry_options.expanded_config_groups)
+		write_string_option("config_group_expanded", group);
 
 	// Write to logfile? 
 	// If enabled, a file named "amiberry_log.txt" will be generated in the startup folder
@@ -7042,6 +8080,10 @@ bool save_amiberry_settings_with_result()
 	// Map RCtrl key to RAmiga key?
 	// This helps with keyboards that may not have 2 Win keys and no Menu key either
 	write_bool_option("rctrl_as_ramiga", amiberry_options.rctrl_as_ramiga);
+
+	// macOS native UI: Left Command-Q goes to the Amiga (0), asks to quit
+	// (1) or quits (2). Right Command-Q always goes to the Amiga.
+	write_int_option("macos_left_command_q", amiberry_options.macos_left_command_q);
 
 	// Disable controller in the GUI?
 	// If you want to disable the default behavior for some reason
@@ -7068,6 +8110,9 @@ bool save_amiberry_settings_with_result()
 	// Default key for Fullscreen Toggle
 	write_string_option("default_fullscreen_toggle_key", amiberry_options.default_fullscreen_toggle_key);
 
+	// Default key for saving a screenshot
+	write_string_option("default_screenshot_key", amiberry_options.default_screenshot_key);
+
 	// Enable Horizontal Centering by default?
 	write_bool_option("default_horizontal_centering", amiberry_options.default_horizontal_centering);
 
@@ -7081,8 +8126,6 @@ bool save_amiberry_settings_with_result()
 	// Enable Auto Resolution Switching by default?
 	write_int_option("default_gfx_autoresolution", amiberry_options.default_gfx_autoresolution);
 
-	// Enable frameskip by default?
-	write_bool_option("default_frameskip", amiberry_options.default_frameskip);
 	write_bool_option("perf_log", amiberry_options.perf_log);
 	write_bool_option("slow_host_warning", amiberry_options.slow_host_warning);
 	write_bool_option("use_adpf", amiberry_options.use_adpf);
@@ -7094,6 +8137,7 @@ bool save_amiberry_settings_with_result()
 
 	// Enable Auto-Crop by default?
 	write_bool_option("default_auto_crop", amiberry_options.default_auto_crop);
+	write_bool_option("default_multithreaded_denise", amiberry_options.default_multithreaded_denise);
 
 	// Default Screen Width
 	write_int_option("default_width", amiberry_options.default_width);
@@ -7188,6 +8232,7 @@ bool save_amiberry_settings_with_result()
 
 	// Default controller button for toggling the On-screen Keyboard
 	write_string_option("default_vkbd_toggle", amiberry_options.default_vkbd_toggle);
+	write_bool_option("default_vkbd_toggle_migrated", amiberry_options.default_vkbd_toggle_migrated);
 
 	// GUI Theme
 	write_string_option("gui_theme", amiberry_options.gui_theme);
@@ -7202,7 +8247,7 @@ bool save_amiberry_settings_with_result()
 		_sntprintf(buffer, MAX_DPATH, "shader_parameter=%s|%s|%s|%.9g\n",
 			parameter.rtg ? "rtg" : "native", parameter.shader.c_str(),
 			parameter.name.c_str(), parameter.value);
-		fputs(buffer, f);
+		content += buffer;
 	}
 
 	// Show CRT bezel frame overlay
@@ -7222,13 +8267,16 @@ bool save_amiberry_settings_with_result()
 		: get_base_content_path_set(base_content_path);
 	auto write_managed_path_option = [&](const managed_path_option_descriptor& descriptor, const std::string& value) {
 		if (base_content_path.empty() || !path_strings_match(value, derived_base_paths.*(descriptor.member)))
-			write_string_option(descriptor.name, value);
+			write_path_option(descriptor.name, value);
 	};
 
-	write_string_option("base_content_path", base_content_path);
-	write_string_option("retroarch_config", retroarch_file);
-	write_string_option("floppy_sounds_dir", floppy_sounds_dir);
-	write_string_option("plugins_dir", plugins_dir);
+	write_bool_option("relative_paths", relativepaths != 0);
+	write_path_option("base_content_path", base_content_path);
+	write_path_option("retroarch_config", retroarch_file);
+	if (!floppy_sounds_dir_is_default)
+		write_path_option("floppy_sounds_dir", floppy_sounds_dir);
+	if (!plugins_dir.empty())
+		write_path_option("plugins_dir", plugins_dir);
 	write_managed_path_option(base_content_managed_path_options[0], config_path);
 	write_managed_path_option(base_content_managed_path_options[1], controllers_path);
 	write_managed_path_option(base_content_managed_path_options[2], whdboot_path);
@@ -7252,32 +8300,43 @@ bool save_amiberry_settings_with_result()
 
 	// Recent disk entries (these are used in the dropdown controls)
 	_sntprintf(buffer, MAX_DPATH, "MRUDiskList=%zu\n", lstMRUDiskList.size());
-	fputs(buffer, f);
+	content += buffer;
 	for (auto& i : lstMRUDiskList)
 	{
-		write_string_option("Diskfile", i);
+		write_path_option("Diskfile", i);
 	}
 
 	// Recent CD entries (these are used in the dropdown controls)
 	_sntprintf(buffer, MAX_DPATH, "MRUCDList=%zu\n", lstMRUCDList.size());
-	fputs(buffer, f);
+	content += buffer;
 	for (auto& i : lstMRUCDList)
 	{
-		write_string_option("CDfile", i);
+		write_path_option("CDfile", i);
 	}
 
 	// Recent WHDLoad entries (these are used in the dropdown controls)
 	// lstMRUWhdloadList
 	_sntprintf(buffer, MAX_DPATH, "MRUWHDLoadList=%zu\n", lstMRUWhdloadList.size());
-	fputs(buffer, f);
+	content += buffer;
 	for (auto& i : lstMRUWhdloadList)
 	{
-		write_string_option("WHDLoadfile", i);
+		write_path_option("WHDLoadfile", i);
 	}
 	
-	const bool write_ok = ferror(f) == 0;
-	const bool close_ok = fclose(f) == 0;
-	return write_ok && close_ok;
+	return replace_file_contents(amiberry_conf_file, content);
+}
+
+// Never throws: a save that cannot build the file (out of memory) fails
+// like one that cannot write it, for the GUI's event handlers and the
+// native API alike.
+bool save_amiberry_settings_with_result()
+{
+	try {
+		return write_amiberry_settings();
+	} catch (...) {
+		write_log("Could not build the settings file '%s'\n", amiberry_conf_file.c_str());
+		return false;
+	}
 }
 
 void save_amiberry_settings()
@@ -7370,6 +8429,7 @@ static bool parse_base_content_path_line(const char* path, char* linea, std::str
 	if (!cfgfile_string(option, value, "base_content_path", configured_base_path, sizeof configured_base_path))
 		return false;
 
+	target_resolve_relative_path(configured_base_path, sizeof configured_base_path);
 	value_out = normalize_path_string(configured_base_path);
 	return true;
 }
@@ -7395,8 +8455,23 @@ static bool parse_managed_path_option_line(const char* path, char* linea, manage
 		return false;
 
 	line_out.descriptor = descriptor;
+	target_resolve_relative_path(configured_path, sizeof configured_path);
 	line_out.value = normalize_path_string(configured_path);
 	return true;
+}
+
+static bool is_settings_path_option(const TCHAR* option)
+{
+	static const TCHAR* const path_options[] = {
+		_T("retroarch_config"), _T("floppy_sounds_dir"), _T("plugins_dir"), _T("cd_path"),
+		_T("Diskfile"), _T("CDfile"), _T("WHDLoadfile"),
+	};
+	for (const auto* path_option : path_options)
+	{
+		if (_tcscmp(option, path_option) == 0)
+			return true;
+	}
+	return find_base_content_managed_path_option(option) != nullptr;
 }
 
 static int parse_amiberry_settings_line(const char *path, char *linea)
@@ -7425,6 +8500,8 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 
 	if (!cfgfile_separate_linea(path, linea, option, value))
 		return 0;
+	if (is_settings_path_option(option))
+		target_resolve_relative_path(value, CONFIG_BLEN);
 
 	if (cfgfile_string(option, value, "Diskfile", tmpFile, sizeof tmpFile))
 	{
@@ -7500,14 +8577,34 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_string(option, value, "logfile_path", logfile_path);
 		ret |= cfgfile_string(option, value, "rom_path", rom_path);
 		ret |= cfgfile_string(option, value, "rp9_path", rp9_path);
-		ret |= cfgfile_string(option, value, "floppy_sounds_dir", floppy_sounds_dir);
+		std::string configured_floppy_sounds_dir;
+		if (cfgfile_string(option, value, "floppy_sounds_dir", configured_floppy_sounds_dir))
+		{
+			if (is_computed_floppy_sounds_dir(configured_floppy_sounds_dir))
+			{
+				legacy_migration_state.settings_rewrite_needed = true;
+			}
+			else
+			{
+				floppy_sounds_dir = configured_floppy_sounds_dir;
+				floppy_sounds_dir_is_default = false;
+			}
+			ret = 1;
+		}
 		ret |= cfgfile_string(option, value, "saveimage_dir", saveimage_dir);
 		ret |= cfgfile_string(option, value, "savestate_dir", savestate_dir);
 		ret |= cfgfile_string(option, value, "ripper_path", ripper_path);
 		ret |= cfgfile_string(option, value, "inputrecordings_dir", input_dir);
 		ret |= cfgfile_string(option, value, "screenshot_dir", screenshot_dir);
 		ret |= cfgfile_string(option, value, "nvram_dir", nvram_dir);
-		ret |= cfgfile_string(option, value, "plugins_dir", plugins_dir);
+	{
+		std::string loaded_plugins_dir;
+		if (cfgfile_string(option, value, "plugins_dir", loaded_plugins_dir)) {
+			plugins_dir = is_valid_plugins_override(loaded_plugins_dir)
+				? normalize_path_string(loaded_plugins_dir) : std::string{};
+			ret = 1;
+		}
+	}
 		ret |= cfgfile_string(option, value, "video_dir", video_dir);
 		ret |= cfgfile_string(option, value, "themes_path", themes_path);
 		ret |= cfgfile_string(option, value, "shaders_path", shaders_path);
@@ -7516,11 +8613,26 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		// save_amiberry_settings(). It's purpose is to provide -o amiberry_config=path
 		// command line option.
 		ret |= cfgfile_string(option, value, "amiberry_config", amiberry_conf_file);
+		bool relative_paths_enabled = relativepaths != 0;
+		if (cfgfile_yesno(option, value, "relative_paths", &relative_paths_enabled))
+		{
+#ifndef AMIBERRY_IOS
+			relativepaths = relative_paths_enabled ? 1 : 0;
+#endif
+			ret = 1;
+		}
 		ret |= cfgfile_intval(option, value, "ROMs", &numROMs, 1);
 		ret |= cfgfile_intval(option, value, "MRUDiskList", &numDisks, 1);
 		ret |= cfgfile_intval(option, value, "MRUCDList", &numCDs, 1);
 		ret |= cfgfile_yesno(option, value, "Quickstart", &amiberry_options.quickstart_start);
 		ret |= cfgfile_yesno(option, value, "read_config_descriptions", &amiberry_options.read_config_descriptions);
+		if (_tcscmp(option, _T("config_group_expanded")) == 0 && value[0])
+		{
+			auto& groups = amiberry_options.expanded_config_groups;
+			if (std::find(groups.begin(), groups.end(), value) == groups.end())
+				groups.emplace_back(value);
+			ret = 1;
+		}
 		ret |= cfgfile_yesno(option, value, "write_logfile", &amiberry_options.write_logfile);
 		ret |= cfgfile_intval(option, value, "default_line_mode", &amiberry_options.default_line_mode, 1);
 		// Sanitize at the parse boundary: cfgfile_floatval stores the raw
@@ -7532,6 +8644,7 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_floatval(option, value, "gui_layout_scale", &parsed_gui_layout_scale);
 		amiberry_options.gui_layout_scale_percent = clamp_gui_layout_scale_percent(parsed_gui_layout_scale);
 		ret |= cfgfile_yesno(option, value, "rctrl_as_ramiga", &amiberry_options.rctrl_as_ramiga);
+		ret |= cfgfile_intval(option, value, "macos_left_command_q", &amiberry_options.macos_left_command_q, 1);
 		ret |= cfgfile_yesno(option, value, "gui_joystick_control", &amiberry_options.gui_joystick_control);
 		ret |= cfgfile_intval(option, value, "input_default_mouse_speed", &amiberry_options.input_default_mouse_speed, 1);
 		ret |= cfgfile_yesno(option, value, "input_keyboard_as_joystick_stop_keypresses", &amiberry_options.input_keyboard_as_joystick_stop_keypresses);
@@ -7539,11 +8652,11 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_string(option, value, "default_quit_key", amiberry_options.default_quit_key, sizeof amiberry_options.default_quit_key);
 		ret |= cfgfile_string(option, value, "default_ar_key", amiberry_options.default_ar_key, sizeof amiberry_options.default_ar_key);
 		ret |= cfgfile_string(option, value, "default_fullscreen_toggle_key", amiberry_options.default_fullscreen_toggle_key, sizeof amiberry_options.default_fullscreen_toggle_key);
+		ret |= cfgfile_string(option, value, "default_screenshot_key", amiberry_options.default_screenshot_key, sizeof amiberry_options.default_screenshot_key);
 		ret |= cfgfile_yesno(option, value, "default_horizontal_centering", &amiberry_options.default_horizontal_centering);
 		ret |= cfgfile_yesno(option, value, "default_vertical_centering", &amiberry_options.default_vertical_centering);
 		ret |= cfgfile_intval(option, value, "default_scaling_method", &amiberry_options.default_scaling_method, 1);
 		ret |= cfgfile_intval(option, value, "default_gfx_autoresolution", &amiberry_options.default_gfx_autoresolution, 1);
-		ret |= cfgfile_yesno(option, value, "default_frameskip", &amiberry_options.default_frameskip);
 		ret |= cfgfile_yesno(option, value, "perf_log", &amiberry_options.perf_log);
 		ret |= cfgfile_yesno(option, value, "slow_host_warning", &amiberry_options.slow_host_warning);
 		ret |= cfgfile_yesno(option, value, "use_adpf", &amiberry_options.use_adpf);
@@ -7552,6 +8665,7 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_yesno(option, value, "default_correct_aspect_ratio", &amiberry_options.default_correct_aspect_ratio);
 		ret |= cfgfile_yesno(option, value, "default_auto_height", &amiberry_options.default_auto_crop);
 		ret |= cfgfile_yesno(option, value, "default_auto_crop", &amiberry_options.default_auto_crop);
+		ret |= cfgfile_yesno(option, value, "default_multithreaded_denise", &amiberry_options.default_multithreaded_denise);
 		ret |= cfgfile_intval(option, value, "default_width", &amiberry_options.default_width, 1);
 		ret |= cfgfile_intval(option, value, "default_height", &amiberry_options.default_height, 1);
 		ret |= cfgfile_intval(option, value, "default_fullscreen_mode", &amiberry_options.default_fullscreen_mode, 1);
@@ -7586,7 +8700,8 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_yesno(option, value, "default_vkbd_enabled", &amiberry_options.default_vkbd_enabled);
 		ret |= cfgfile_string(option, value, "default_vkbd_language", amiberry_options.default_vkbd_language, sizeof amiberry_options.default_vkbd_language);
 		ret |= cfgfile_intval(option, value, "default_vkbd_transparency", &amiberry_options.default_vkbd_transparency, 1);
-		ret |= cfgfile_string(option, value, "default_vkbd_toggle", amiberry_options.default_vkbd_toggle, sizeof amiberry_options.default_vkbd_toggle);
+		ret |= cfgfile_string(option, value, _T("default_vkbd_toggle"), amiberry_options.default_vkbd_toggle, sizeof amiberry_options.default_vkbd_toggle);
+		ret |= cfgfile_yesno(option, value, "default_vkbd_toggle_migrated", &amiberry_options.default_vkbd_toggle_migrated);
 		// Legacy bitmap vkbd defaults. Accept old amiberry.conf files, but do not apply or re-save these.
 		bool legacy_vkbd_bool;
 		char legacy_vkbd_string[128];
@@ -7707,13 +8822,9 @@ bool directory_exists(std::string directory, const std::string& sub_dir)
 
 bool file_exists(const std::string& file)
 {
-#ifdef USE_OLDGCC
-	namespace fs = std::experimental::filesystem;
-#else
 	namespace fs = std::filesystem;
-#endif
-	fs::path f{ file };
-	return (fs::exists(f));
+	std::error_code error;
+	return fs::exists(host_path(file), error) && !error;
 }
 
 #ifdef _WIN32
@@ -7767,6 +8878,86 @@ static std::string get_desktop_executable_directory()
 #endif
 }
 
+struct installed_resource_roots
+{
+	std::string prefix;
+	std::string data;
+	std::string plugins;
+};
+
+static const char* get_configured_install_bindir()
+{
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	return AMIBERRY_INSTALL_BINDIR;
+#else
+	return "";
+#endif
+}
+
+static const char* get_configured_install_datadir()
+{
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	return AMIBERRY_INSTALL_DATADIR;
+#else
+	return "";
+#endif
+}
+
+static const char* get_configured_install_libdir()
+{
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	return AMIBERRY_INSTALL_LIBDIR;
+#else
+	return "";
+#endif
+}
+
+static const installed_resource_roots& get_relocated_installed_resource_roots()
+{
+	static const installed_resource_roots roots = []
+	{
+		installed_resource_roots result;
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+		auto executable_directory = std::filesystem::path(get_desktop_executable_directory()).lexically_normal();
+		if (executable_directory.filename().empty())
+			executable_directory = executable_directory.parent_path();
+		const auto configured_bindir = std::filesystem::path(AMIBERRY_INSTALL_BINDIR).lexically_normal();
+		if (executable_directory.empty() || configured_bindir.empty() || configured_bindir.is_absolute())
+			return result;
+
+		for (auto component = configured_bindir.end(); component != configured_bindir.begin();)
+		{
+			--component;
+			if (*component == "." || component->empty())
+				continue;
+			if (*component == ".." || executable_directory.empty()
+				|| executable_directory.filename() != *component)
+				return result;
+			executable_directory = executable_directory.parent_path();
+		}
+		if (executable_directory.empty())
+			return result;
+
+		result.prefix = normalize_path_string(executable_directory.string());
+		const auto data_root = (executable_directory / AMIBERRY_INSTALL_DATADIR / "amiberry").lexically_normal();
+		if (my_existsdir(data_root.string().c_str()))
+			result.data = normalize_path_string(data_root.string());
+		const auto plugins_root = (executable_directory / AMIBERRY_INSTALL_LIBDIR / "amiberry").lexically_normal();
+		if (my_existsdir(plugins_root.string().c_str()))
+			result.plugins = normalize_path_string(plugins_root.string());
+#endif
+		return result;
+	}();
+	return roots;
+}
+
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+static std::string get_relocated_installed_data_root()
+{
+	return get_relocated_installed_resource_roots().data;
+}
+#endif
+
 static std::string get_portable_root_directory()
 {
 	const auto executable_directory = get_desktop_executable_directory();
@@ -7787,6 +8978,10 @@ static std::string get_portable_mode_marker_path()
 
 static bool is_portable_mode_enabled()
 {
+#if defined(__linux__) && !defined(LIBRETRO)
+	if (get_linux_installation_kind() == linux_installation_kind::appimage)
+		return false;
+#endif
 	const auto portable_marker = get_portable_mode_marker_path();
 	if (portable_marker.empty())
 		return false;
@@ -7802,6 +8997,14 @@ bool get_portable_mode()
 #if !defined(__MACH__) && !defined(__ANDROID__)
 bool can_toggle_portable_mode(std::string* reason_out)
 {
+#if defined(__linux__) && !defined(LIBRETRO)
+	if (get_linux_installation_kind() == linux_installation_kind::appimage)
+	{
+		if (reason_out != nullptr)
+			*reason_out = "AppImage mounts are read-only. Create a sibling '<AppImage>.home' directory before launch to keep Amiberry data beside the image.";
+		return false;
+	}
+#endif
 	const auto portable_root = get_portable_root_directory();
 	if (portable_root.empty())
 	{
@@ -7858,6 +9061,33 @@ bool set_portable_mode(bool enable)
 }
 #endif
 
+static std::string backup_path_for(const std::string& destination)
+{
+	const auto dot_pos = destination.find_last_of('.');
+	return (dot_pos != std::string::npos)
+		? destination.substr(0, dot_pos).append(".bak")
+		: destination + ".bak";
+}
+
+static bool backup_file(const std::string& destination)
+{
+	if (!file_exists(destination))
+		return false;
+
+	write_log("Backup requested, renaming destination file %s to .bak\n", destination.c_str());
+	const std::string new_filename = backup_path_for(destination);
+
+	if (file_exists(new_filename))
+		host_remove(new_filename.c_str());
+
+	if (host_rename(destination.c_str(), new_filename.c_str()) < 0)
+	{
+		write_log("%s\n", strerror(errno));
+		return false;
+	}
+	return true;
+}
+
 #ifndef LIBRETRO
 #ifdef AMIBERRY_HAS_CURL
 static size_t curl_write_file_cb(void* ptr, size_t size, size_t nmemb, void* userdata)
@@ -7874,6 +9104,35 @@ static void ensure_curl_initialized()
 	});
 }
 
+// Installs a finished download over destination. std::filesystem::rename replaces an existing file in one step
+// (also on Windows, where rename() refuses), so a good destination is never removed before its replacement is in
+// place. When that fails the temporary file, which only this download owns, is removed, a backup taken first is put
+// back, and the failure is reported instead of a success that left the old file behind.
+static bool install_downloaded_file(const std::string& tmp, const std::string& destination, const bool keep_backup)
+{
+	if (!file_exists(tmp))
+		return false;
+
+	const bool backed_up = keep_backup && backup_file(destination);
+
+	write_log("Renaming downloaded temporary file %s to final destination\n", tmp.c_str());
+	std::error_code error;
+	std::filesystem::rename(host_path(tmp), host_path(destination), error);
+	if (!error)
+		return true;
+
+	write_log("Could not install %s as %s: %s\n", tmp.c_str(), destination.c_str(), error.message().c_str());
+	host_remove(tmp.c_str());
+	if (backed_up)
+	{
+		std::error_code restore_error;
+		std::filesystem::rename(host_path(backup_path_for(destination)), host_path(destination), restore_error);
+		if (restore_error)
+			write_log("Could not restore %s: %s\n", destination.c_str(), restore_error.message().c_str());
+	}
+	return false;
+}
+
 bool download_file(const std::string& source, const std::string& destination, bool keep_backup)
 {
 	ensure_curl_initialized();
@@ -7884,14 +9143,14 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	if (file_exists(tmp))
 	{
 		write_log("Existing file found, removing %s\n", tmp.c_str());
-		if (std::remove(tmp.c_str()) < 0)
+		if (host_remove(tmp.c_str()) < 0)
 		{
 			write_log(strerror(errno));
 			write_log("\n");
 		}
 	}
 
-	FILE* fp = fopen(tmp.c_str(), "wb");
+	FILE* fp = host_fopen(tmp.c_str(), "wb");
 	if (!fp)
 	{
 		write_log("Failed to open temporary file for writing: %s\n", tmp.c_str());
@@ -7903,6 +9162,16 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	{
 		write_log("Failed to initialize libcurl\n");
 		fclose(fp);
+		return false;
+	}
+
+	std::string ca_error;
+	if (!apply_effective_ca_bundle_to_curl(curl, &ca_error))
+	{
+		write_log("Failed to configure libcurl CA bundle: %s\n", ca_error.c_str());
+		curl_easy_cleanup(curl);
+		fclose(fp);
+		host_remove(tmp.c_str());
 		return false;
 	}
 
@@ -7925,33 +9194,11 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	if (res != CURLE_OK)
 	{
 		write_log("Download failed: %s (URL: %s)\n", curl_easy_strerror(res), source.c_str());
-		std::remove(tmp.c_str());
+		host_remove(tmp.c_str());
 		return false;
 	}
 
-	if (file_exists(tmp))
-	{
-		if (file_exists(destination) && keep_backup)
-		{
-			write_log("Backup requested, renaming destination file %s to .bak\n", destination.c_str());
-			const std::string new_filename = destination.substr(0, destination.find_last_of('.')).append(".bak");
-			if (std::rename(destination.c_str(), new_filename.c_str()) < 0)
-			{
-				write_log(strerror(errno));
-				write_log("\n");
-			}
-		}
-
-		write_log("Renaming downloaded temporary file %s to final destination\n", tmp.c_str());
-		if (std::rename(tmp.c_str(), destination.c_str()) < 0)
-		{
-			write_log(strerror(errno));
-			write_log("\n");
-		}
-		return true;
-	}
-
-	return false;
+	return install_downloaded_file(tmp, destination, keep_backup);
 }
 
 struct download_progress_ctx
@@ -7987,14 +9234,14 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	if (file_exists(tmp))
 	{
 		write_log("Existing file found, removing %s\n", tmp.c_str());
-		if (std::remove(tmp.c_str()) < 0)
+		if (host_remove(tmp.c_str()) < 0)
 		{
 			write_log(strerror(errno));
 			write_log("\n");
 		}
 	}
 
-	FILE* fp = fopen(tmp.c_str(), "wb");
+	FILE* fp = host_fopen(tmp.c_str(), "wb");
 	if (!fp)
 	{
 		write_log("Failed to open temporary file for writing: %s\n", tmp.c_str());
@@ -8006,6 +9253,16 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	{
 		write_log("Failed to initialize libcurl\n");
 		fclose(fp);
+		return false;
+	}
+
+	std::string ca_error;
+	if (!apply_effective_ca_bundle_to_curl(curl, &ca_error))
+	{
+		write_log("Failed to configure libcurl CA bundle: %s\n", ca_error.c_str());
+		curl_easy_cleanup(curl);
+		fclose(fp);
+		host_remove(tmp.c_str());
 		return false;
 	}
 
@@ -8035,47 +9292,16 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	if (res != CURLE_OK)
 	{
 		write_log("Download failed: %s (URL: %s)\n", curl_easy_strerror(res), source.c_str());
-		std::remove(tmp.c_str());
+		host_remove(tmp.c_str());
 		return false;
 	}
 
-	if (file_exists(tmp))
-	{
-		if (file_exists(destination) && keep_backup)
-		{
-			write_log("Backup requested, renaming destination file %s to .bak\n", destination.c_str());
-			const std::string new_filename = destination.substr(0, destination.find_last_of('.')).append(".bak");
-			if (std::rename(destination.c_str(), new_filename.c_str()) < 0)
-			{
-				write_log(strerror(errno));
-				write_log("\n");
-			}
-		}
-
-		write_log("Renaming downloaded temporary file %s to final destination\n", tmp.c_str());
-		if (std::rename(tmp.c_str(), destination.c_str()) < 0)
-		{
-			write_log(strerror(errno));
-			write_log("\n");
-		}
-		return true;
-	}
-
-	return false;
+	return install_downloaded_file(tmp, destination, keep_backup);
 }
 
-void download_rtb(const std::string& filename)
-{
-	const std::string destination_filename = "save-data/Kickstarts/" + filename;
-	const std::string destination = get_whdbootpath().append(destination_filename);
-	if (!file_exists(destination))
-	{
-		write_log("Downloading %s ...\n", destination.c_str());
-		const std::string url = "https://github.com/BlitterStudio/amiberry/blob/master/whdboot/save-data/Kickstarts/" + filename + "?raw=true";
-		download_file(url, destination, false);
-	}
-}
-#else // !AMIBERRY_HAS_CURL (no curl on this platform, e.g. iOS)
+// The skick346 helpers below download the RTB files from Aminet.
+#else // !AMIBERRY_HAS_CURL (no curl on this platform)
+#ifndef AMIBERRY_IOS
 bool download_file(const std::string& source, const std::string& destination, bool keep_backup)
 {
 	write_log("download_file: not available (no CURL)\n");
@@ -8088,10 +9314,9 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	write_log("download_file: not available (no CURL)\n");
 	return false;
 }
-
-void download_rtb(const std::string& filename)
-{
-}
+#else
+// iOS implements download_file() with NSURLSession in amiberry_download_ios.mm.
+#endif // AMIBERRY_IOS
 #endif // AMIBERRY_HAS_CURL
 #else // LIBRETRO
 bool download_file(const std::string& source, const std::string& destination, bool keep_backup)
@@ -8107,9 +9332,7 @@ bool download_file(const std::string& source, const std::string& destination, bo
 	return false;
 }
 
-void download_rtb(const std::string& filename)
-{
-}
+// The skick346 helpers above download the RTB files from Aminet.
 #endif // LIBRETRO
 
 #ifdef AMIBERRY_IOS
@@ -8170,25 +9393,26 @@ std::string get_data_directory(bool portable_mode)
 	}
 
 	const auto env_data_dir = getenv("AMIBERRY_DATA_DIR");
-	const auto xdg_data_home = get_xdg_data_home();
 
-	// 1: Check if the $AMIBERRY_DATA_DIR ENV variable is set
 	if (env_data_dir != nullptr && my_existsdir(env_data_dir))
 	{
-		// If the ENV variable is set, and it actually contains our data dir, use it
 		write_log("Using data directory from AMIBERRY_DATA_DIR: %s\n", env_data_dir);
 		return {env_data_dir};
 	}
-	// 2: Check for system-wide installation (e.g. from a .deb package)
+
+	const auto& installed_roots = get_relocated_installed_resource_roots();
+	if (!installed_roots.data.empty() && directory_exists(installed_roots.data, "/data"))
+	{
+		write_log("Using relocated data directory from %s\n", installed_roots.data.c_str());
+		return join_path(installed_roots.data, "data");
+	}
+
 	if (directory_exists(AMIBERRY_DATADIR, "/data"))
 	{
-		// If the data directory exists in AMIBERRY_DATADIR, use it
-		// This would be the default location after an installation with the .deb package
 		write_log("Using data directory from " AMIBERRY_DATADIR "\n");
 		return std::string(AMIBERRY_DATADIR) + "/data/";
 	}
 
-	// 3: Check for a local executable-relative data dir (e.g. local build or unpacked tree)
 	const auto executable_directory = get_desktop_executable_directory();
 	if (directory_exists(executable_directory, "/data"))
 	{
@@ -8429,94 +9653,171 @@ std::string get_config_directory(bool portable_mode)
 #endif
 }
 
-// Plugins that Amiberry can use, usually in the form of shared libraries
-std::string get_plugins_directory(bool portable_mode)
+// Plugin locations are searched in get_plugin_search_paths(). The bundled or
+// system directory remains separate from the writable per-user directory.
+static std::string get_compiled_system_plugins_directory()
+{
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	return my_existsdir(AMIBERRY_LIBDIR) ? AMIBERRY_LIBDIR : std::string{};
+#else
+	return {};
+#endif
+}
+
+#if defined(LIBRETRO) || defined(AMIBERRY_IOS) || defined(AMIBERRY_MACOS) || defined(__ANDROID__) || defined(_WIN32)
+static std::string get_system_plugins_directory()
 {
 #ifdef LIBRETRO
-	// libretro: standard standalone fallbacks (executable dir / app bundle Resources)
-	// don't apply because the libretro core is loaded as a shared object inside the
-	// frontend's process — the executable is the frontend, not amiberry. Resolve only
-	// from explicit env vars; otherwise return empty (no plugins). Never fall back
-	// to a host home dir. See get_home_directory() for rationale.
-	{
-		const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
-		if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
-			return { env_plugins_dir };
-		const auto env_home_dir = getenv("AMIBERRY_HOME_DIR");
-		if (env_home_dir != nullptr && env_home_dir[0] != '\0')
-			return { std::string(env_home_dir) + "/plugins" };
-		return {};
-	}
-#endif
-#ifdef AMIBERRY_IOS
-	// iOS: no plugins directory (no dynamic loading on iOS)
+	const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
+	if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
+		return { env_plugins_dir };
+	const auto env_home_dir = getenv("AMIBERRY_HOME_DIR");
+	return env_home_dir != nullptr && env_home_dir[0] != '\0'
+		? join_path(env_home_dir, "plugins") : std::string{};
+#elif defined(AMIBERRY_IOS)
 	return {};
 #elif defined(AMIBERRY_MACOS)
 	char exepath[MAX_DPATH];
 	uint32_t size = sizeof exepath;
-	std::string directory;
-	if (_NSGetExecutablePath(exepath, &size) == 0)
-	{
-		size_t last_slash_idx = string(exepath).rfind('/');
-		if (std::string::npos != last_slash_idx)
-		{
-			directory = string(exepath).substr(0, last_slash_idx);
-		}
-		last_slash_idx = directory.rfind('/');
-		if (std::string::npos != last_slash_idx)
-		{
-
-			directory = directory.substr(0, last_slash_idx);
-		}
-	}
-	return directory + "/Resources/plugins/";
+	if (_NSGetExecutablePath(exepath, &size) != 0)
+		return {};
+	return join_path(std::filesystem::path(exepath).parent_path().parent_path().string(), "Resources/plugins");
 #elif defined(__ANDROID__)
 	return prefix_with_application_directory_path("plugins/");
 #elif defined(_WIN32)
-	{
-		return get_windows_executable_directory() + "\\plugins";
-	}
-#else
-	if (portable_mode)
-	{
-		write_log("Portable mode: Setting plugins directory to executable path\n");
-		return join_path(get_portable_root_directory(), "plugins");
-	}
+	return get_windows_executable_directory() + "\\plugins";
+#endif
+}
+#endif
 
-	// 1: Check if the $AMIBERRY_PLUGINS_DIR ENV variable is set
-	const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
-	if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
-	{
-		// If the ENV variable is set, use it
-		write_log("Using config directory from AMIBERRY_PLUGINS_DIR: %s\n", env_plugins_dir);
-		return { env_plugins_dir };
-	}
-	// 2: Check system-wide location (e.g. installed from a .deb package)
-	if (my_existsdir(AMIBERRY_LIBDIR))
-	{
-		write_log("Using plugins directory from " AMIBERRY_LIBDIR "\n");
-		return AMIBERRY_LIBDIR;
-	}
-	// 3: Check for $AMIBERRY_HOME_DIR/plugins
+static std::string get_legacy_system_plugins_directory()
+{
+	if (g_portable_mode)
+		return {};
+
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+	return AMIBERRY_LIBDIR;
+#else
+	return get_system_plugins_directory();
+#endif
+}
+
+bool user_plugins_supported()
+{
+#if defined(MACOS_APP_STORE) || defined(AMIBERRY_IOS) || defined(__ANDROID__)
+	return false;
+#else
+	return true;
+#endif
+}
+
+std::string get_user_plugins_path()
+{
+	if (!user_plugins_supported())
+		return {};
+
+	if (g_portable_mode)
+		return join_path(get_portable_root_directory(), "plugins");
+#ifdef LIBRETRO
+	return get_system_plugins_directory();
+#elif defined(AMIBERRY_MACOS)
+	const auto user_home_dir = getenv("HOME");
+	return user_home_dir != nullptr && user_home_dir[0] != '\0'
+		? normalize_path_string(std::string(user_home_dir) + "/Library/Application Support/Amiberry/Plugins") : std::string{};
+#elif defined(_WIN32)
+	const auto local_app_data = getenv("LOCALAPPDATA");
+	return local_app_data != nullptr && local_app_data[0] != '\0'
+		? normalize_path_string(std::string(local_app_data) + "\\Amiberry\\plugins") : std::string{};
+#else
 	const auto env_home_dir = getenv("AMIBERRY_HOME_DIR");
 	if (env_home_dir != nullptr && env_home_dir[0] != '\0')
-	{
-		write_log("Using plugins directory from AMIBERRY_HOME_DIR/plugins\n");
-		return { std::string(env_home_dir) + "/plugins" };
-	}
-	// 4: Check for ~/Amiberry/plugins.
-	// Keep path discovery side-effect free so migrated/customized setups do not recreate default folders.
-	const auto default_home_dir = get_default_posix_content_root();
-	if (!default_home_dir.empty())
-	{
-		write_log("Using plugins directory from $HOME/Amiberry/plugins\n");
-		return join_path(default_home_dir, "plugins");
-	}
-
-	// 5: Fallback to the executable directory when no other plugin path is available.
-	write_log("Using plugins directory from executable path\n");
-	return join_path(get_portable_root_directory(), "plugins");
+		return join_path(env_home_dir, "plugins");
+	return join_path(get_default_posix_content_root(), "plugins");
 #endif
+}
+
+static bool is_macos_bundled_plugins_path(const std::string& path)
+{
+#ifdef AMIBERRY_MACOS
+	const auto normalized = lowercase_path_for_compare(path);
+	const auto marker = std::string(".app/contents/resources/plugins");
+	return normalized.size() >= marker.size()
+		&& normalized.compare(normalized.size() - marker.size(), marker.size(), marker) == 0;
+#else
+	return false;
+#endif
+}
+
+static bool is_valid_plugins_override(const std::string& path)
+{
+	if (path.empty() || g_portable_mode
+		|| path_strings_match(path, get_user_plugins_path())
+		|| path_strings_match(path, get_relocated_installed_resource_roots().plugins)
+		|| is_macos_bundled_plugins_path(path))
+		return false;
+
+	const auto legacy_system_plugins = get_legacy_system_plugins_directory();
+#ifdef _WIN32
+	// Windows paths are case-insensitive; match only the old computed default,
+	// the executable's sibling plugins folder.
+	if (path_strings_match_case_insensitive(path, legacy_system_plugins))
+		return false;
+#else
+	if (path_strings_match(path, legacy_system_plugins))
+		return false;
+#endif
+	return true;
+}
+
+static void append_unique_path_candidate(std::vector<std::string>& candidates, const std::string& candidate);
+
+#ifdef _WIN32
+// "Install plugin…" moves a loaded DLL aside as <name>.dll.old (a DLL in use
+// cannot be replaced, but it can be renamed). Remove those at the next start,
+// when no process of ours holds them any more.
+static void remove_stale_user_plugin_backups()
+{
+	const auto user_plugins_path = get_user_plugins_path();
+	if (user_plugins_path.empty())
+		return;
+
+	std::error_code ec;
+	for (std::filesystem::directory_iterator it(user_plugins_path, ec), end; !ec && it != end; it.increment(ec))
+	{
+		const auto filename = it->path().filename().string();
+		if (filename.size() > 8 && filename.compare(filename.size() - 8, 8, ".dll.old") == 0)
+		{
+			std::error_code remove_ec;
+			std::filesystem::remove(it->path(), remove_ec);
+		}
+	}
+}
+#endif
+
+std::vector<std::string> get_plugin_search_paths()
+{
+	std::vector<std::string> candidates;
+	if (g_portable_mode) {
+		append_unique_path_candidate(candidates, get_user_plugins_path());
+	} else {
+		const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
+		if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
+			append_unique_path_candidate(candidates, env_plugins_dir);
+		append_unique_path_candidate(candidates, plugins_dir);
+		append_unique_path_candidate(candidates, get_user_plugins_path());
+#if !defined(LIBRETRO) && !defined(AMIBERRY_IOS) && !defined(AMIBERRY_MACOS) && !defined(__ANDROID__) && !defined(_WIN32)
+		append_unique_path_candidate(candidates, get_relocated_installed_resource_roots().plugins);
+		append_unique_path_candidate(candidates, get_compiled_system_plugins_directory());
+#else
+		append_unique_path_candidate(candidates, get_system_plugins_directory());
+#endif
+#if (defined(__linux__) || defined(__FreeBSD__)) && !defined(LIBRETRO)
+		append_unique_path_candidate(candidates, join_path(get_portable_root_directory(), "plugins"));
+#endif
+	}
+	for (auto& candidate : candidates)
+		candidate = fix_trailing(candidate);
+	return candidates;
 }
 
 static void append_unique_path_candidate(std::vector<std::string>& candidates, const std::string& candidate)
@@ -9641,7 +10942,7 @@ static path_case_migration_result migrate_path_case_if_needed(const std::string&
 			return path_case_migration_result::failed;
 		}
 
-		auto entry_name = it->path().filename().string();
+		auto entry_name = host_path_utf8(it->path().filename());
 		if (entry_name == basename)
 		{
 			exact_match_exists = true;
@@ -9847,7 +11148,7 @@ static bool path_entry_exists_with_exact_name(const std::string& path)
 	{
 		if (ec)
 			return false;
-		if (iterator->path().filename().string() == filename)
+		if (host_path_utf8(iterator->path().filename()) == filename)
 			return true;
 	}
 
@@ -10112,25 +11413,77 @@ static bool rewrite_legacy_configuration_path_text(std::string& text,
 	return changed;
 }
 
+static constexpr const char* configuration_migration_backup_tag = ".amiberry-case-migration";
+
 static std::filesystem::path get_unique_configuration_migration_backup_path(
 	const std::filesystem::path& config_file)
 {
 	auto candidate = config_file;
-	candidate += ".amiberry-case-migration.bak";
+	candidate += std::string(configuration_migration_backup_tag) + ".bak";
 	if (!path_exists_quietly(candidate.string()))
 		return candidate;
 
 	for (int suffix = 1; suffix < 1000; ++suffix)
 	{
 		candidate = config_file;
-		candidate += ".amiberry-case-migration-" + std::to_string(suffix) + ".bak";
+		candidate += std::string(configuration_migration_backup_tag) + "-" + std::to_string(suffix) + ".bak";
 		if (!path_exists_quietly(candidate.string()))
 			return candidate;
 	}
 
 	candidate = config_file;
-	candidate += ".amiberry-case-migration-last.bak";
+	candidate += std::string(configuration_migration_backup_tag) + "-last.bak";
 	return candidate;
+}
+
+// Matches the names get_unique_configuration_migration_backup_path() produces for config_name.
+static bool is_configuration_migration_backup_of(const std::string& file_name, const std::string& config_name)
+{
+	const auto prefix = config_name + configuration_migration_backup_tag;
+	const std::string extension = ".bak";
+	if (file_name.size() < prefix.size() + extension.size()
+		|| file_name.compare(0, prefix.size(), prefix) != 0
+		|| file_name.compare(file_name.size() - extension.size(), extension.size(), extension) != 0)
+		return false;
+
+	const auto suffix = file_name.substr(prefix.size(), file_name.size() - prefix.size() - extension.size());
+	if (suffix.empty() || suffix == "-last")
+		return true;
+	// Numbered backups run from 1 to 999 without leading zeros.
+	if (suffix.size() < 2 || suffix.size() > 4 || suffix[0] != '-' || suffix[1] == '0')
+		return false;
+	return std::all_of(suffix.begin() + 1, suffix.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+bool remove_configuration_file(const std::string& config_file)
+{
+	const std::filesystem::path config_path_entry(config_file);
+	std::error_code ec;
+	if (!std::filesystem::remove(config_path_entry, ec) || ec)
+	{
+		write_log("Failed to delete configuration %s: %s\n", config_file.c_str(),
+			ec ? ec.message().c_str() : "file not found");
+		return false;
+	}
+
+	// The path migration backups belong to this configuration; nothing else reads them.
+	const auto config_name = config_path_entry.filename().string();
+	std::filesystem::directory_iterator iterator(config_path_entry.parent_path(), ec);
+	if (ec)
+		return true;
+	for (const std::filesystem::directory_iterator end; iterator != end; iterator.increment(ec))
+	{
+		if (ec)
+			break;
+		std::error_code entry_ec;
+		if (!iterator->is_regular_file(entry_ec) || entry_ec
+			|| !is_configuration_migration_backup_of(iterator->path().filename().string(), config_name))
+			continue;
+		if (!std::filesystem::remove(iterator->path(), entry_ec) || entry_ec)
+			write_log("Failed to delete configuration backup %s: %s\n", iterator->path().string().c_str(),
+				entry_ec ? entry_ec.message().c_str() : "file not found");
+	}
+	return true;
 }
 
 static bool backup_configuration_file_for_path_migration(const std::filesystem::path& config_file)
@@ -10198,7 +11551,7 @@ static configuration_file_path_migration_result migrate_legacy_configuration_fil
 	if (!backup_configuration_file_for_path_migration(config_file))
 		return configuration_file_path_migration_result::failed;
 
-	if (!my_save_file_atomic(config_file.string().c_str(), migrated_text.data(), migrated_text.size()))
+	if (!my_save_file_atomic(host_path_utf8(config_file).c_str(), migrated_text.data(), migrated_text.size()))
 	{
 		write_log("Configuration file path migration: failed to save %s\n",
 			config_file.string().c_str());
@@ -10216,12 +11569,15 @@ static int migrate_legacy_configuration_file_paths_in_directory(const std::strin
 	failed = false;
 	if (configuration_directory.empty() || path_pairs.empty())
 		return 0;
-	if (!my_existsdir(configuration_directory.c_str()))
+	// A host directory: UTF-8 from the native UI or ANSI from older
+	// configurations, read by host_path() either way.
+	const auto directory = host_path(configuration_directory);
+	std::error_code ec;
+	if (!std::filesystem::is_directory(directory, ec))
 		return 0;
 
 	int migrated_files = 0;
-	std::error_code ec;
-	std::filesystem::recursive_directory_iterator iterator(configuration_directory,
+	std::filesystem::recursive_directory_iterator iterator(directory,
 		std::filesystem::directory_options::none, ec);
 	if (ec)
 	{
@@ -10525,6 +11881,28 @@ static int run_path_migration_selftest_cli()
 		&& !std::filesystem::exists(case_variant_source);
 	settings_dir = original_settings_dir;
 
+	// Deleting a configuration removes its own migration backups and no other file.
+	const bool backup_created = std::filesystem::exists(backup_file);
+	const auto numbered_backup = default_config.string() + ".amiberry-case-migration-1.bak";
+	const auto last_backup = default_config.string() + ".amiberry-case-migration-last.bak";
+	const auto other_config_backup = (std::filesystem::path(paths.config_path)
+		/ "default-2.uae.amiberry-case-migration.bak").string();
+	const auto padded_lookalike = default_config.string() + ".amiberry-case-migration-01.bak";
+	const bool delete_fixture_written = write_selftest_text_file(numbered_backup, "backup\n")
+		&& write_selftest_text_file(last_backup, "backup\n")
+		&& write_selftest_text_file(other_config_backup, "backup\n")
+		&& write_selftest_text_file(padded_lookalike, "backup\n");
+	const bool delete_test_ok = backup_created
+		&& delete_fixture_written
+		&& remove_configuration_file(default_config.string())
+		&& !std::filesystem::exists(default_config)
+		&& !std::filesystem::exists(backup_file)
+		&& !std::filesystem::exists(numbered_backup)
+		&& !std::filesystem::exists(last_backup)
+		&& std::filesystem::exists(other_config_backup)
+		&& std::filesystem::exists(padded_lookalike)
+		&& std::filesystem::exists(protected_config);
+
 	const bool ok = read_ok
 		&& !path_rewrite_failed
 		&& migrated == 1
@@ -10535,23 +11913,23 @@ static int run_path_migration_selftest_cli()
 		&& migrated_default.find(legacy_rom + "/kick.rom") == std::string::npos
 		&& migrated_default.find(legacy_harddrives + "/system.hdf") == std::string::npos
 		&& migrated_protected == protected_text
-		&& std::filesystem::exists(backup_file)
 		&& case_only_test_ok
 		&& verification_rollback_test_ok
 		&& settings_test_ok
 		&& rename_test_ok
 		&& split_test_ok
-		&& case_variant_test_ok;
+		&& case_variant_test_ok
+		&& delete_test_ok;
 
 	if (!ok)
 	{
 		fprintf(stderr, "path migration selftest: failed\n");
-		fprintf(stderr, "migrated=%d read_ok=%d path_failed=%d case_only_ok=%d rollback_ok=%d settings_ok=%d rename_ok=%d split_ok=%d case_ok=%d root=%s\n",
+		fprintf(stderr, "migrated=%d read_ok=%d path_failed=%d case_only_ok=%d rollback_ok=%d settings_ok=%d rename_ok=%d split_ok=%d case_ok=%d delete_ok=%d root=%s\n",
 			migrated, read_ok ? 1 : 0, path_rewrite_failed ? 1 : 0,
 			case_only_test_ok ? 1 : 0,
 			verification_rollback_test_ok ? 1 : 0,
 			settings_test_ok ? 1 : 0, rename_test_ok ? 1 : 0, split_test_ok ? 1 : 0,
-			case_variant_test_ok ? 1 : 0,
+			case_variant_test_ok ? 1 : 0, delete_test_ok ? 1 : 0,
 			root.string().c_str());
 		return 1;
 	}
@@ -10838,7 +12216,13 @@ bool consume_startup_migration_notice(std::string& title, std::string& message)
 			message += "Conflicting legacy files were preserved under:\n\n  " + backup_root
 				+ "\n\n(or left in their original location if they could not be archived).\n\n";
 		}
-		message += "Files that could not be moved were left in place.\nPlease check the log file for details.";
+		message += "Files that could not be moved were left in place.\n";
+		if (!amiberry_options.write_logfile)
+			message += "Enable logging under Paths and restart Amiberry to record the details.";
+		else if (debugfile == nullptr)
+			message += "The details could not be recorded because the log file could not be opened:\n\n  " + logfile_path;
+		else
+			message += "Details are in the log file:\n\n  " + logfile_path;
 		return true;
 	}
 
@@ -10942,11 +12326,34 @@ static std::vector<std::string> get_seed_source_candidates(const std::string& su
 	if (!app_resources_dir.empty())
 		append_unique_path_candidate(candidates, join_path(app_resources_dir, subdirectory));
 #else
+#if !defined(LIBRETRO) && !defined(__ANDROID__) && !defined(_WIN32)
+	const auto append_existing_seed_directory = [&](const std::string& root)
+	{
+		const auto candidate = join_path(root, subdirectory);
+		if (!candidate.empty() && my_existsdir(candidate.c_str()))
+			append_unique_path_candidate(candidates, candidate);
+	};
+	// Executable-relative resources belong to the binary being run: a portable
+	// copy or a development build. A relocated installation root outranks them
+	// only outside portable mode, and the compiled data directory follows both.
+	if (g_portable_mode)
+		append_existing_seed_directory(get_desktop_executable_directory());
+	append_existing_seed_directory(get_relocated_installed_resource_roots().data);
+	append_existing_seed_directory(get_desktop_executable_directory());
+	append_existing_seed_directory(AMIBERRY_DATADIR);
+	append_existing_seed_directory("/usr/share/amiberry");
+	if (include_usr_local_share)
+		append_existing_seed_directory("/usr/local/share/amiberry");
+#else
+	const auto executable_directory = get_desktop_executable_directory();
+	if (!executable_directory.empty())
+		append_unique_path_candidate(candidates, join_path(executable_directory, subdirectory));
 	append_unique_path_candidate(candidates, join_path(AMIBERRY_DATADIR, subdirectory));
 #if !defined(_WIN32)
 	append_unique_path_candidate(candidates, join_path("/usr/share/amiberry", subdirectory));
 	if (include_usr_local_share)
 		append_unique_path_candidate(candidates, join_path("/usr/local/share/amiberry", subdirectory));
+#endif
 #endif
 #endif
 	return candidates;
@@ -10963,7 +12370,7 @@ static bool copy_missing_directory_contents_if_exists(const std::string& source_
 
 	try
 	{
-		std::filesystem::copy(source_dir, destination_dir,
+		std::filesystem::copy(host_path(source_dir), host_path(destination_dir),
 			std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing);
 		return true;
 	}
@@ -11074,18 +12481,613 @@ static bool report_whdboot_download_progress(
 	return progress_cb(progress);
 }
 
+// WHDLoad (Bert Jahn, whdload.de), the Kickstart RTB files (Aminet,
+// skick346), JST (Aminet) and the optional Amiga libraries (see below) are
+// not bundled with Amiberry: their licences do not allow commercial
+// redistribution. They are fetched on demand from their authors'
+// distribution points instead.
+static const char* const whdload_usr_url = "https://whdload.de/whdload/WHDLoad_usr.lha";
+static const char* const skick346_url = "https://aminet.net/util/boot/skick346.lha";
+// skick346.lha is frozen on Aminet: its SHA-256 is pinned so a corrupted
+// or impersonated download is refused before anything is decoded from it.
+static const char* const skick346_sha256 =
+	"02b4d01852d12ab391c6469064f917221a0f7319fd0b3ba6c359403ec1d59f96";
+static const char* const jst_url = "https://aminet.net/game/patch/jst.lha";
+
+bool whdboot_can_download()
+{
+#if defined(LIBRETRO)
+	return false;
+#elif defined(AMIBERRY_HAS_CURL) || defined(AMIBERRY_IOS)
+	return true;
+#else
+	return false;
+#endif
+}
+
+// The kickstart relocation files skick346.lha provides (the non-beta ones
+// the booter links). kick31034.A1000.RTB is not in skick346 and stays
+// bundled; kick33192.A500.RTB is byte-identical to skick346's
+// kick33180.A500.RTB and is created as its copy when missing.
+const std::vector<std::string>& whdboot_skick_rtb_files()
+{
+	static const std::vector<std::string> files = {
+		"kick33180.A500.RTB",
+		"kick34005.A500.RTB",
+		"kick37175.A500.RTB",
+		"kick36143.A3000.RTB",
+		"kick39106.A1200.RTB",
+		"kick40063.A600.RTB",
+		"kick40068.A1200.RTB",
+		"kick40068.A4000.RTB"
+	};
+	return files;
+}
+
+static std::string whdboot_rtb_destination(const std::string& filename)
+{
+	return join_path(whdboot_path, join_path("save-data/Kickstarts", filename));
+}
+
+static bool whdboot_skick_rtbs_missing()
+{
+	for (const auto& filename : whdboot_skick_rtb_files())
+	{
+		if (!file_exists(whdboot_rtb_destination(filename)))
+			return true;
+	}
+	return false;
+}
+
+// The optional Amiga libraries the booter mounts for WHDLoad and slaves:
+// the XPK stack (Dirk Stöcker), MMULib's 68040.library (Thomas Richter),
+// explode.library (Struijk/Brouwer) and OctaMED's medplayer.library
+// (Teijo Kinnunen, RBF Software). Their licences do not allow bundling
+// them with Amiberry either, so like WHDLoad and the RTB files they are
+// downloaded only on request from their authors' Aminet packages. The
+// frozen ones are pinned by SHA-256 so a corrupted or impersonated
+// download is refused before anything is decoded from it (MMULib, which
+// is updated in place, is not; see below). They install into the WHDBoot folder's
+// writable Libs drawer, which set_booter_drives mounts for the boot.
+static const char* const xpk_user_url = "https://aminet.net/util/pack/xpk_User.lha";
+static const char* const xpk_user_sha256 =
+	"ec48c2820e45e64e1c1970592f06dc32c64546a6c7d545b39c79b469012879f3";
+// MMULib.lha is re-uploaded in place on Aminet with every release, so a
+// pin would reject each new version: it is not pinned, and relies on the
+// HTTPS download plus each member's size and CRC check.
+static const char* const mmulib_url = "https://aminet.net/util/libs/MMULib.lha";
+static const char* const explode_url = "https://aminet.net/util/libs/explode-7.lha";
+static const char* const explode_sha256 =
+	"140f6b4190c5bf739a587aa3dc14a72b135e35ac22394cc0901001a4647f853a";
+// medplayer.library ships inside the OctaMED V5 tutorial disk 4, the
+// official Aminet copy of Teijo Kinnunen's player library.
+static const char* const medplayer_url = "https://aminet.net/docs/help/OctV5_Tut4.lha";
+static const char* const medplayer_sha256 =
+	"d6ec0581195b76a3c6b9955e921d431451cd56bbeb74f190c7ce2d7614fff89a";
+
+// The XPK client libraries xpk_User.lha carries in its Libs/compressors
+// drawer; xpkmaster.library looks for them in LIBS:Compressors.
+const std::vector<std::string>& whdboot_xpk_compressor_files()
+{
+	static const std::vector<std::string> files = {
+		"xpkCBR0.library", "xpkDLTA.library", "xpkDUKE.library", "xpkFAST.library",
+		"xpkFRLE.library", "xpkHFMN.library", "xpkHUFF.library", "xpkIMPL.library",
+		"xpkMASH.library", "xpkNONE.library", "xpkNUKE.library", "xpkRAKE.library",
+		"xpkRLEN.library", "xpkSHRI.library", "xpkSMPL.library", "xpkSQSH.library"
+	};
+	return files;
+}
+
+static std::string whdboot_library_destination(const std::string& root, const std::string& filename)
+{
+	return join_path(root, join_path("Libs", filename));
+}
+
+static bool whdboot_xpk_libraries_missing(const std::string& root)
+{
+	if (!file_exists(whdboot_library_destination(root, "xpkmaster.library")))
+		return true;
+	for (const auto& filename : whdboot_xpk_compressor_files())
+	{
+		if (!file_exists(whdboot_library_destination(root, join_path("Compressors", filename))))
+			return true;
+	}
+	return false;
+}
+
+// MMULib's 68040.library needs its mmu.library and 680x0.library.
+static const char* const whdboot_mmulib_files[] = {
+	"68040.library", "mmu.library", "680x0.library"
+};
+
+static bool whdboot_mmu_library_missing(const std::string& root)
+{
+	for (const auto* filename : whdboot_mmulib_files)
+	{
+		if (!file_exists(whdboot_library_destination(root, filename)))
+			return true;
+	}
+	return false;
+}
+
+static bool whdboot_explode_library_missing(const std::string& root)
+{
+	return !file_exists(whdboot_library_destination(root, "explode.library"));
+}
+
+static bool whdboot_medplayer_library_missing(const std::string& root)
+{
+	return !file_exists(whdboot_library_destination(root, "medplayer.library"));
+}
+
+// True once every optional Amiga library the download installs is
+// present. Each of them is optional for a given game, so the status only
+// reports that none is missing.
+bool whdboot_optional_libraries_installed(const std::string& root)
+{
+	return !whdboot_xpk_libraries_missing(root) && !whdboot_mmu_library_missing(root)
+		&& !whdboot_explode_library_missing(root) && !whdboot_medplayer_library_missing(root);
+}
+
+bool whdboot_optional_libraries_installed()
+{
+	return whdboot_optional_libraries_installed(whdboot_path);
+}
+
+// Whether a machine runs that the download's archive handling must not
+// touch: extracting uses the zfile/LhA global state a running emulation
+// reads its mounted archives through. Paused machines (the pause key, the
+// built-in GUI or the native settings window hold them) are fine.
+bool whdboot_emulation_blocks_downloads()
+{
+	if (!emulating)
+		return false;
+	if (pause_emulation != 0)
+		return false;
+#ifdef AMIBERRY_NATIVE_HOST
+	if (native_host_settings_open())
+		return false;
+#endif
+#ifndef LIBRETRO
+	// The built-in GUI (amiberry_gui.cpp, not part of the libretro core).
+	extern int gui_active;
+	if (gui_active > 0)
+		return false;
+#endif
+	return true;
+}
+
+// The LhA CRC (the one the archive headers store), computed over the
+// member's original bytes. Runs incrementally over chunks.
+static unsigned int whdboot_lha_crc16(const unsigned char* data, size_t length, unsigned int crc)
+{
+	for (size_t i = 0; i < length; i++)
+	{
+		crc ^= data[i];
+		for (int bit = 0; bit < 8; bit++)
+			crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+	}
+	return crc & 0xffff;
+}
+
+struct whdboot_lha_member
+{
+	bool found = false;
+	bool has_crc = false;
+	unsigned int crc = 0;
+	long long size = -1;
+};
+
+static void whdboot_normalize_archive_name(std::string& name)
+{
+	for (char& c : name)
+		if (c == '\\' || c == '\xff' || c == static_cast<char>(0xff))
+			c = '/';
+}
+
+// Walks the LhA headers of a local archive directly - level 0 (the Aminet
+// archives) and level 1 (whdload.de's WHDLoad_usr.lha), the layout
+// src/archivers/lha/header.cpp parses - and returns the member's stored
+// CRC and original size, so an extraction can be verified before it
+// replaces anything. Anything else (other header levels, unreadable
+// headers, a missing member) reports "not found", which makes the
+// extraction refuse: fail safe.
+static whdboot_lha_member whdboot_lha_lookup_member(const std::string& archive_path, const std::string& member_name)
+{
+	whdboot_lha_member info;
+	FILE* fp = host_fopen(archive_path.c_str(), "rb");
+	if (!fp)
+		return info;
+
+	std::string wanted = member_name;
+	whdboot_normalize_archive_name(wanted);
+	unsigned char base[1024];
+
+	for (;;)
+	{
+		const int header_size = fgetc(fp);
+		if (header_size == EOF || header_size == 0)
+			break; // end of the archive
+		if (header_size < 23 || header_size > 1000)
+			break; // implausible: refuse
+		if (fread(base, 1, header_size - 1, fp) != static_cast<size_t>(header_size - 1))
+			break;
+		// base[i] is the byte at file offset i + 1 (I_METHOD 2,
+		// I_PACKED_SIZE 7, I_ORIGINAL_SIZE 11, I_HEADER_LEVEL 20,
+		// I_NAME_LENGTH 21, I_NAME 22; the CRC follows the name).
+		const int level = base[19];
+		if (level != 0 && level != 1)
+			break;
+		unsigned int packed_size = base[6] | (base[7] << 8) | (base[8] << 16) | (static_cast<unsigned int>(base[9]) << 24);
+		const auto original_size = static_cast<long long>(base[10] | (base[11] << 8)
+			| (base[12] << 16) | (static_cast<long long>(base[13]) << 24));
+		const size_t name_length = base[20];
+		if (name_length == 0 || 22 + name_length > static_cast<size_t>(header_size))
+			break;
+		std::string name(reinterpret_cast<char*>(base) + 21, name_length);
+		whdboot_normalize_archive_name(name);
+
+		bool has_crc = false;
+		unsigned int crc = 0;
+		if (level == 0)
+		{
+			// The two bytes behind the base are the CRC of a classic
+			// level-0 header (an OS-extended one carries it inside).
+			const long extend = header_size - static_cast<long>(name_length) - 22;
+			if (extend >= 0)
+			{
+				has_crc = true;
+				unsigned char trailing[2];
+				if (fread(trailing, 1, 2, fp) != 2)
+					break;
+				if (header_size >= 24 + static_cast<int>(name_length))
+					crc = base[21 + name_length] | (base[22 + name_length] << 8);
+				else
+					crc = trailing[0] | (trailing[1] << 8);
+			}
+			else
+			{
+				unsigned char trailing[2];
+				if (fread(trailing, 1, 2, fp) != 2)
+					break;
+			}
+		}
+		else
+		{
+			// A level-1 header is followed by extension headers - each a
+			// 2-byte size N (counting itself), then N - 2 content bytes
+			// with a type first - until a zero size. Types 1 and 2 carry
+			// the file name and its directory; the packed size counts the
+			// extension bytes, so the payload is what remains.
+			unsigned int extension_bytes = 0;
+			std::string directory;
+			for (;;)
+			{
+				unsigned char size_bytes[2];
+				if (fread(size_bytes, 1, 2, fp) != 2)
+				{
+					fclose(fp);
+					return info;
+				}
+				const unsigned int size = size_bytes[0] | (size_bytes[1] << 8);
+				if (size == 0)
+					break;
+				unsigned char content[256];
+				// Extensions carry a type byte and at most a name or a
+				// directory: anything longer than the buffer is refused, not
+				// read (the size is archive-controlled and 16-bit).
+				if (size < 3 || size > 2 + static_cast<unsigned int>(sizeof content)
+					|| extension_bytes + size > packed_size)
+				{
+					fclose(fp);
+					return info;
+				}
+				if (fread(content, 1, size - 2, fp) != size - 2)
+				{
+					fclose(fp);
+					return info;
+				}
+				extension_bytes += size;
+				if (content[0] == 0x01) // the file name
+					name.assign(reinterpret_cast<char*>(content) + 1, size - 3);
+				else if (content[0] == 0x02) // its directory
+					directory.assign(reinterpret_cast<char*>(content) + 1, size - 3);
+			}
+			if (!directory.empty())
+			{
+				// The directory extension separates and terminates its
+				// path with 0xff; normalized, it already ends in '/'.
+				whdboot_normalize_archive_name(directory);
+				if (directory.back() != '/')
+					directory += '/';
+				name = directory + name;
+			}
+			whdboot_normalize_archive_name(name);
+			packed_size -= extension_bytes;
+			if (header_size >= 24 + static_cast<int>(name_length))
+			{
+				has_crc = true;
+				crc = base[21 + name_length] | (base[22 + name_length] << 8);
+			}
+		}
+
+		if (strcasecmp(name.c_str(), wanted.c_str()) == 0)
+		{
+			info.found = true;
+			info.has_crc = has_crc;
+			info.crc = crc;
+			info.size = original_size;
+			break;
+		}
+
+		if (fseek(fp, static_cast<long>(packed_size), SEEK_CUR) != 0)
+			break;
+	}
+
+	fclose(fp);
+	return info;
+}
+
+static std::string whdboot_file_sha256(const std::string& path)
+{
+	CSha256 sha;
+	Sha256_Init(&sha);
+
+	FILE* fp = host_fopen(path.c_str(), "rb");
+	if (!fp)
+		return {};
+	unsigned char buffer[65536];
+	size_t bytes;
+	while ((bytes = fread(buffer, 1, sizeof buffer, fp)) > 0)
+		Sha256_Update(&sha, buffer, static_cast<unsigned>(bytes));
+	const bool read_error = ferror(fp) != 0;
+	fclose(fp);
+	if (read_error)
+		return {};
+
+	unsigned char digest[SHA256_DIGEST_SIZE];
+	Sha256_Final(&sha, digest);
+	char hex[SHA256_DIGEST_SIZE * 2 + 1];
+	for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++)
+		snprintf(hex + i * 2, 3, "%02x", digest[i]);
+	return hex;
+}
+
+// zfile builds its archive paths with the host separator: a '/' inside a
+// member name would not be found on Windows.
+static std::string whdboot_archive_member_path(const std::string& archive_path, const std::string& member_name)
+{
+	std::string member = member_name;
+	for (char& c : member)
+		if (c == '/')
+			c = FSDB_DIR_SEPARATOR;
+	return archive_path + FSDB_DIR_SEPARATOR_S + member;
+}
+
+// Extracts one member of an archive to destination_path, verifying what
+// was extracted (size and the header's CRC) before anything is replaced:
+// the member goes to a temporary file first and is renamed over the
+// destination only after it proved intact, so a corrupt download never
+// destroys the previous copy. allow_replace = false (the RTB and JST
+// rule: fetch once, never overwrite) extracts only when the destination
+// does not exist.
+static bool whdboot_extract_archive_member_to_file(const std::string& archive_path, const std::string& member_name,
+	const std::string& destination_path, const bool allow_replace)
+{
+	if (!allow_replace && file_exists(destination_path))
+		return true;
+
+	const whdboot_lha_member member = whdboot_lha_lookup_member(archive_path, member_name);
+	if (!member.found || member.size <= 0)
+	{
+		write_log("WHDBooter - could not verify %s in %s (member missing or unsupported header); keeping any previous copy\n",
+			member_name.c_str(), archive_path.c_str());
+		return false;
+	}
+
+	bool ok = false;
+	{
+	std::lock_guard<std::recursive_mutex> extraction_guard(zarchive_access_mutex);
+	struct zvolume* zv = zfile_fopen_archive(archive_path.c_str());
+	if (!zv)
+	{
+		write_log("WHDBooter - could not open archive %s\n", archive_path.c_str());
+		return false;
+	}
+
+	const std::string member_path = whdboot_archive_member_path(archive_path, member_name);
+	struct zfile* zf = zfile_open_archive(member_path.c_str(), 0);
+	ok = zf != nullptr;
+	if (ok)
+	{
+		const std::string temp_path = destination_path + ".new";
+		FILE* fp = host_fopen(temp_path.c_str(), "wb");
+		ok = fp != nullptr;
+		if (ok)
+		{
+			unsigned char buffer[65536];
+			size_t bytes;
+			while ((bytes = zfile_fread(buffer, 1, sizeof buffer, zf)) > 0)
+			{
+				if (fwrite(buffer, 1, bytes, fp) != bytes)
+				{
+					ok = false;
+					break;
+				}
+			}
+			fclose(fp);
+
+			if (ok)
+			{
+				// Verify the extracted bytes against the archive header.
+				FILE* verify = host_fopen(temp_path.c_str(), "rb");
+				ok = verify != nullptr;
+				if (ok)
+				{
+					unsigned int crc = 0;
+					long long total = 0;
+					while ((bytes = fread(buffer, 1, sizeof buffer, verify)) > 0)
+					{
+						crc = whdboot_lha_crc16(buffer, bytes, crc);
+						total += static_cast<long long>(bytes);
+					}
+					fclose(verify);
+					if (total != member.size)
+					{
+						write_log("WHDBooter - %s in %s is %lld bytes, expected %lld; keeping any previous copy\n",
+							member_name.c_str(), archive_path.c_str(), total, member.size);
+						ok = false;
+					}
+					else if (member.has_crc && crc != member.crc)
+					{
+						write_log("WHDBooter - CRC mismatch for %s in %s; keeping any previous copy\n",
+							member_name.c_str(), archive_path.c_str());
+						ok = false;
+					}
+				}
+			}
+
+			if (ok)
+			{
+				std::error_code rename_error;
+				// std::filesystem::rename replaces an existing destination
+				// on Windows as well.
+				std::filesystem::rename(host_path(temp_path), host_path(destination_path), rename_error);
+				if (rename_error)
+				{
+					write_log("WHDBooter - could not install %s: %s\n",
+						destination_path.c_str(), rename_error.message().c_str());
+					ok = false; // the previous copy stays in place
+				}
+			}
+			if (!ok)
+				host_remove(temp_path.c_str());
+		}
+	}
+	zfile_fclose_archive(zv); // closes the member's zfile as well
+	} // the archive lock ends with the volume
+
+	if (ok)
+		write_log("WHDBooter - installed %s from %s\n", destination_path.c_str(), archive_path.c_str());
+	return ok;
+}
+
+// Downloads one of the on-demand archives to archive_path (a scratch name
+// inside the WHDBoot folder; removed by the caller after extraction).
+static bool whdboot_fetch_archive(const int step, const int total_steps, const std::string& label,
+	const char* const url, const std::string& archive_path,
+	const std::function<bool(const whdboot_download_progress&)>& progress_cb,
+	std::atomic<bool>* cancel_flag)
+{
+	if (report_whdboot_download_progress(progress_cb, cancel_flag, step, total_steps, label, 0, 0))
+		return false;
+	write_log("Downloading %s ...\n", archive_path.c_str());
+	return download_file(url, archive_path, false,
+		[&](const int64_t dlnow, const int64_t dltotal)
+		{
+			return report_whdboot_download_progress(progress_cb, cancel_flag, step, total_steps,
+				label, dlnow, dltotal);
+		},
+		cancel_flag);
+}
+
+// Downloads one of the optional-library archives and installs the members
+// listed, each CRC-verified and moved into place atomically. A frozen
+// archive is SHA-256-checked first, like skick346.lha (sha256 == nullptr
+// for one that is updated in place). Destinations that already exist are
+// left alone, so a library the user placed in the WHDBoot folder is never
+// overwritten; the caller only fetches while one of them is missing.
+static bool whdboot_install_pinned_library_archive(
+	const int step, const int total_steps, const std::string& label,
+	const char* const url, const char* const sha256, const char* const archive_name,
+	const std::vector<std::pair<std::string, std::string>>& members,
+	const std::function<bool(const whdboot_download_progress&)>& progress_cb,
+	std::atomic<bool>* cancel_flag)
+{
+	const auto archive = join_path(whdboot_path, archive_name);
+	bool ok = false;
+	if (whdboot_fetch_archive(step, total_steps, label, url, archive, progress_cb, cancel_flag))
+	{
+		const auto digest = sha256 ? whdboot_file_sha256(archive) : std::string();
+		if (sha256 && digest != sha256)
+		{
+			write_log("WHDBooter - %s is not the pinned %s (SHA-256 %s, expected %s); not extracting\n",
+				archive.c_str(), archive_name, digest.c_str(), sha256);
+		}
+		else
+		{
+			ok = true;
+			for (const auto& [member, destination] : members)
+			{
+				if (file_exists(destination))
+					continue;
+				if (!whdboot_extract_archive_member_to_file(archive, member, destination, false))
+					ok = false;
+			}
+		}
+	}
+	host_remove(archive.c_str());
+	return ok;
+}
+
+// One download at a time: the zfile/LhA state the extraction uses is not
+// re-entrant, and two runs would share the same scratch files.
+static std::atomic<bool> whdboot_download_active{ false };
+
 whdboot_download_result download_whdboot_assets(
 	const std::function<bool(const whdboot_download_progress&)>& progress_cb,
 	std::atomic<bool>* cancel_flag)
 {
-	constexpr int total_steps = 10;
 	whdboot_download_result result;
-	bool any_success = false;
-	bool any_failure = false;
+	if (!whdboot_can_download())
+	{
+		write_log("WHDBooter - downloads are not available in this build\n");
+		result.outcome = whdboot_download_outcome::failed;
+		return result;
+	}
+
+	bool expected = false;
+	if (!whdboot_download_active.compare_exchange_strong(expected, true))
+	{
+		write_log("WHDBooter - a download is already in progress\n");
+		result.outcome = whdboot_download_outcome::busy;
+		return result;
+	}
+	struct whdboot_download_guard
+	{
+		~whdboot_download_guard() { whdboot_download_active.store(false); }
+	} download_guard;
+
+	if (whdboot_emulation_blocks_downloads())
+	{
+		write_log("WHDBooter - a machine is running; stop it (or open the settings) before downloading\n");
+		result.outcome = whdboot_download_outcome::busy;
+		return result;
+	}
 
 	write_log("Downloading WHDBoot runtime assets into %s\n", whdboot_path.c_str());
+	write_log("WHDLoad comes from whdload.de; the RTB files, JST and the optional Amiga libraries from Aminet\n");
 
 	ensure_whdboot_runtime_directories();
+
+	// WHDLoad is always re-fetched so an update installs new releases. The
+	// RTB files, JST and the optional Amiga libraries (XPK, MMULib's
+	// 68040.library, explode.library, medplayer.library) are fetched only
+	// while one is missing, JST only when it is selected; existing files
+	// are never overwritten.
+	const bool jst_step = amiberry_options.use_jst_instead_of_whd
+		&& !file_exists(join_path(whdboot_path, "JST"));
+	const bool rtbs_step = whdboot_skick_rtbs_missing();
+	const bool xpk_step = whdboot_xpk_libraries_missing(whdboot_path);
+	const bool mmu_step = whdboot_mmu_library_missing(whdboot_path);
+	const bool explode_step = whdboot_explode_library_missing(whdboot_path);
+	const bool medplayer_step = whdboot_medplayer_library_missing(whdboot_path);
+	const int total_steps = 4 + (jst_step ? 1 : 0) + (rtbs_step ? 1 : 0)
+		+ (xpk_step ? 1 : 0) + (mmu_step ? 1 : 0)
+		+ (explode_step ? 1 : 0) + (medplayer_step ? 1 : 0);
+
+	bool any_success = false;
+	bool any_failure = false;
 
 	const auto do_download = [&](const int step, const std::string& label, const std::string& url,
 		const std::string& destination, const bool keep_backup, const bool record_failure = true) -> bool
@@ -11108,80 +13110,201 @@ whdboot_download_result download_whdboot_assets(
 		return ok;
 	};
 
+	const auto cancelled = [&]()
+	{
+		if (!should_cancel_whdboot_download(cancel_flag))
+			return false;
+		result.outcome = whdboot_download_outcome::cancelled;
+		return true;
+	};
+
 	int step = 0;
-	auto destination = join_path(whdboot_path, "WHDLoad");
-	do_download(++step, "WHDLoad",
-		"https://github.com/BlitterStudio/amiberry/blob/master/whdboot/WHDLoad?raw=true",
-		destination, false);
-	if (should_cancel_whdboot_download(cancel_flag))
-	{
-		result.outcome = whdboot_download_outcome::cancelled;
-		return result;
-	}
 
-	destination = join_path(whdboot_path, "JST");
-	do_download(++step, "JST",
-		"https://github.com/BlitterStudio/amiberry/blob/master/whdboot/JST?raw=true",
-		destination, false);
-	if (should_cancel_whdboot_download(cancel_flag))
+	// WHDLoad by Bert Jahn, from the author's site. The archive member
+	// WHDLoad/C/WHDLoad replaces the previous copy only after it was
+	// extracted and verified, so a failure keeps the old version.
 	{
-		result.outcome = whdboot_download_outcome::cancelled;
-		return result;
+		const auto archive = join_path(whdboot_path, "WHDLoad_usr.lha.download");
+		if (whdboot_fetch_archive(++step, total_steps, "WHDLoad (whdload.de)", whdload_usr_url,
+			archive, progress_cb, cancel_flag))
+		{
+			if (whdboot_extract_archive_member_to_file(archive, "WHDLoad/C/WHDLoad",
+				join_path(whdboot_path, "WHDLoad"), true))
+				any_success = true;
+			else
+				any_failure = true;
+		}
+		else if (!should_cancel_whdboot_download(cancel_flag))
+		{
+			any_failure = true;
+		}
+		host_remove(archive.c_str());
 	}
+	if (cancelled())
+		return result;
 
-	destination = join_path(whdboot_path, "AmiQuit");
-	do_download(++step, "AmiQuit",
-		"https://github.com/BlitterStudio/amiberry/blob/master/whdboot/AmiQuit?raw=true",
-		destination, false);
-	if (should_cancel_whdboot_download(cancel_flag))
+	// JST (freeware) only when "Use JST instead of WHDLoad" is enabled.
+	if (jst_step)
 	{
-		result.outcome = whdboot_download_outcome::cancelled;
-		return result;
+		const auto archive = join_path(whdboot_path, "jst.lha.download");
+		if (whdboot_fetch_archive(++step, total_steps, "JST (Aminet)", jst_url,
+			archive, progress_cb, cancel_flag))
+		{
+			if (whdboot_extract_archive_member_to_file(archive, "jst_usr/bin/jst",
+				join_path(whdboot_path, "JST"), false))
+				any_success = true;
+			else
+				any_failure = true;
+		}
+		else if (!should_cancel_whdboot_download(cancel_flag))
+		{
+			any_failure = true;
+		}
+		host_remove(archive.c_str());
 	}
+	if (cancelled())
+		return result;
+
+	auto destination = join_path(whdboot_path, "host-quit");
+	do_download(++step, "host-quit",
+		"https://github.com/BlitterStudio/amiberry/blob/master/whdboot/host-quit?raw=true",
+		destination, false);
+	if (cancelled())
+		return result;
 
 	destination = join_path(whdboot_path, "boot-data.zip");
 	do_download(++step, "boot-data.zip",
 		"https://github.com/BlitterStudio/amiberry/blob/master/whdboot/boot-data.zip?raw=true",
 		destination, false);
-	if (should_cancel_whdboot_download(cancel_flag))
-	{
-		result.outcome = whdboot_download_outcome::cancelled;
+	if (cancelled())
 		return result;
-	}
 
-	const char* rtb_files[] = {
-		"kick33180.A500.RTB",
-		"kick34005.A500.RTB",
-		"kick40063.A600.RTB",
-		"kick40068.A1200.RTB",
-		"kick40068.A4000.RTB"
-	};
-	for (const auto& rtb : rtb_files)
+	// The kickstart relocation files, all from the one skick346.lha.
+	if (rtbs_step)
 	{
-		++step;
-		const auto rtb_dest_name = std::string("save-data/Kickstarts/") + rtb;
-		const auto rtb_destination = join_path(whdboot_path, rtb_dest_name);
-		if (file_exists(rtb_destination))
+		const auto archive = join_path(whdboot_path, "skick346.lha.download");
+		if (whdboot_fetch_archive(++step, total_steps, "Kickstart RTB files (Aminet)", skick346_url,
+			archive, progress_cb, cancel_flag))
 		{
-			report_whdboot_download_progress(progress_cb, cancel_flag, step, total_steps,
-				std::string(rtb) + " (already exists)", 0, 0);
-			if (should_cancel_whdboot_download(cancel_flag))
+			bool rtbs_ok = true;
+			// The archive is frozen: anything that does not hash to the
+			// pinned digest is refused before a byte is decoded from it.
+			const auto digest = whdboot_file_sha256(archive);
+			if (digest != skick346_sha256)
 			{
-				result.outcome = whdboot_download_outcome::cancelled;
-				return result;
+				write_log("WHDBooter - %s is not skick346.lha (SHA-256 %s, expected %s); not extracting\n",
+					archive.c_str(), digest.c_str(), skick346_sha256);
+				rtbs_ok = false;
 			}
-			continue;
+			else
+			{
+				for (const auto& rtb : whdboot_skick_rtb_files())
+				{
+					const auto rtb_destination = whdboot_rtb_destination(rtb);
+					if (file_exists(rtb_destination))
+						continue;
+					if (!whdboot_extract_archive_member_to_file(archive, "Kickstarts/" + rtb,
+						rtb_destination, false))
+						rtbs_ok = false;
+				}
+			}
+			if (rtbs_ok)
+				any_success = true;
+			else
+				any_failure = true;
 		}
-
-		const auto rtb_url = std::string("https://github.com/BlitterStudio/amiberry/blob/master/whdboot/save-data/Kickstarts/")
-			+ rtb + "?raw=true";
-		do_download(step, rtb, rtb_url, rtb_destination, false);
-		if (should_cancel_whdboot_download(cancel_flag))
+		else if (!should_cancel_whdboot_download(cancel_flag))
 		{
-			result.outcome = whdboot_download_outcome::cancelled;
-			return result;
+			any_failure = true;
 		}
+		host_remove(archive.c_str());
 	}
+	if (cancelled())
+		return result;
+
+	// skick346 carries no kick33192.A500.RTB of its own: it is the same
+	// file as kick33180.A500.RTB, so make the copy WHDLoad looks for.
+	const auto kick33180_path = whdboot_rtb_destination("kick33180.A500.RTB");
+	const auto kick33192_path = whdboot_rtb_destination("kick33192.A500.RTB");
+	if (file_exists(kick33180_path) && !file_exists(kick33192_path))
+	{
+		std::error_code copy_error;
+		std::filesystem::copy_file(host_path(kick33180_path), host_path(kick33192_path), copy_error);
+		if (!copy_error)
+			write_log("WHDBooter - created kick33192.A500.RTB (a copy of kick33180.A500.RTB)\n");
+	}
+
+	// The XPK master library and client set (Dirk Stöcker), fetched from
+	// Aminet while one of them is missing.
+	if (xpk_step)
+	{
+		ensure_directory_exists(join_path(whdboot_path, "Libs"));
+		ensure_directory_exists(join_path(whdboot_path, "Libs/Compressors"));
+		std::vector<std::pair<std::string, std::string>> members;
+		members.emplace_back("xpk_User/Libs/xpkmaster.library",
+			whdboot_library_destination(whdboot_path, "xpkmaster.library"));
+		for (const auto& filename : whdboot_xpk_compressor_files())
+		{
+			members.emplace_back("xpk_User/Libs/compressors/" + filename,
+				whdboot_library_destination(whdboot_path, join_path("Compressors", filename)));
+		}
+		if (whdboot_install_pinned_library_archive(++step, total_steps, "XPK libraries (Aminet)",
+			xpk_user_url, xpk_user_sha256, "xpk_User.lha.download", members, progress_cb, cancel_flag))
+			any_success = true;
+		else if (!should_cancel_whdboot_download(cancel_flag))
+			any_failure = true;
+	}
+	if (cancelled())
+		return result;
+
+	// MMULib's 68040.library (Thomas Richter), the FPU-trap FPSP provider
+	// a 68040 setup expects in LIBS:, with the mmu.library and
+	// 680x0.library it opens.
+	if (mmu_step)
+	{
+		std::vector<std::pair<std::string, std::string>> members;
+		for (const auto* filename : whdboot_mmulib_files)
+			members.emplace_back(std::string("MMULib/Libs/") + filename, whdboot_library_destination(whdboot_path, filename));
+		if (whdboot_install_pinned_library_archive(++step, total_steps, "68040.library (Aminet)",
+			mmulib_url, nullptr, "MMULib.lha.download", members, progress_cb, cancel_flag))
+			any_success = true;
+		else if (!should_cancel_whdboot_download(cancel_flag))
+			any_failure = true;
+	}
+	if (cancelled())
+		return result;
+
+	// explode.library (Struijk/Brouwer), which LoadSeg needs for
+	// TurboImploder-crunched executables.
+	if (explode_step)
+	{
+		const std::vector<std::pair<std::string, std::string>> members = {
+			{ "explode.library", whdboot_library_destination(whdboot_path, "explode.library") }
+		};
+		if (whdboot_install_pinned_library_archive(++step, total_steps, "explode.library (Aminet)",
+			explode_url, explode_sha256, "explode-7.lha.download", members, progress_cb, cancel_flag))
+			any_success = true;
+		else if (!should_cancel_whdboot_download(cancel_flag))
+			any_failure = true;
+	}
+	if (cancelled())
+		return result;
+
+	// OctaMED's medplayer.library (Teijo Kinnunen, RBF Software), which
+	// music-playing slaves expect in LIBS:.
+	if (medplayer_step)
+	{
+		const std::vector<std::pair<std::string, std::string>> members = {
+			{ "libs/medplayer.library", whdboot_library_destination(whdboot_path, "medplayer.library") }
+		};
+		if (whdboot_install_pinned_library_archive(++step, total_steps, "medplayer.library (Aminet)",
+			medplayer_url, medplayer_sha256, "OctV5_Tut4.lha.download", members, progress_cb, cancel_flag))
+			any_success = true;
+		else if (!should_cancel_whdboot_download(cancel_flag))
+			any_failure = true;
+	}
+	if (cancelled())
+		return result;
 
 	const auto json_destination = join_path(whdboot_path, "game-data/whdload_db.json");
 	const auto xml_destination = join_path(whdboot_path, "game-data/whdload_db.xml");
@@ -11200,11 +13323,8 @@ whdboot_download_result download_whdboot_assets(
 			xml_destination, true, true);
 	}
 
-	if (should_cancel_whdboot_download(cancel_flag))
-	{
-		result.outcome = whdboot_download_outcome::cancelled;
+	if (cancelled())
 		return result;
-	}
 
 	const auto new_json_timestamp = get_json_timestamp(json_destination);
 	const auto new_xml_timestamp = get_xml_timestamp(xml_destination);
@@ -11222,11 +13342,10 @@ whdboot_download_result download_whdboot_assets(
 
 static bool whdboot_seed_files_missing_at(const std::string& root_path)
 {
-	if (!file_exists(join_path(root_path, "WHDLoad")))
-		return true;
-	if (!file_exists(join_path(root_path, "JST")))
-		return true;
-	if (!file_exists(join_path(root_path, "AmiQuit")))
+	// Only files Amiberry still bundles may be required here: WHDLoad, JST
+	// and the skick346 RTB files are fetched on demand (whdload.de and
+	// Aminet), so demanding them would reseed on every start.
+	if (!file_exists(join_path(root_path, "host-quit")))
 		return true;
 
 	const auto boot_data_zip = join_path(root_path, "boot-data.zip");
@@ -11239,17 +13358,15 @@ static bool whdboot_seed_files_missing_at(const std::string& root_path)
 	if (!file_exists(json_destination) && !file_exists(xml_destination))
 		return true;
 
-	const char* required_rtb_files[] = {
-		"kick33180.A500.RTB",
-		"kick34005.A500.RTB",
-		"kick40063.A600.RTB",
-		"kick40068.A1200.RTB",
-		"kick40068.A4000.RTB"
+	// kick31034.A1000.RTB is not in skick346 and stays bundled.
+	// (kick33192.A500.RTB is skick346's kick33180.A500.RTB byte for byte;
+	// the download creates it as a copy.)
+	const char* bundled_rtb_files[] = {
+		"kick31034.A1000.RTB"
 	};
-	for (const auto* filename : required_rtb_files)
+	for (const auto* filename : bundled_rtb_files)
 	{
-		const auto destination = join_path(root_path, std::string("save-data/Kickstarts/") + filename);
-		if (!file_exists(destination))
+		if (!file_exists(join_path(root_path, std::string("save-data/Kickstarts/") + filename)))
 			return true;
 	}
 
@@ -11290,16 +13407,184 @@ static void seed_default_whdboot_files_if_needed()
 	if (!seed_missing_directory_contents_from_candidates(whdboot_path, source_candidates))
 #endif
 	{
-		write_log("No WHDLoad boot files found in bundled or system data locations\n");
-		write_log("Skipping automatic download during startup. Use the Paths panel or --download-whdboot to fetch them explicitly.\n");
+		write_log("WHDLoad, JST and the Kickstart RTB files are not bundled with Amiberry.\n");
+		write_log("Download them on demand with the Paths panel's 'Update WHDBooter files' button, "
+			"App Settings in the native apps, or --download-whdboot.\n");
 	}
 }
 
+static std::string get_whdload_db_generated_timestamp(const std::string& json_path)
+{
+	std::ifstream f(json_path, std::ios::binary);
+	if (!f.is_open())
+		return "";
+
+	std::string buffer;
+	buffer.resize(4096);
+	f.read(&buffer[0], buffer.size());
+	const std::streamsize bytes_read = f.gcount();
+	buffer.resize(static_cast<size_t>(bytes_read));
+
+	const auto key_pos = buffer.find("\"generated\"");
+	if (key_pos != std::string::npos)
+	{
+		const auto colon_pos = buffer.find(':', key_pos + 11);
+		if (colon_pos != std::string::npos)
+		{
+			const auto first_quote = buffer.find('\"', colon_pos + 1);
+			if (first_quote != std::string::npos)
+			{
+				const auto second_quote = buffer.find('\"', first_quote + 1);
+				if (second_quote != std::string::npos)
+				{
+					bool whitespace_only = true;
+					for (size_t i = key_pos + 11; i < colon_pos; ++i)
+					{
+						if (!std::isspace(static_cast<unsigned char>(buffer[i])))
+						{
+							whitespace_only = false;
+							break;
+						}
+					}
+					for (size_t i = colon_pos + 1; whitespace_only && i < first_quote; ++i)
+					{
+						if (!std::isspace(static_cast<unsigned char>(buffer[i])))
+						{
+							whitespace_only = false;
+							break;
+						}
+					}
+					if (whitespace_only)
+					{
+						return buffer.substr(first_quote + 1, second_quote - (first_quote + 1));
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback to full parse for non-standard layout or large header
+	f.clear();
+	f.seekg(0, std::ios::beg);
+	try
+	{
+		nlohmann::json doc = nlohmann::json::parse(f, nullptr, false);
+		if (!doc.is_discarded() && doc.contains("generated") && doc["generated"].is_string())
+		{
+			return doc["generated"].get<std::string>();
+		}
+	}
+	catch (...)
+	{
+	}
+
+	return "";
+}
+
+static void refresh_whdboot_database_if_outdated()
+{
+	if (whdboot_path.empty())
+		return;
+
+	const auto source_candidates = get_seed_source_candidates("whdboot", true);
+	std::string bundled_db_path;
+	for (const auto& candidate : source_candidates)
+	{
+		if (path_strings_match(candidate, whdboot_path))
+			continue;
+		const auto candidate_db = join_path(candidate, "game-data/whdload_db.json");
+		if (file_exists(candidate_db))
+		{
+			bundled_db_path = candidate_db;
+			break;
+		}
+	}
+
+	if (bundled_db_path.empty())
+		return;
+
+	const auto bundled_generated = get_whdload_db_generated_timestamp(bundled_db_path);
+	if (bundled_generated.empty())
+	{
+		// If the bundled file lacks generated, do nothing
+		return;
+	}
+
+	const auto user_db_path = join_path(whdboot_path, "game-data/whdload_db.json");
+	const bool user_db_exists = file_exists(user_db_path);
+
+	if (user_db_exists)
+	{
+		const auto user_generated = get_whdload_db_generated_timestamp(user_db_path);
+		if (!user_generated.empty() && !(user_generated < bundled_generated))
+		{
+			write_log("WHDBooter - User database is current (%s >= %s), keeping existing database\n",
+				user_generated.c_str(), bundled_generated.c_str());
+			return;
+		}
+
+		write_log("WHDBooter - User database is outdated (%s < %s), updating from bundled database\n",
+			user_generated.empty() ? "missing/unparseable" : user_generated.c_str(),
+			bundled_generated.c_str());
+	}
+	else
+	{
+		write_log("WHDBooter - User database is missing, copying bundled database (%s)\n",
+			bundled_generated.c_str());
+	}
+
+	const auto game_data_dir = join_path(whdboot_path, "game-data");
+	ensure_directory_exists(game_data_dir);
+
+	// Copy to a staging file first: the user's database is only touched once a
+	// complete copy exists and the backup has been made.
+	const auto staged_path = user_db_path + ".new";
+	std::error_code ec;
+	std::filesystem::copy_file(bundled_db_path, staged_path,
+		std::filesystem::copy_options::overwrite_existing, ec);
+	bool staged = !ec;
+	if (staged)
+	{
+		const auto source_size = std::filesystem::file_size(bundled_db_path, ec);
+		staged = !ec && std::filesystem::file_size(staged_path, ec) == source_size && !ec;
+	}
+	if (!staged)
+	{
+		write_log("WHDBooter - Failed to copy bundled database %s to %s: %s\n",
+			bundled_db_path.c_str(), staged_path.c_str(), ec ? ec.message().c_str() : "size mismatch");
+		std::filesystem::remove(staged_path, ec);
+		return;
+	}
+
+	if (user_db_exists && !backup_file(user_db_path))
+	{
+		write_log("WHDBooter - Could not back up %s, keeping the existing database\n", user_db_path.c_str());
+		std::filesystem::remove(staged_path, ec);
+		return;
+	}
+
+	std::filesystem::rename(staged_path, user_db_path, ec);
+	if (ec)
+	{
+		write_log("WHDBooter - Failed to replace %s: %s\n", user_db_path.c_str(), ec.message().c_str());
+		std::filesystem::remove(staged_path, ec);
+		if (user_db_exists)
+		{
+			const auto backup_path = join_path(game_data_dir, "whdload_db.bak");
+			std::filesystem::rename(backup_path, user_db_path, ec);
+		}
+		return;
+	}
+
+	write_log("WHDBooter - Bundled database copied successfully to %s\n", user_db_path.c_str());
+}
+
+
 static bool rom_seed_files_missing()
 {
-	if (!file_exists(join_path(rom_path, "aros-ext.bin")))
+	if (!file_exists(join_path(rom_path, aros_ext_rom_file)))
 		return true;
-	if (!file_exists(join_path(rom_path, "aros-rom.bin")))
+	if (!file_exists(join_path(rom_path, aros_main_rom_file)))
 		return true;
 	if (!file_exists(join_path(rom_path, "mt32-roms/dir.txt")))
 		return true;
@@ -11318,10 +13603,14 @@ static void seed_default_rom_files_if_needed()
 static void refresh_builtin_theme_presets()
 {
 	// Always regenerate built-in theme presets so they include any new fields.
+	// The presets are built in gui_theme, so put the active theme back after:
+	// this also runs from the Paths panel while the GUI is showing it.
+	const amiberry_gui_theme active_theme = gui_theme;
 	load_default_theme();
 	save_theme("Default.theme");
 	load_default_dark_theme();
 	save_theme("Dark.theme");
+	gui_theme = active_theme;
 }
 
 void create_missing_amiberry_folders()
@@ -11330,6 +13619,7 @@ void create_missing_amiberry_folders()
 	seed_default_controller_files_if_needed();
 	ensure_whdboot_runtime_directories();
 	seed_default_whdboot_files_if_needed();
+	refresh_whdboot_database_if_outdated();
 	seed_default_rom_files_if_needed();
 	refresh_builtin_theme_presets();
 }
@@ -11363,7 +13653,10 @@ static void init_amiberry_dirs(const bool portable_mode, const bool materialize_
 	config_path = get_config_directory(portable_mode);
 	current_dir = home_dir = get_home_directory(portable_mode);
 	data_dir = get_data_directory(portable_mode);
-	plugins_dir = get_plugins_directory(portable_mode);
+	// plugins_dir is only an explicit user override; defaults are resolved by
+	// get_plugin_search_paths() so moving an app bundle cannot stale this setting.
+	if (portable_mode)
+		plugins_dir.clear();
 	const auto visual_content_root = home_dir;
 
 #ifdef LIBRETRO
@@ -11458,6 +13751,7 @@ static void init_amiberry_dirs(const bool portable_mode, const bool materialize_
 			floppy_sounds_dir += '/';
 #endif
 	}
+	floppy_sounds_dir_is_default = true;
 
 	default_base_content_paths = get_current_base_content_path_set();
 }
@@ -11473,6 +13767,16 @@ static void dump_resolved_paths(const bool write_dump_file)
 	output.append("portable_mode=").append(g_portable_mode ? "1" : "0").append("\n");
 	append_line("portable_root", get_portable_root_directory());
 	append_line("portable_marker_file", get_portable_mode_marker_path());
+#if !defined(__MACH__) && !defined(__ANDROID__)
+	std::string portable_toggle_reason;
+	const bool portable_toggle_available = can_toggle_portable_mode(&portable_toggle_reason);
+	std::replace(portable_toggle_reason.begin(), portable_toggle_reason.end(), '\n', ' ');
+	std::replace(portable_toggle_reason.begin(), portable_toggle_reason.end(), '\r', ' ');
+	output.append("portable_toggle_available=").append(portable_toggle_available ? "1" : "0").append("\n");
+	append_line("portable_toggle_unavailable_reason", portable_toggle_reason);
+#endif
+	append_line("relative_paths", relativepaths ? "1" : "0");
+	append_line("relative_path_base", get_relative_path_base());
 	append_line("settings_resolution_source", get_settings_resolution_source_name(resolved_settings_source));
 	append_line("settings_resolution_file", resolved_settings_file);
 	append_line("settings_dir", settings_dir);
@@ -11482,7 +13786,31 @@ static void dump_resolved_paths(const bool write_dump_file)
 	append_line("home_dir", home_dir);
 	append_line("config_path", config_path);
 	append_line("data_dir", data_dir);
+	append_line("floppy_sounds_dir", floppy_sounds_dir);
+	append_line("abr_path", get_data_path() + "abr/");
+	append_line("install_bindir_relative", get_configured_install_bindir());
+	append_line("install_datadir_relative", get_configured_install_datadir());
+	append_line("install_libdir_relative", get_configured_install_libdir());
+	append_line("compiled_data_dir", join_path(AMIBERRY_DATADIR, "data"));
+	append_line("effective_ca_bundle", get_effective_ca_bundle());
+	const auto& installed_roots = get_relocated_installed_resource_roots();
+	append_line("install_prefix", installed_roots.prefix);
+	append_line("relocated_data_root", installed_roots.data);
+	append_line("relocated_plugins_root", installed_roots.plugins);
 	append_line("plugins_dir", plugins_dir);
+	append_line("system_plugins_dir", get_legacy_system_plugins_directory());
+	append_line("user_plugins_dir", get_user_plugins_path());
+	const auto plugin_search_paths = get_plugin_search_paths();
+	for (size_t index = 0; index < plugin_search_paths.size(); ++index)
+		append_line(("plugin_search_path_" + std::to_string(index)).c_str(), plugin_search_paths[index]);
+	const auto append_seed_sources = [&](const char* name, const std::vector<std::string>& candidates)
+	{
+		for (size_t index = 0; index < candidates.size(); ++index)
+			append_line((std::string(name) + "_seed_source_" + std::to_string(index)).c_str(), candidates[index]);
+	};
+	append_seed_sources("controllers", get_seed_source_candidates("controllers", true));
+	append_seed_sources("roms", get_seed_source_candidates("roms", true));
+	append_seed_sources("whdboot", get_seed_source_candidates("whdboot", true));
 	append_line("controllers_path", controllers_path);
 	append_line("whdboot_path", whdboot_path);
 	append_line("whdload_arch_path", whdload_arch_path);
@@ -11524,6 +13852,7 @@ void reset_default_paths()
 {
 	const auto previous_logfile_path = logfile_path;
 	base_content_path.clear();
+	plugins_dir.clear();
 	init_amiberry_dirs(g_portable_mode);
 	create_missing_amiberry_folders();
 	if (!path_strings_match(previous_logfile_path, logfile_path))
@@ -11651,8 +13980,25 @@ static void load_amiberry_settings_from_file(const std::string& settings_file)
 
 			parse_amiberry_settings_line(settings_file.c_str(), line_copy);
 		}
+
+#ifdef __ANDROID__
+		// One-time legacy migration, applied only after the whole file has been
+		// parsed so the migrated flag (serialized after the toggle) is already
+		// loaded: Guide is the Android menu trigger, so a persisted "guide" from
+		// a previous version is the stale default, never a working keyboard
+		// toggle. The flag is set after inspecting an unmarked file regardless
+		// of conversion, so a Guide value chosen deliberately afterwards is
+		// preserved on later launches.
+		if (!amiberry_options.default_vkbd_toggle_migrated)
+		{
+			if (_tcscmp(amiberry_options.default_vkbd_toggle, _T("guide")) == 0)
+				_tcscpy(amiberry_options.default_vkbd_toggle, _T("leftstick"));
+			amiberry_options.default_vkbd_toggle_migrated = true;
+		}
+#endif
 	}
 }
+
 
 void load_amiberry_settings()
 {
@@ -11755,6 +14101,10 @@ void target_addtorecent(const TCHAR* name, int t)
 void target_reset()
 {
 	clipboard_reset();
+	// Runs before devices_reset() -> memory_reset(), so the memory map and
+	// chipset setup see the new values.
+	if (is_hardreset())
+		set_reset_only_chipset_prefs(currprefs, get_reset_only_chipset_prefs(changed_prefs));
 }
 
 bool target_can_autoswitchdevice()
@@ -11785,11 +14135,13 @@ uae_u32 emulib_target_getcpurate(const uae_u32 v, uae_u32* low)
 
 void target_shutdown()
 {
-#ifndef AMIBERRY_IOS
-	system("sudo poweroff");
+#ifndef __APPLE__
+	if (system("sudo poweroff") != 0)
+		write_log("Host shutdown failed: 'sudo poweroff' needs passwordless sudo for this user\n");
 #endif
 }
 
+namespace {
 struct winuae	//this struct is put in a6 if you call
 	//execute native function
 {
@@ -11797,6 +14149,7 @@ struct winuae	//this struct is put in a6 if you call
 	unsigned int changenum;   //number to detect screen close/open
 	unsigned int z3offset;    //the offset to add to access Z3 mem from Dll side
 };
+}
 
 void* uaenative_get_uaevar()
 {
@@ -11811,24 +14164,16 @@ void* uaenative_get_uaevar()
 
 const TCHAR** uaenative_get_library_dirs()
 {
-	static const TCHAR** nats;
-	static TCHAR* path;
-	static TCHAR* libpath;
-	
-	if (nats == nullptr)
-		nats = xcalloc(const TCHAR*, 4);
-	if (path == nullptr) {
-		path = xcalloc(TCHAR, MAX_DPATH);
-		_tcscpy(path, plugins_dir.c_str());
-	}
-	if (libpath == nullptr)
-	{
-		libpath = strdup(_T(AMIBERRY_LIBDIR));
-	}
-	nats[0] = home_dir.c_str();
-	nats[1] = path;
-	nats[2] = libpath; 
-	return nats;
+	static std::vector<std::string> library_dirs;
+	static std::vector<const TCHAR*> directories;
+	library_dirs = get_plugin_search_paths();
+	directories.clear();
+	directories.reserve(library_dirs.size() + 2);
+	directories.emplace_back(home_dir.c_str());
+	for (const auto& directory : library_dirs)
+		directories.emplace_back(directory.c_str());
+	directories.emplace_back(nullptr);
+	return directories.data();
 }
 
 static int parseversion(TCHAR** vs)
@@ -11924,8 +14269,31 @@ static void makeverstr(TCHAR* s)
 	}
 }
 
+// Resolve and load the bootstrap settings (amiberry.conf) for the early-exit
+// dump modes without creating or migrating anything, so --dump-paths and
+// --dump-config see the same path overrides a normal start would apply.
+static void resolve_and_load_bootstrap_settings_for_dump(const bool portable_mode)
+{
+	resolved_settings_source = amiberry_conf_file_overridden_from_cli
+		? settings_resolution_source::cli_override
+		: settings_resolution_source::default_paths_only;
+	const auto settings_file_for_resolution = get_existing_settings_file_for_resolution(portable_mode);
+	if (!settings_file_for_resolution.empty())
+	{
+		resolved_settings_file = normalize_path_string(settings_file_for_resolution);
+		if (!amiberry_conf_file_overridden_from_cli)
+		{
+			resolved_settings_source = path_strings_match(settings_file_for_resolution, amiberry_conf_file)
+				? settings_resolution_source::settings_dir
+				: settings_resolution_source::legacy_settings;
+		}
+		load_amiberry_settings_from_file(settings_file_for_resolution);
+	}
+}
+
 int amiberry_main(int argc, char* argv[])
 {
+	write_log_begin_startup_capture();
 #ifdef __ANDROID__
 	if (!SDL_Init(0)) {
 		write_log("SDL_Init(0) failed: %s\n", SDL_GetError());
@@ -11949,6 +14317,11 @@ int amiberry_main(int argc, char* argv[])
 	bool run_jit_selftest = false;
 	bool run_path_migration_selftest = false;
 	bool dump_paths = false;
+	bool dump_config = false;
+	bool settings_schema = false;
+#ifndef LIBRETRO
+	const char* settings_schema_options = nullptr;
+#endif
 	bool download_whdboot = false;
 	for (auto i = 1; i < argc; i++) {
 		if (_tcscmp(argv[i], _T("-h")) == 0 || _tcscmp(argv[i], _T("--help")) == 0)
@@ -11963,36 +14336,55 @@ int amiberry_main(int argc, char* argv[])
 			run_path_migration_selftest = true;
 		if (_tcscmp(argv[i], _T("--dump-paths")) == 0)
 			dump_paths = true;
+		if (_tcscmp(argv[i], _T("--dump-config")) == 0)
+			dump_config = true;
+#ifndef LIBRETRO
+		// The libretro core does not link the settings layer.
+		if (_tcscmp(argv[i], _T("--settings-schema")) == 0)
+			settings_schema = true;
+		if (_tcsncmp(argv[i], _T("--settings-schema="), 18) == 0) {
+			settings_schema = true;
+			settings_schema_options = argv[i] + 18;
+		}
+#endif
 		if (_tcscmp(argv[i], _T("--download-whdboot")) == 0)
 			download_whdboot = true;
+#ifdef AMIBERRY_NATIVE_UI_TESTS
+		if (_tcsncmp(argv[i], _T("--native-ui-tests="), 18) == 0)
+			native_ui_tests_request(argv[i] + 18);
+#endif
 		if (_tcscmp(argv[i], _T("--rescan-roms")) == 0)
 			forceroms = 1;
 		if (_tcscmp(argv[i], _T("--perf-log")) == 0)
 			force_perf_log = true;
 	}
+	// write_log() console output goes to stdout, which would interleave with
+	// the serialized configuration; --log is therefore ignored in dump mode
+	// (file logging never initializes this early anyway). Reset it here,
+	// before any code path that can log.
+	if (dump_config || settings_schema)
+		console_logging = 0;
+	amiberry_dump_config_mode = dump_config;
 
 	if (run_jit_selftest)
 		return run_jit_selftest_cli();
 	if (run_path_migration_selftest)
 		return run_path_migration_selftest_cli();
 
-#ifndef _WIN32
+#ifdef AMIBERRY_FAULT_SIGNAL_HANDLERS
 	struct sigaction action{};
 #endif
 	mainthreadid = uae_thread_get_id(nullptr);
+	const bool early_dump_mode = dump_paths || dump_config || settings_schema;
 
 
 
-#ifdef USE_DBUS
-	if (!dump_paths)
-		DBusSetup();
-#endif
 #ifdef USE_IPC_SOCKET
-	if (!dump_paths)
+	if (!early_dump_mode)
 		Amiberry::IPC::IPCSetup();
 #endif
 
-	suppress_runtime_path_side_effects = dump_paths;
+	suppress_runtime_path_side_effects = early_dump_mode;
 
 	// Parse the command line to possibly set amiberry_config.
 	// Do not remove used args yet.
@@ -12013,27 +14405,115 @@ int amiberry_main(int argc, char* argv[])
 	g_portable_mode = false;
 	#endif
 	const bool portable_mode = g_portable_mode;
-	resolve_bootstrap_settings_paths(portable_mode, !dump_paths);
+	// Portable installs default to relative paths; amiberry.conf can override this.
+	// The iOS app's container moves (reinstall, update, restore), so it
+	// always stores paths relative to its home.
+#ifdef AMIBERRY_IOS
+	relativepaths = 1;
+#else
+	relativepaths = portable_mode ? 1 : 0;
+#endif
+	resolve_bootstrap_settings_paths(portable_mode, !early_dump_mode);
 	if (dump_paths)
 	{
 		init_amiberry_dirs(portable_mode, false);
-		resolved_settings_source = amiberry_conf_file_overridden_from_cli
-			? settings_resolution_source::cli_override
-			: settings_resolution_source::default_paths_only;
-		const auto settings_file_for_resolution = get_existing_settings_file_for_resolution(portable_mode);
-		if (!settings_file_for_resolution.empty())
-		{
-			resolved_settings_file = normalize_path_string(settings_file_for_resolution);
-			if (!amiberry_conf_file_overridden_from_cli)
-			{
-				resolved_settings_source = path_strings_match(settings_file_for_resolution, amiberry_conf_file)
-					? settings_resolution_source::settings_dir
-					: settings_resolution_source::legacy_settings;
-			}
-			load_amiberry_settings_from_file(settings_file_for_resolution);
-		}
+		resolve_and_load_bootstrap_settings_for_dump(portable_mode);
 		dump_resolved_paths(false);
 		return 0;
+	}
+#ifndef LIBRETRO
+	if (settings_schema)
+	{
+		// Built-in defaults only, neither amiberry.conf nor the ROM
+		// inventory: the schema must not depend on the machine making it.
+		// default_prefs() needs the keyboard translation table, the core's
+		// checks a display list and the Zorro III window a normal start
+		// sets up before any configuration is resolved; quit_program keeps
+		// them from probing attached hardware.
+		keyboard_settrans();
+		install_headless_display_fallback();
+		preinit_shm();
+		quit_program = UAE_QUIT;
+		return settings_schema_and_exit(settings_schema_options);
+	}
+#endif
+	if (dump_config)
+	{
+		init_amiberry_dirs(portable_mode, false);
+		resolve_and_load_bootstrap_settings_for_dump(portable_mode);
+		// Mirror the first-run slow-host default a normal start applies after
+		// this early exit point: with no amiberry.conf on a known-slow SBC,
+		// resolution autoswitch is enabled before target_default_options()
+		// copies it into currprefs, so the dump must reflect it too.
+		if (!my_existsfile2(amiberry_conf_file.c_str()) && host_detect_slow_sbc())
+			amiberry_options.default_gfx_autoresolution = 1;
+		// default_prefs() dereferences the keyboard translation table that
+		// keyboard_settrans() installs later on a normal start; it has not run
+		// yet at this early exit point.
+		keyboard_settrans();
+		// Populate the ROM inventory from the existing DetectedROMs cache in
+		// amiberry.ini, read-only: --model presets and config loading resolve
+		// Kickstart paths through configure_rom(), which needs the inventory a
+		// normal start builds in initialize_ini(). A missing cache is left
+		// alone -- --dump-config must not write scan results back.
+		bool rom_inventory_available = false;
+		if (my_existsfile2(get_ini_file_path().c_str())) {
+			// recover_by_recreate=false: a malformed ini must be left
+			// untouched -- the normal self-heal deletes and recreates it,
+			// which a diagnostic command must never do.
+			reginitializeinit(&inipath, false);
+			if (regexiststree(nullptr, _T("DetectedROMs"))) {
+				// --rescan-roms asks for a cache refresh, which writes; the
+				// dump resolves against the existing cache instead, so the
+				// inventory is loaded even when a rescan was requested.
+				const int saved_forceroms = forceroms;
+				forceroms = 0;
+				read_rom_list(false);
+				forceroms = saved_forceroms;
+				rom_inventory_available = true;
+			}
+		}
+		if (!rom_inventory_available)
+			fprintf(stderr, "; no ROM inventory: amiberry.ini has no DetectedROMs cache (first run?).\n"
+				"; ROM-dependent settings resolve unselected until a normal launch scans once.\n");
+		// fixup_prefs() resolves gfx options through the enumerated display
+		// list (getdisplay() exits when no display was ever enumerated) and
+		// sound options through the enumerated sound device list. Enumerate
+		// for real when SDL is available; otherwise the synthetic primary
+		// display below lets headless hosts and CI runners resolve offline.
+		if (osdep_platform_init_sdl()) {
+			enumeratedisplays();
+			sortdisplays();
+			enumerate_sound_devices();
+		}
+		install_headless_display_fallback();
+		// fixup_prefs() clamps Zorro III memory against the reserved window
+		// (max_z3fastmem), which preinit_shm() computes on a normal start
+		// before any configuration is resolved. Without it the dump would
+		// report Z3 fake chip RAM and Z3 graphics card memory as corrected
+		// to zero; mirror the reservation so the dump resolves exactly like
+		// a normal start (the reservation is address space only and is
+		// released when the process exits).
+		preinit_shm();
+		// Resolving a WHDLoad autoload in dump mode must not prepare the
+		// host for a real boot: no booter temp tree, no save-data links.
+		whdload_set_host_writes_enabled(false);
+		// drawbridge_update_profiles() skips floppybridge_init() while
+		// quitting, which is the code's own lever against probing bridge
+		// hardware; use it so the dump never touches attached devices.
+		quit_program = UAE_QUIT;
+		// RP9 media marked for deployment must not be copied into the
+		// persistent Shared tree by a diagnostic dump.
+		rp9_set_host_writes_enabled(false);
+		// Remove Amiberry's -o options so the core command line parser below
+		// sees the same argv a normal start would.
+		if (!parse_amiberry_cmd_line(&argc, argv, true))
+		{
+			printf("Error in Amiberry command line option parsing.\n");
+			usage();
+			abort();
+		}
+		return dump_config_and_exit(argc, argv);
 	}
 
 	if (!amiberry_conf_file_overridden_from_cli)
@@ -12054,6 +14534,18 @@ int amiberry_main(int argc, char* argv[])
 		// cpu_compatible case and only risks breaking timing-sensitive titles.)
 		amiberry_options.default_gfx_autoresolution = 1;
 	}
+#ifdef _WIN32
+	remove_stale_user_plugin_backups();
+#endif
+
+#ifdef __ANDROID__
+	// First run with no amiberry.conf: nothing legacy to migrate. Marking now
+	// prevents the first save from persisting default_vkbd_toggle_migrated=no,
+	// which would let a deliberately chosen Guide value be treated as stale
+	// legacy on the next launch.
+	if (!config_found)
+		amiberry_options.default_vkbd_toggle_migrated = true;
+#endif
 	if (force_perf_log)
 		amiberry_options.perf_log = true;
 	quickstart_compa = amiberry_options.default_quickstart_compatibility;
@@ -12121,31 +14613,9 @@ int amiberry_main(int argc, char* argv[])
 
 	logging_init();
 	rp9_init();
-#if defined (CPU_arm) && !defined (_WIN32)
-	memset(&action, 0, sizeof action);
-	action.sa_sigaction = signal_segv;
-	action.sa_flags = SA_SIGINFO;
-	if (sigaction(SIGSEGV, &action, nullptr) < 0)
+#ifdef AMIBERRY_FAULT_SIGNAL_HANDLERS
+	if (!install_fault_signal_handlers())
 	{
-		write_log("Failed to set signal handler (SIGSEGV).\n");
-#ifndef __ANDROID__
-		abort();
-#endif
-	}
-	if (sigaction(SIGILL, &action, nullptr) < 0)
-	{
-		write_log("Failed to set signal handler (SIGILL).\n");
-#ifndef __ANDROID__
-		abort();
-#endif
-	}
-
-	memset(&action, 0, sizeof action);
-	action.sa_sigaction = signal_buserror;
-	action.sa_flags = SA_SIGINFO;
-	if (sigaction(SIGBUS, &action, nullptr) < 0)
-	{
-		write_log("Failed to set signal handler (SIGBUS).\n");
 #ifndef __ANDROID__
 		abort();
 #endif
@@ -12171,6 +14641,7 @@ int amiberry_main(int argc, char* argv[])
 	
 	if (!osdep_platform_init_sdl())
 		abort();
+	install_fault_signal_handlers();
 
 	initialize_ini();
 	initialize_legacy_cleanup_prompt_state();
@@ -12181,16 +14652,22 @@ int amiberry_main(int argc, char* argv[])
 	enumerate_sound_devices();
 	for (int i = 0; i < MAX_SOUND_DEVICES && sound_devices[i]; i++) {
 		const int type = sound_devices[i]->type;
-		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL2 ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), sound_devices[i]->name);
+		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), sound_devices[i]->name);
 	}
 	write_log(_T("Enumerating recording devices:\n"));
 	for (int i = 0; i < MAX_SOUND_DEVICES && record_devices[i]; i++) {
 		const int type = record_devices[i]->type;
-		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL2 ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), record_devices[i]->name);
+		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), record_devices[i]->name);
 	}
 	write_log(_T("Enumeration done\n"));
 
 	osdep_platform_init_ui();
+#if !defined(__ANDROID__) && !defined(LIBRETRO)
+	SDL_AddEventWatch(app_lifecycle_watch, nullptr);
+#endif
+#ifdef AMIBERRY_NATIVE_HOST
+	native_host_install_menus();
+#endif
 	keyboard_settrans();
 
 	open_led_console();
@@ -12282,12 +14759,16 @@ int amiberry_main(int argc, char* argv[])
 	free_keyring();
 	rp9_cleanup();
 
-	logging_cleanup();
-
 	osdep_platform_shutdown_sdl();
 
 	if (host_poweroff)
 		target_shutdown();
+
+	logging_cleanup();
+#ifdef AMIBERRY_NATIVE_UI_TESTS
+	if (native_ui_tests_requested())
+		return native_ui_tests_exit_status();
+#endif
 	return 0;
 }
 
@@ -12299,29 +14780,103 @@ void toggle_mousegrab()
 bool get_plugin_path(TCHAR* out, const int len, const TCHAR* path)
 {
 	if (strcmp(path, "floppysounds") == 0) {
-		if (floppy_sounds_dir[0]) {
+		if (floppy_sounds_dir[0])
 			strncpy(out, floppy_sounds_dir.c_str(), len);
-		}
-		else {
+		else
 			strncpy(out, "floppy_sounds", len);
-		}
-		// make sure out is null-terminated in any case
 		out[len - 1] = '\0';
+		return TRUE;
 	}
-	else if (strcmp(path, "abr") == 0)
-	{
-		strncpy(out, data_dir.c_str(), len - 1);
-		strncat(out, "abr/", len - 1);
+	if (strcmp(path, "abr") == 0) {
+		const auto abr_path = get_data_path() + "abr/";
+		strncpy(out, abr_path.c_str(), len - 1);
 		out[len - 1] = '\0';
+		return TRUE;
 	}
-	else {
-		strncpy(out, plugins_dir.c_str(), len - 1);
-		strncat(out, "/", len - 1);
-		strncat(out, path, len - 1);
-		strncat(out, "/", len - 1);
-		return my_existsfile2(out);
+	for (const auto& plugin_directory : get_plugin_search_paths()) {
+		auto candidate = join_path(plugin_directory, path);
+		candidate = fix_trailing(candidate);
+		if (!my_existsfile2(candidate.c_str()))
+			continue;
+		strncpy(out, candidate.c_str(), len - 1);
+		out[len - 1] = '\0';
+		return true;
 	}
-	return TRUE;
+	out[0] = '\0';
+	return false;
+}
+
+#ifdef FLOPPYBRIDGE
+static_assert(DRAWBRIDGE_OPTION_AUTOCACHE == FloppyBridgeAPI::ConfigOption_AutoCache
+	&& DRAWBRIDGE_OPTION_COMPORT == FloppyBridgeAPI::ConfigOption_ComPort
+	&& DRAWBRIDGE_OPTION_AUTODETECT_COMPORT == FloppyBridgeAPI::ConfigOption_AutoDetectComport
+	&& DRAWBRIDGE_OPTION_DRIVE_CABLE == FloppyBridgeAPI::ConfigOption_DriveABCable
+	&& DRAWBRIDGE_OPTION_SMARTSPEED == FloppyBridgeAPI::ConfigOption_SmartSpeed
+	&& DRAWBRIDGE_OPTION_SHUGART == FloppyBridgeAPI::ConfigOption_SupportsShugartMode,
+	"DRAWBRIDGE_OPTION_* must match FloppyBridgeAPI::ConfigOption_*");
+
+static std::vector<FloppyBridgeAPI::DriverInformation>& drawbridge_drivers()
+{
+	static std::vector<FloppyBridgeAPI::DriverInformation> drivers;
+	return drivers;
+}
+static bool drawbridge_drivers_read = false;
+#endif
+
+int drawbridge_driver_count(bool refresh)
+{
+#ifdef FLOPPYBRIDGE
+	if (refresh || !drawbridge_drivers_read) {
+		drawbridge_drivers().clear();
+		if (FloppyBridgeAPI::isAvailable())
+			FloppyBridgeAPI::getDriverList(drawbridge_drivers());
+		drawbridge_drivers_read = true;
+	}
+	return static_cast<int>(drawbridge_drivers().size());
+#else
+	return 0;
+#endif
+}
+
+const char* drawbridge_driver_name(int index)
+{
+#ifdef FLOPPYBRIDGE
+	if (index >= 0 && index < drawbridge_driver_count(false))
+		return drawbridge_drivers()[index].name;
+#endif
+	return "";
+}
+
+unsigned int drawbridge_driver_options(int index)
+{
+#ifdef FLOPPYBRIDGE
+	if (index >= 0 && index < drawbridge_driver_count(false))
+		return drawbridge_drivers()[index].configOptions;
+#endif
+	return 0;
+}
+
+// Applies DrawBridge changes to the running configuration and the
+// FloppyBridge profiles. Called when the GUI closes and from the floppy
+// code's per-frame change check, so a change committed through the settings
+// layer while running reaches the hardware too.
+void drawbridge_check_prefs_changed()
+{
+	if (currprefs.drawbridge_driver == changed_prefs.drawbridge_driver &&
+		currprefs.drawbridge_serial_auto == changed_prefs.drawbridge_serial_auto &&
+		_tcsicmp(currprefs.drawbridge_serial_port, changed_prefs.drawbridge_serial_port) == 0 &&
+		currprefs.drawbridge_smartspeed == changed_prefs.drawbridge_smartspeed &&
+		currprefs.drawbridge_autocache == changed_prefs.drawbridge_autocache &&
+		currprefs.drawbridge_drive_cable == changed_prefs.drawbridge_drive_cable)
+		return;
+	currprefs.drawbridge_driver = changed_prefs.drawbridge_driver;
+	currprefs.drawbridge_serial_auto = changed_prefs.drawbridge_serial_auto;
+	_tcscpy(currprefs.drawbridge_serial_port, changed_prefs.drawbridge_serial_port);
+	currprefs.drawbridge_smartspeed = changed_prefs.drawbridge_smartspeed;
+	currprefs.drawbridge_autocache = changed_prefs.drawbridge_autocache;
+	currprefs.drawbridge_drive_cable = changed_prefs.drawbridge_drive_cable;
+	if (quit_program != UAE_QUIT)
+		drawbridge_update_profiles(&currprefs);
 }
 
 // The serialization logic here is taken from FloppyBridge.cpp -> void BridgeConfig::toString(char** serialisedOptions)
@@ -12369,7 +14924,8 @@ void drawbridge_update_profiles(uae_prefs* p)
 
 bool is_mainthread()
 {
-	return uae_thread_get_id(nullptr) == mainthreadid;
+	static thread_local const SDL_ThreadID tid = uae_thread_get_id(nullptr);
+	return tid == mainthreadid;
 }
 
 void clear_whdload_prefs()
@@ -12381,6 +14937,7 @@ void clear_whdload_prefs()
 	whdload_prefs.slave_count = 0;
 	whdload_prefs.slave_default.clear();
 	whdload_prefs.slave_libraries = false;
+	whdload_prefs.exp_chip = false;
 	whdload_prefs.slaves = {};
 	whdload_prefs.selected_slave = {};
 	whdload_prefs.custom.clear();

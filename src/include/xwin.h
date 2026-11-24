@@ -70,6 +70,10 @@ extern void amiberry_hw_vsync_pacing_invalidate(void);
 // Publishes whether the active renderer has successfully configured blocking
 // presentation. Called on the presentation thread and read by frame pacing.
 extern void amiberry_hw_vsync_pacing_set_blocking(bool blocking);
+
+// Whether the host monitor's refresh matches the chipset's within ~1 Hz,
+// whatever the presentation mode (false until the monitor has been probed).
+extern bool amiberry_hw_vsync_refresh_matches(void);
 #endif
 
 extern void flush_line(struct vidbuffer*, int);
@@ -88,11 +92,18 @@ extern int target_get_display_scanline(int displayindex);
 extern void target_spin(int);
 
 void getgfxoffset(int monid, float *dxp, float *dyp, float *mxp, float *myp);
+#ifdef AMIBERRY
+// Window coordinate units per presented source pixel. Pointer events and SDL
+// cursor images share this space on every video driver.
+bool getgfxwindowscale(int monid, float *sxp, float *syp);
+#endif
 bool getgfxsourceorigin(int monid, int *xp, int *yp);
 float target_getcurrentvblankrate(int monid);
 
 extern int debuggable(void);
 extern void screenshot(int monid, int, int);
+// Save PNG to an explicit host path without changing screenshot preferences.
+extern bool screenshot_save(int monid, const TCHAR *path);
 void refreshtitle(void);
 
 extern int bits_in_mask(unsigned long mask);

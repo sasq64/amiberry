@@ -1,0 +1,100 @@
+package com.blitterstudio.amiberry.data
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
+
+class DeviceStorageTest {
+
+	@get:Rule
+	val tempDir = TemporaryFolder()
+
+	@Test
+	fun `entries list folders first then supported files by name, without hidden ones`() {
+		val root = tempDir.root
+		File(root, "zeta").mkdir()
+		File(root, "Alpha").mkdir()
+		File(root, ".hidden").mkdir()
+		File(root, "Game.ADF").writeText("disk")
+		File(root, "b.lha").writeText("game")
+		File(root, "notes.txt").writeText("text")
+		File(root, ".secret.adf").writeText("disk")
+
+		val entries = DeviceStorage.entries(root, setOf("adf", "lha"))!!
+
+		assertEquals(listOf("Alpha", "zeta", "b.lha", "Game.ADF"), entries.map { it.file.name })
+		assertEquals(listOf(true, true, false, false), entries.map { it.isDirectory })
+	}
+
+	@Test
+	fun `an unreadable folder has no entries`() {
+		assertNull(DeviceStorage.entries(File(tempDir.root, "missing"), setOf("adf")))
+	}
+
+	@Test
+	fun `supported files below a folder include nested folders and skip hidden ones`() {
+		val root = tempDir.root
+		File(root, "Games/Action").mkdirs()
+		File(root, ".cache").mkdirs()
+		File(root, "kick.rom").writeText("rom")
+		File(root, "Games/Action/Turrican.lha").writeText("game")
+		File(root, "Games/readme.txt").writeText("text")
+		File(root, ".cache/old.adf").writeText("disk")
+
+		val files = DeviceStorage.supportedFilesUnder(root, setOf("rom", "lha", "adf"))
+
+		assertEquals(listOf("kick.rom", "Turrican.lha"), files.map { it.name })
+	}
+
+	@Test
+	fun `the app's own storage below the folder is left out`() {
+		val root = tempDir.root
+		val appFiles = File(root, "Android/data/com.blitterstudio.amiberry/files")
+		File(appFiles, "Floppies").mkdirs()
+		File(appFiles, "Floppies/Lotus.adf").writeText("disk")
+		File(root, "Download").mkdirs()
+		File(root, "Download/Turrican.lha").writeText("game")
+
+		val files = DeviceStorage.supportedFilesUnder(root, setOf("adf", "lha"), excluded = listOf(appFiles))
+
+		assertEquals(listOf("Turrican.lha"), files.map { it.name })
+		assertEquals(emptyList<File>(), DeviceStorage.supportedFilesUnder(appFiles, setOf("adf"), excluded = listOf(appFiles)))
+	}
+
+	@Test
+	fun `an empty extension set lists every file, for a file-setting picker`() {
+		val root = tempDir.root
+		File(root, "retroarch.cfg").writeText("input_driver")
+		File(root, "Amiberry.log").writeText("log")
+		File(root, ".hidden.cfg").writeText("hidden")
+
+		val entries = DeviceStorage.entries(root, emptySet())!!
+
+		assertEquals(listOf("Amiberry.log", "retroarch.cfg"), entries.map { it.file.name })
+	}
+
+	@Test
+	fun `every configured category folder below the imported folder is left out`() {
+		// A folder holding a configured library root (a path setting moved
+		// it out of the app's own storage) must not import the library
+		// into itself.
+		val picked = tempDir.newFolder("picked")
+		val appFiles = File(picked, "Android/data/app/files/LHA").also { it.mkdirs() }
+		val roms = File(picked, "configured/ROMs").also { it.mkdirs() }
+		File(roms, "kick.rom").writeText("rom")
+		val floppies = File(picked, "configured/Floppies").also { it.mkdirs() }
+		File(floppies, "game.adf").writeText("disk")
+		File(appFiles, "inside.lha").writeText("packed")
+
+		val files = DeviceStorage.supportedFilesUnder(
+			picked,
+			setOf("rom", "adf", "lha"),
+			excluded = listOf(appFiles, roms, floppies)
+		)
+
+		assertEquals(emptyList<File>(), files)
+	}
+}

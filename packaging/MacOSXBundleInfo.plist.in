@@ -22,6 +22,10 @@
         <string>APPL</string>
         <key>NSHighResolutionCapable</key>
         <true/>
+        <key>NSCameraUsageDescription</key>
+        <string>Amiberry uses the camera when it is selected as a genlock capture source.</string>
+        <key>NSMicrophoneUsageDescription</key>
+        <string>Amiberry uses the microphone as the recording input of the sampler and the emulated sound cards.</string>
         <key>CFBundleShortVersionString</key>
         <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
         <key>CFBundleVersion</key>
@@ -30,8 +34,12 @@
         <true/>
         <key>NSHumanReadableCopyright</key>
         <string>${MACOSX_BUNDLE_COPYRIGHT}</string>
+        ${AMIBERRY_MACOS_STORE_PLIST_KEYS}
         <key>LSApplicationCategoryType</key>
-        <string>public.app-category.games</string>
+        <string>public.app-category.entertainment</string>
+        <!-- Game Mode came with the games category; Entertainment keeps it this way. -->
+        <key>LSSupportsGameMode</key>
+        <true/>
 		<key>CFBundleDocumentTypes</key>
 		<array>
 			<dict>

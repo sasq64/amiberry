@@ -1,4 +1,4 @@
-// dear imgui, v1.92.9 WIP
+// dear imgui, v1.93.0 WIP
 // (drawing and font code)
 
 /*
@@ -105,7 +105,7 @@ namespace IMGUI_STB_NAMESPACE
 #pragma warning (push)
 #pragma warning (disable: 4456)                             // declaration of 'xx' hides previous local declaration
 #pragma warning (disable: 6011)                             // (stb_rectpack) Dereferencing NULL pointer 'cur->next'.
-#pragma warning (disable: 5262)                             // (stb_truetype) implicit fall-through occurs here; are you missing a break statement? 
+#pragma warning (disable: 5262)                             // (stb_truetype) implicit fall-through occurs here; are you missing a break statement?
 #pragma warning (disable: 6385)                             // (stb_truetype) Reading invalid data from 'buffer':  the readable size is '_Old_3`kernel_width' bytes, but '3' bytes may be read.
 #pragma warning (disable: 28182)                            // (stb_rectpack) Dereferencing NULL pointer. 'cur' contains the same NULL value as 'cur->next' did.
 #endif
@@ -336,9 +336,9 @@ void ImGui::StyleColorsLight(ImGuiStyle* dst)
     colors[ImGuiCol_FrameBg]                = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
     colors[ImGuiCol_FrameBgHovered]         = ImVec4(0.26f, 0.59f, 0.98f, 0.40f);
     colors[ImGuiCol_FrameBgActive]          = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
-    colors[ImGuiCol_TitleBg]                = ImVec4(0.96f, 0.96f, 0.96f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]          = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(1.00f, 1.00f, 1.00f, 0.51f);
+    colors[ImGuiCol_TitleBg]                = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]          = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(1.00f, 1.00f, 1.00f, 0.43f);
     colors[ImGuiCol_MenuBarBg]              = ImVec4(0.86f, 0.86f, 0.86f, 1.00f);
     colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.98f, 0.98f, 0.98f, 0.53f);
     colors[ImGuiCol_ScrollbarGrab]          = ImVec4(0.69f, 0.69f, 0.69f, 0.80f);
@@ -396,7 +396,6 @@ void ImGui::StyleColorsLight(ImGuiStyle* dst)
 ImDrawListSharedData::ImDrawListSharedData()
 {
     memset((void*)this, 0, sizeof(*this));
-    InitialFringeScale = 1.0f;
     for (int i = 0; i < IM_COUNTOF(ArcFastVtx); i++)
     {
         const float a = ((float)i * 2 * IM_PI) / (float)IM_COUNTOF(ArcFastVtx);
@@ -473,7 +472,7 @@ void ImDrawList::_ResetForNewFrame()
     _Path.resize(0);
     _Splitter.Clear();
     CmdBuffer.push_back(ImDrawCmd());
-    _FringeScale = _Data->InitialFringeScale;
+    // Caller needs to bet _SetPixelDensity() as well.
 }
 
 void ImDrawList::_ClearFreeMemory()
@@ -655,6 +654,7 @@ void ImDrawList::_OnChangedVtxOffset()
 int ImDrawList::_CalcCircleAutoSegmentCount(float radius) const
 {
     // Automatic segment count
+    radius *= _InvFringeScale;
     const int radius_idx = (int)(radius + 0.999f); // ceil to never reduce accuracy
     if (radius_idx >= 0 && radius_idx < IM_COUNTOF(_Data->CircleSegmentCounts))
         return _Data->CircleSegmentCounts[radius_idx]; // Use cached value
@@ -699,7 +699,7 @@ void ImDrawList::PushTexture(ImTextureRef tex_ref)
     _TextureStack.push_back(tex_ref);
     _CmdHeader.TexRef = tex_ref;
     if (tex_ref._TexData != NULL)
-        IM_ASSERT(tex_ref._TexData->WantDestroyNextFrame == false);
+        IM_ASSERT(tex_ref._TexData->Status != ImTextureStatus_WantDestroy && tex_ref._TexData->Status != ImTextureStatus_Destroyed);
     _OnChangedTexture();
 }
 
@@ -718,6 +718,13 @@ void ImDrawList::_SetTexture(ImTextureRef tex_ref)
     _CmdHeader.TexRef = tex_ref;
     _TextureStack.back() = tex_ref;
     _OnChangedTexture();
+}
+
+void ImDrawList::_SetPixelDensity(float pixel_density)
+{
+    IM_ASSERT(pixel_density > 0.0f);
+    _FringeScale = 1.0f / pixel_density;
+    _InvFringeScale = pixel_density;
 }
 
 // Reserve space for a number of vertices and indices.
@@ -1370,7 +1377,7 @@ ImVec2 ImBezierQuadraticCalc(const ImVec2& p1, const ImVec2& p2, const ImVec2& p
 }
 
 // Closely mimics ImBezierCubicClosestPointCasteljau() in imgui.cpp
-static void PathBezierCubicCurveToCasteljau(ImVector<ImVec2>* path, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float tess_tol, int level)
+static void PathBezierCubicCurveToCasteljau(ImVector<ImVec2>* path, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float max_error_sqr, int level)
 {
     float dx = x4 - x1;
     float dy = y4 - y1;
@@ -1378,7 +1385,7 @@ static void PathBezierCubicCurveToCasteljau(ImVector<ImVec2>* path, float x1, fl
     float d3 = (x3 - x4) * dy - (y3 - y4) * dx;
     d2 = (d2 >= 0) ? d2 : -d2;
     d3 = (d3 >= 0) ? d3 : -d3;
-    if ((d2 + d3) * (d2 + d3) < tess_tol * (dx * dx + dy * dy))
+    if ((d2 + d3) * (d2 + d3) < max_error_sqr * (dx * dx + dy * dy))
     {
         path->push_back(ImVec2(x4, y4));
     }
@@ -1390,16 +1397,16 @@ static void PathBezierCubicCurveToCasteljau(ImVector<ImVec2>* path, float x1, fl
         float x123 = (x12 + x23) * 0.5f, y123 = (y12 + y23) * 0.5f;
         float x234 = (x23 + x34) * 0.5f, y234 = (y23 + y34) * 0.5f;
         float x1234 = (x123 + x234) * 0.5f, y1234 = (y123 + y234) * 0.5f;
-        PathBezierCubicCurveToCasteljau(path, x1, y1, x12, y12, x123, y123, x1234, y1234, tess_tol, level + 1);
-        PathBezierCubicCurveToCasteljau(path, x1234, y1234, x234, y234, x34, y34, x4, y4, tess_tol, level + 1);
+        PathBezierCubicCurveToCasteljau(path, x1, y1, x12, y12, x123, y123, x1234, y1234, max_error_sqr, level + 1);
+        PathBezierCubicCurveToCasteljau(path, x1234, y1234, x234, y234, x34, y34, x4, y4, max_error_sqr, level + 1);
     }
 }
 
-static void PathBezierQuadraticCurveToCasteljau(ImVector<ImVec2>* path, float x1, float y1, float x2, float y2, float x3, float y3, float tess_tol, int level)
+static void PathBezierQuadraticCurveToCasteljau(ImVector<ImVec2>* path, float x1, float y1, float x2, float y2, float x3, float y3, float max_error_sqr, int level)
 {
     float dx = x3 - x1, dy = y3 - y1;
     float det = (x2 - x3) * dy - (y2 - y3) * dx;
-    if (det * det * 4.0f < tess_tol * (dx * dx + dy * dy))
+    if (det * det * 4.0f < max_error_sqr * (dx * dx + dy * dy))
     {
         path->push_back(ImVec2(x3, y3));
     }
@@ -1408,8 +1415,8 @@ static void PathBezierQuadraticCurveToCasteljau(ImVector<ImVec2>* path, float x1
         float x12 = (x1 + x2) * 0.5f, y12 = (y1 + y2) * 0.5f;
         float x23 = (x2 + x3) * 0.5f, y23 = (y2 + y3) * 0.5f;
         float x123 = (x12 + x23) * 0.5f, y123 = (y12 + y23) * 0.5f;
-        PathBezierQuadraticCurveToCasteljau(path, x1, y1, x12, y12, x123, y123, tess_tol, level + 1);
-        PathBezierQuadraticCurveToCasteljau(path, x123, y123, x23, y23, x3, y3, tess_tol, level + 1);
+        PathBezierQuadraticCurveToCasteljau(path, x1, y1, x12, y12, x123, y123, max_error_sqr, level + 1);
+        PathBezierQuadraticCurveToCasteljau(path, x123, y123, x23, y23, x3, y3, max_error_sqr, level + 1);
     }
 }
 
@@ -1418,8 +1425,9 @@ void ImDrawList::PathBezierCubicCurveTo(const ImVec2& p2, const ImVec2& p3, cons
     ImVec2 p1 = _Path.back();
     if (num_segments == 0)
     {
-        IM_ASSERT(_Data->CurveTessellationTol > 0.0f);
-        PathBezierCubicCurveToCasteljau(&_Path, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y, _Data->CurveTessellationTol, 0); // Auto-tessellated
+        IM_ASSERT(_Data->CurveTessellationMaxError > 0.0f);
+        float max_error_sqr = (_Data->CurveTessellationMaxError * _FringeScale) * (_Data->CurveTessellationMaxError * _FringeScale);
+        PathBezierCubicCurveToCasteljau(&_Path, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y, max_error_sqr, 0); // Auto-tessellated
     }
     else
     {
@@ -1434,8 +1442,9 @@ void ImDrawList::PathBezierQuadraticCurveTo(const ImVec2& p2, const ImVec2& p3, 
     ImVec2 p1 = _Path.back();
     if (num_segments == 0)
     {
-        IM_ASSERT(_Data->CurveTessellationTol > 0.0f);
-        PathBezierQuadraticCurveToCasteljau(&_Path, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, _Data->CurveTessellationTol, 0);// Auto-tessellated
+        IM_ASSERT(_Data->CurveTessellationMaxError > 0.0f);
+        float max_error_sqr = (_Data->CurveTessellationMaxError * _FringeScale) * (_Data->CurveTessellationMaxError * _FringeScale);
+        PathBezierQuadraticCurveToCasteljau(&_Path, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, max_error_sqr, 0);// Auto-tessellated
     }
     else
     {
@@ -2280,7 +2289,7 @@ void ImDrawListSplitter::SetCurrentChannel(ImDrawList* draw_list, int idx)
 void ImDrawData::Clear()
 {
     Valid = false;
-    TotalIdxCount = TotalVtxCount = 0;
+    FrameCount = TotalIdxCount = TotalVtxCount = 0;
     CmdLists.resize(0); // The ImDrawList are NOT owned by ImDrawData but e.g. by ImGuiContext, so we don't clear them.
     DisplayPos = DisplaySize = FramebufferScale = ImVec2(0.0f, 0.0f);
     OwnerViewport = NULL;
@@ -2340,9 +2349,6 @@ void ImDrawData::AddDrawList(ImDrawList* draw_list)
 {
     draw_list->_PopUnusedDrawCmd();
     ImGui::AddDrawListToDrawDataEx(this, &CmdLists, draw_list);
-#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
-    CmdListsCount = CmdLists.Size;
-#endif
 }
 
 // For backward compatibility: convert all buffers from indexed to de-indexed, in case you cannot render indexed. Note: this is slow and most likely a waste of resources. Always prefer indexed rendering!
@@ -2866,13 +2872,14 @@ bool ImTextureDataUpdateNewFrame(ImTextureData* tex)
     // If a texture has never reached the backend, they don't need to know about it.
     // (note: backends between 1.92.0 and 1.92.4 could set an already destroyed texture to ImTextureStatus_WantDestroy
     //  when invalidating graphics objects twice, which would previously remove it from the list and crash.)
-    if (tex->Status == ImTextureStatus_WantDestroy && tex->TexID == ImTextureID_Invalid && tex->BackendUserData == NULL)
+    if (tex->Status == ImTextureStatus_WantDestroy && tex->TexID == ImTextureID_Invalid && tex->BackendUserData == NULL && tex->QueueUserData == NULL)
         tex->Status = ImTextureStatus_Destroyed;
 
     // Process texture being destroyed
     if (tex->Status == ImTextureStatus_Destroyed)
     {
         IM_ASSERT(tex->TexID == ImTextureID_Invalid && tex->BackendUserData == NULL && "Backend set texture Status to Destroyed but did not clear TexID/BackendUserData!");
+        IM_ASSERT(tex->QueueUserData == NULL && "Texture queue set Status to Destroyed but did not clear QueueUserData!");
         if (tex->WantDestroyNextFrame)
             remove_from_list = true; // Destroy was scheduled by us
         else
@@ -3116,7 +3123,7 @@ ImFont* ImFontAtlas::AddFont(const ImFontConfig* font_cfg_in)
     }
     if (font_cfg->FontLoader != NULL)
     {
-        IM_ASSERT(font_cfg->FontLoader->FontBakedLoadGlyph != NULL);
+        IM_ASSERT(font_cfg->FontLoader->FontSrcGetGlyphIndexFromCodepoint != NULL && font_cfg->FontLoader->FontBakedLoadGlyph != NULL);
         IM_ASSERT(font_cfg->FontLoader->LoaderInit == NULL && font_cfg->FontLoader->LoaderShutdown == NULL); // FIXME-NEWATLAS: Unsupported yet.
     }
     //                             | Target w/ Implicit RefSize | Target w/ Explicit RefSize |
@@ -3161,20 +3168,24 @@ static void         Decode85(const unsigned char* src, unsigned char* dst)
     }
 }
 #if !defined(IMGUI_DISABLE_DEFAULT_FONT) && !defined(IMGUI_DISABLE_DEFAULT_FONT_BITMAP)
-static const char* GetDefaultCompressedFontDataProggyClean(int* out_size);
+const char* ImGui_GetDefaultCompressedFontDataProggyClean(int* out_size);
 #endif
 #if !defined(IMGUI_DISABLE_DEFAULT_FONT) && !defined(IMGUI_DISABLE_DEFAULT_FONT_VECTOR)
-static const char* GetDefaultCompressedFontDataProggyForever(int* out_size);
+const char* ImGui_GetDefaultCompressedFontDataProggyForever(int* out_size);
 #endif
 
 // This duplicates some of the logic in UpdateFontsNewFrame() which is a bit chicken-and-eggy/tricky to extract due to variety of codepaths and possible initialization ordering.
 static float GetExpectedContextFontSize(ImGuiContext* ctx)
 {
-    return ((ctx->Style.FontSizeBase > 0.0f) ? ctx->Style.FontSizeBase : 13.0f) * ctx->Style.FontScaleMain * ctx->Style.FontScaleDpi;
+    float fb_scale = (ctx->IO.DisplayFramebufferScale.x != 0.0f) ? ctx->IO.DisplayFramebufferScale.x : 1.0f;
+    if (ctx->IO.DisplayFramebufferScale.x == 1.0f && ctx->IO.DisplaySize.x <= 0.0f && ctx->IO.ConfigMacOSXBehaviors)
+        fb_scale = 2.0f; // If called before backend had a chance to init DisplayFramebufferScale. default to expecting Retina.
+    float scale = ctx->Style.FontScaleMain * ctx->Style.FontScaleDpi * fb_scale;
+    return ((ctx->Style.FontSizeBase > 0.0f) ? ctx->Style.FontSizeBase : 13.0f) * scale;
 }
 
 // Legacy function with heuristic to select Pixel or Vector font.
-// The selection is based on (style.FontSizeBase * style.FontScaleMain * style.FontScaleDpi) reaching a small threshold at the time of adding the default font.
+// The selection is based on (style.FontSizeBase * style.FontScaleMain * style.FontScaleDpi * io.DisplayFramebufferScale) reaching a small threshold at the time of adding the default font.
 // Prefer calling AddFontDefaultVector() or AddFontDefaultBitmap() based on your own logic.
 ImFont* ImFontAtlas::AddFontDefault(const ImFontConfig* font_cfg)
 {
@@ -3203,7 +3214,7 @@ ImFont* ImFontAtlas::AddFontDefaultBitmap(const ImFontConfig* font_cfg_template)
     font_cfg.GlyphOffset.y += 1.0f * (font_cfg.SizePixels / 13.0f); // Add +1 offset per 13 units
 
     int ttf_compressed_size = 0;
-    const char* ttf_compressed = GetDefaultCompressedFontDataProggyClean(&ttf_compressed_size);
+    const char* ttf_compressed = ImGui_GetDefaultCompressedFontDataProggyClean(&ttf_compressed_size);
     return AddFontFromMemoryCompressedTTF(ttf_compressed, ttf_compressed_size, font_cfg.SizePixels, &font_cfg);
 #else
     IM_ASSERT(0 && "Function is disabled in this build.");
@@ -3231,7 +3242,7 @@ ImFont* ImFontAtlas::AddFontDefaultVector(const ImFontConfig* font_cfg_template)
     font_cfg.GlyphOffset.y += 0.5f * (font_cfg.SizePixels / 16.0f); // Closer match ProggyClean + avoid descenders going too high (with current code).
 
     int ttf_compressed_size = 0;
-    const char* ttf_compressed = GetDefaultCompressedFontDataProggyForever(&ttf_compressed_size);
+    const char* ttf_compressed = ImGui_GetDefaultCompressedFontDataProggyForever(&ttf_compressed_size);
     return AddFontFromMemoryCompressedTTF(ttf_compressed, ttf_compressed_size, font_cfg.SizePixels, &font_cfg);
 #else
     IM_ASSERT(0 && "Function is disabled in this build.");
@@ -4551,11 +4562,46 @@ static void ImFontBaked_BuildGrowIndex(ImFontBaked* baked, int new_size)
     baked->IndexLookup.resize(new_size, IM_FONTGLYPH_INDEX_UNUSED);
 }
 
-static void ImFontAtlas_FontHookRemapCodepoint(ImFontAtlas* atlas, ImFont* font, ImWchar* c)
+// Remap a codepoint to another codepoint
+void ImFont::AddRemapCodepoint(ImWchar from_codepoint, ImWchar to_codepoint)
+{
+    ImU32 data = (ImU32)to_codepoint;
+    IM_ASSERT((data & (1u << 31)) == 0);
+    RemapPairs.SetInt((ImGuiID)from_codepoint, (int)data);
+}
+
+static const int IMFONT_REMAPVALUE_GLYPHIDX_SHIFT   = 0;
+static const int IMFONT_REMAPVALUE_GLYPHIDX_MASK    = 0xFFFF;
+static const int IMFONT_REMAPVALUE_FONTSRCIDX_SHIFT = 16;
+static const int IMFONT_REMAPVALUE_FONTSRCIDX_MASK  = 0xFF0000;
+
+// Remap a codepoint to a raw glyph index inside the font. Allows accessing glyphs which are not mapped to codepoints. (#9559)
+//  font_src_idx = index in font->Sources[], or -1 for last added source.
+//  glyph_idx    = index in TTF or OTF file.
+void ImFont::AddRemapCodepointToGlyphIndex(ImWchar from_codepoint, int font_src_idx, int glyph_idx)
+{
+    if (font_src_idx == -1)
+        font_src_idx = Sources.Size - 1;
+    IM_ASSERT(font_src_idx >= 0 && font_src_idx < Sources.Size && ((font_src_idx << IMFONT_REMAPVALUE_FONTSRCIDX_SHIFT) & ~IMFONT_REMAPVALUE_FONTSRCIDX_MASK) == 0);
+    IM_ASSERT(glyph_idx >= 0 && ((glyph_idx << IMFONT_REMAPVALUE_GLYPHIDX_SHIFT) & ~IMFONT_REMAPVALUE_GLYPHIDX_MASK) == 0);
+    ImU32 data = ((ImU32)glyph_idx << IMFONT_REMAPVALUE_GLYPHIDX_SHIFT) | (font_src_idx << IMFONT_REMAPVALUE_FONTSRCIDX_SHIFT) | (1u << 31);
+    RemapPairs.SetInt((ImGuiID)from_codepoint, (int)data);
+}
+
+static void ImFontAtlas_FontHookRemapCodepoint(ImFontAtlas* atlas, ImFont* font, ImWchar codepoint, ImWchar* out_codepoint, int* out_font_src_idx, int* out_glyph_idx)
 {
     IM_UNUSED(atlas);
-    if (font->RemapPairs.Data.Size != 0)
-        *c = (ImWchar)font->RemapPairs.GetInt((ImGuiID)*c, (int)*c);
+    if (font->RemapPairs.Data.Size == 0)
+        return;
+    ImU32 data = (ImU32)font->RemapPairs.GetInt((ImGuiID)codepoint, (int)codepoint);
+    if (data & (1u << 31))
+    {
+        *out_codepoint = (ImWchar)-1;
+        *out_font_src_idx = (data & IMFONT_REMAPVALUE_FONTSRCIDX_MASK) >> IMFONT_REMAPVALUE_FONTSRCIDX_SHIFT;
+        *out_glyph_idx = (data & IMFONT_REMAPVALUE_GLYPHIDX_MASK) >> IMFONT_REMAPVALUE_GLYPHIDX_SHIFT;
+        return;
+    }
+    *out_codepoint = (ImWchar)data;
 }
 
 static ImFontGlyph* ImFontBaked_BuildLoadGlyph(ImFontBaked* baked, ImWchar codepoint, float* only_load_advance_x)
@@ -4572,7 +4618,8 @@ static ImFontGlyph* ImFontBaked_BuildLoadGlyph(ImFontBaked* baked, ImWchar codep
 
     // User remapping hooks
     ImWchar src_codepoint = codepoint;
-    ImFontAtlas_FontHookRemapCodepoint(atlas, font, &codepoint);
+    int src_font_idx = -1, src_glyph_idx = -1;
+    ImFontAtlas_FontHookRemapCodepoint(atlas, font, codepoint, &src_codepoint, &src_font_idx, &src_glyph_idx);
 
     //char utf8_buf[5];
     //IMGUI_DEBUG_LOG("[font] BuildLoadGlyph U+%04X (%s)\n", (unsigned int)codepoint, ImTextCharToUtf8(utf8_buf, (unsigned int)codepoint));
@@ -4585,35 +4632,47 @@ static ImFontGlyph* ImFontBaked_BuildLoadGlyph(ImFontBaked* baked, ImWchar codep
 
     // Call backend
     char* loader_user_data_p = (char*)baked->FontLoaderDatas;
-    int src_n = 0;
-    for (ImFontConfig* src : font->Sources)
+    char* loader_user_data_p_next = NULL;
+    for (int src_n = 0; src_n < font->Sources.Size; src_n++, loader_user_data_p = loader_user_data_p_next)
     {
+        ImFontConfig* src = font->Sources[src_n];
         const ImFontLoader* loader = src->FontLoader ? src->FontLoader : atlas->FontLoader;
-        if (!src->GlyphExcludeRanges || ImFontAtlasBuildAcceptCodepointForSource(src, codepoint))
+        loader_user_data_p_next = loader_user_data_p + loader->FontBakedSrcLoaderDataSize;
+
+        int glyph_index;
+        if (src_codepoint != (ImWchar)-1)
         {
-            if (only_load_advance_x == NULL)
-            {
-                ImFontGlyph glyph_buf;
-                if (loader->FontBakedLoadGlyph(atlas, src, baked, loader_user_data_p, codepoint, &glyph_buf, NULL))
-                {
-                    // FIXME: Add hooks for e.g. #7962
-                    glyph_buf.Codepoint = src_codepoint;
-                    glyph_buf.SourceIdx = src_n;
-                    return ImFontAtlasBakedAddFontGlyph(atlas, baked, src, &glyph_buf);
-                }
-            }
-            else
-            {
-                // Special mode but only loading glyphs metrics. Will rasterize and pack later.
-                if (loader->FontBakedLoadGlyph(atlas, src, baked, loader_user_data_p, codepoint, NULL, only_load_advance_x))
-                {
-                    ImFontAtlasBakedAddFontGlyphAdvancedX(atlas, baked, src, codepoint, *only_load_advance_x);
-                    return NULL;
-                }
-            }
+            if (src->GlyphExcludeRanges && !ImFontAtlasBuildAcceptCodepointForSource(src, src_codepoint))
+                continue;
+            glyph_index = loader->FontSrcGetGlyphIndexFromCodepoint(atlas, src, src_codepoint);
         }
-        loader_user_data_p += loader->FontBakedSrcLoaderDataSize;
-        src_n++;
+        else
+        {
+            if (src_n != src_font_idx)
+                continue;
+            glyph_index = src_glyph_idx;
+        }
+        if (glyph_index == 0)
+            continue;
+
+        if (only_load_advance_x == NULL)
+        {
+            ImFontGlyph glyph_buf;
+            glyph_buf.Codepoint = codepoint;
+            if (!loader->FontBakedLoadGlyph(atlas, src, baked, loader_user_data_p, glyph_index, &glyph_buf, NULL))
+                continue;
+            // FIXME: Add hooks for e.g. #7962
+            glyph_buf.SourceIdx = src_n;
+            return ImFontAtlasBakedAddFontGlyph(atlas, baked, src, &glyph_buf);
+        }
+        else
+        {
+            // Special mode but only loading glyphs metrics. Will rasterize and pack later.
+            if (!loader->FontBakedLoadGlyph(atlas, src, baked, loader_user_data_p, glyph_index, NULL, only_load_advance_x))
+                continue;
+            ImFontAtlasBakedAddFontGlyphAdvancedX(atlas, baked, src, codepoint, *only_load_advance_x);
+            return NULL;
+        }
     }
 
     // Lazily load fallback glyph
@@ -4697,10 +4756,8 @@ struct ImGui_ImplStbTrueType_FontSrcData
     float           ScaleFactor;
 };
 
-static bool ImGui_ImplStbTrueType_FontSrcInit(ImFontAtlas* atlas, ImFontConfig* src)
+static bool ImGui_ImplStbTrueType_FontSrcInit(ImFontAtlas*, ImFontConfig* src)
 {
-    IM_UNUSED(atlas);
-
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = IM_NEW(ImGui_ImplStbTrueType_FontSrcData);
     IM_ASSERT(src->FontLoaderData == NULL);
 
@@ -4732,29 +4789,27 @@ static bool ImGui_ImplStbTrueType_FontSrcInit(ImFontAtlas* atlas, ImFontConfig* 
     return true;
 }
 
-static void ImGui_ImplStbTrueType_FontSrcDestroy(ImFontAtlas* atlas, ImFontConfig* src)
+static void ImGui_ImplStbTrueType_FontSrcDestroy(ImFontAtlas*, ImFontConfig* src)
 {
-    IM_UNUSED(atlas);
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
     IM_DELETE(bd_font_data);
     src->FontLoaderData = NULL;
 }
 
-static bool ImGui_ImplStbTrueType_FontSrcContainsGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImWchar codepoint)
+static int ImGui_ImplStbTrueType_FontSrcGetGlyphIndexFromCodepoint(ImFontAtlas*, ImFontConfig* src, ImWchar codepoint)
 {
-    IM_UNUSED(atlas);
-
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
-    IM_ASSERT(bd_font_data != NULL);
-
-    int glyph_index = stbtt_FindGlyphIndex(&bd_font_data->FontInfo, (int)codepoint);
-    return glyph_index != 0;
+    return stbtt_FindGlyphIndex(&bd_font_data->FontInfo, (int)codepoint);
 }
 
-static bool ImGui_ImplStbTrueType_FontBakedInit(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void*)
+static bool ImGui_ImplStbTrueType_FontSrcContainsGlyph(ImFontAtlas*, ImFontConfig* src, int glyph_index)
 {
-    IM_UNUSED(atlas);
+    ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
+    return glyph_index > 0 && glyph_index < bd_font_data->FontInfo.numGlyphs;
+}
 
+static bool ImGui_ImplStbTrueType_FontBakedInit(ImFontAtlas*, ImFontConfig* src, ImFontBaked* baked, void*)
+{
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
     if (src->MergeMode == false)
     {
@@ -4765,18 +4820,17 @@ static bool ImGui_ImplStbTrueType_FontBakedInit(ImFontAtlas* atlas, ImFontConfig
         stbtt_GetFontVMetrics(&bd_font_data->FontInfo, &unscaled_ascent, &unscaled_descent, &unscaled_line_gap);
         baked->Ascent = ImCeil(unscaled_ascent * scale_for_layout);
         baked->Descent = ImFloor(unscaled_descent * scale_for_layout);
+        // FIXME: round to rasterizer density? (#9348)
     }
     return true;
 }
 
-static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void*, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x)
+static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void*, int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x)
 {
     // Search for first font which has the glyph
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
     IM_ASSERT(bd_font_data);
-    int glyph_index = stbtt_FindGlyphIndex(&bd_font_data->FontInfo, (int)codepoint);
-    if (glyph_index == 0)
-        return false;
+    IM_ASSERT(glyph_index != 0);
 
     // Fonts unit to pixels
     int oversample_h, oversample_v;
@@ -4801,7 +4855,6 @@ static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontC
     }
 
     // Prepare glyph
-    out_glyph->Codepoint = codepoint;
     out_glyph->AdvanceX = advance * scale_for_layout;
 
     // Pack and retrieve position inside texture atlas
@@ -4863,6 +4916,7 @@ const ImFontLoader* ImFontAtlasGetFontLoaderForStbTruetype()
     loader.Name = "stb_truetype";
     loader.FontSrcInit = ImGui_ImplStbTrueType_FontSrcInit;
     loader.FontSrcDestroy = ImGui_ImplStbTrueType_FontSrcDestroy;
+    loader.FontSrcGetGlyphIndexFromCodepoint = ImGui_ImplStbTrueType_FontSrcGetGlyphIndexFromCodepoint;
     loader.FontSrcContainsGlyph = ImGui_ImplStbTrueType_FontSrcContainsGlyph;
     loader.FontBakedInit = ImGui_ImplStbTrueType_FontBakedInit;
     loader.FontBakedDestroy = NULL;
@@ -5336,11 +5390,6 @@ void ImFontAtlasBakedSetFontGlyphBitmap(ImFontAtlas* atlas, ImFontBaked* baked, 
     ImFontAtlasTextureBlockQueueUpload(atlas, tex, r->x, r->y, r->w, r->h);
 }
 
-void ImFont::AddRemapChar(ImWchar from_codepoint, ImWchar to_codepoint)
-{
-    RemapPairs.SetInt((ImGuiID)from_codepoint, (int)to_codepoint);
-}
-
 // Find glyph, load if necessary, return fallback if missing
 ImFontGlyph* ImFontBaked::FindGlyph(ImWchar c)
 {
@@ -5390,11 +5439,19 @@ bool ImFontBaked::IsGlyphLoaded(ImWchar c)
 bool ImFont::IsGlyphInFont(ImWchar c)
 {
     ImFontAtlas* atlas = OwnerAtlas;
-    ImFontAtlas_FontHookRemapCodepoint(atlas, this, &c);
+    ImWchar src_codepoint = c;
+    int src_font_idx = -1, src_glyph_idx = -1;
+    ImFontAtlas_FontHookRemapCodepoint(atlas, this, c, &src_codepoint, &src_font_idx, &src_glyph_idx);
+    if (src_font_idx != -1)
+    {
+        ImFontConfig* src = Sources[src_font_idx];
+        const ImFontLoader* loader = src->FontLoader ? src->FontLoader : atlas->FontLoader;
+        return loader->FontSrcContainsGlyph ? loader->FontSrcContainsGlyph(atlas, src, src_glyph_idx) : false;
+    }
     for (ImFontConfig* src : Sources)
     {
         const ImFontLoader* loader = src->FontLoader ? src->FontLoader : atlas->FontLoader;
-        if (loader->FontSrcContainsGlyph != NULL && loader->FontSrcContainsGlyph(atlas, src, c))
+        if (loader->FontSrcGetGlyphIndexFromCodepoint(atlas, src, c) != 0)
             return true;
     }
     return false;
@@ -6199,26 +6256,33 @@ ImDrawFlags ImGui::CalcRoundingFlagsForRectInRect(const ImRect& r_in, const ImRe
 // Helper for ColorPicker4()
 // NB: This is rather brittle and will show artifact when rounding this enabled if rounded corners overlap multiple cells. Caller currently responsible for avoiding that.
 // Spent a non reasonable amount of time trying to getting this right for ColorButton with rounding+anti-aliasing+ImGuiColorEditFlags_HalfAlphaPreview flag + various grid sizes and offsets, and eventually gave up... probably more reasonable to disable rounding altogether.
-// FIXME: uses ImGui::GetColorU32
-void ImGui::RenderColorRectWithAlphaCheckerboard(ImDrawList* draw_list, ImVec2 p_min, ImVec2 p_max, ImU32 col, float grid_step, ImVec2 grid_off, float rounding, ImDrawFlags flags)
+void ImGui::RenderColorRectWithAlphaCheckerboard(ImDrawList* draw_list, ImVec2 p_min, ImVec2 p_max, ImU32 col, float alpha, float grid_step, ImVec2 grid_off, float rounding, ImDrawFlags flags)
 {
     if ((flags & ImDrawFlags_RoundCornersMask_) == 0)
-        flags = ImDrawFlags_RoundCornersDefault_;
+        flags = ImDrawFlags_RoundCornersAll;
     if (((col & IM_COL32_A_MASK) >> IM_COL32_A_SHIFT) < 0xFF)
     {
-        ImU32 col_bg1 = GetColorU32(ImAlphaBlendColors(IM_COL32(128, 128, 128, 255), col));
-        ImU32 col_bg2 = GetColorU32(ImAlphaBlendColors(IM_COL32(204, 204, 204, 255), col));
-        draw_list->AddRectFilled(p_min, p_max, col_bg1, rounding, flags);
+        IM_ASSERT(alpha >= 0.0f && alpha <= 1.0f);
+        const ImU32 a_mask = (ImU32)(alpha * 255.0f) << IM_COL32_A_SHIFT;
+        ImU32 col_bg1 = (ImAlphaBlendColors(IM_COL32(128, 128, 128, 255), col) & ~IM_COL32_A_MASK) | a_mask;
+        ImU32 col_bg2 = (ImAlphaBlendColors(IM_COL32(204, 204, 204, 255), col) & ~IM_COL32_A_MASK) | a_mask;
+        const bool dual_layer = (alpha == 1.0f); // Dual layer is faster but incorrect if blending.
+        if (dual_layer)
+            draw_list->AddRectFilled(p_min, p_max, col_bg1, rounding, flags);
 
         int yi = 0;
         for (float y = p_min.y + grid_off.y; y < p_max.y; y += grid_step, yi++)
         {
-            float y1 = ImClamp(y, p_min.y, p_max.y), y2 = ImMin(y + grid_step, p_max.y);
+            float y1 = ImClamp((float)(int)y, p_min.y, p_max.y), y2 = ImMin((float)(int)(y + grid_step), p_max.y);
             if (y2 <= y1)
                 continue;
-            for (float x = p_min.x + grid_off.x + ((yi ^ 1)  & 1) * grid_step; x < p_max.x; x += grid_step * 2.0f)
+
+            const float x_start_off = dual_layer ? (((yi ^ 1) & 1) * grid_step) : 0.0f;
+            const float x_step = dual_layer ? (grid_step * 2.0f) : (grid_step);
+            int xi = 0;
+            for (float x = p_min.x + grid_off.x + x_start_off; x < p_max.x; x += x_step, xi++)
             {
-                float x1 = ImClamp(x, p_min.x, p_max.x), x2 = ImMin(x + grid_step, p_max.x);
+                float x1 = ImClamp((float)(int)x, p_min.x, p_max.x), x2 = ImMin((float)(int)(x + grid_step), p_max.x);
                 if (x2 <= x1)
                     continue;
                 ImDrawFlags cell_flags = ImDrawFlags_RoundCornersNone; // FIXME: Could use CalcRoundingFlagsForRectInRect()
@@ -6227,7 +6291,8 @@ void ImGui::RenderColorRectWithAlphaCheckerboard(ImDrawList* draw_list, ImVec2 p
 
                 // Combine flags
                 cell_flags = (flags == ImDrawFlags_RoundCornersNone || cell_flags == ImDrawFlags_RoundCornersNone) ? ImDrawFlags_RoundCornersNone : (cell_flags & flags);
-                draw_list->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), col_bg2, rounding, cell_flags);
+                ImU32 col_bg = dual_layer ? col_bg2 : (((yi + xi) & 1) ? col_bg2 : col_bg1);
+                draw_list->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), col_bg, rounding, cell_flags);
             }
         }
     }
@@ -6538,7 +6603,7 @@ static const unsigned char proggy_clean_ttf_compressed_data[9583] =
     239,32,57,141,239,32,57,141,239,32,57,141,239,32,57,141,239,32,57,141,239,35,57,102,0,0,5,250,72,249,98,247,
 };
 
-static const char* GetDefaultCompressedFontDataProggyClean(int* out_size)
+const char* ImGui_GetDefaultCompressedFontDataProggyClean(int* out_size)
 {
     *out_size = proggy_clean_ttf_compressed_size;
     return (const char*)proggy_clean_ttf_compressed_data;
@@ -6803,7 +6868,7 @@ static const unsigned char proggy_forever_minimal_ttf_compressed_data[14562] =
     3,36,0,229,13,183,147,132,7,42,175,187,66,0,0,0,0,229,178,59,232,5,250,48,120,202,241,
 };
 
-static const char* GetDefaultCompressedFontDataProggyForever(int* out_size)
+const char* ImGui_GetDefaultCompressedFontDataProggyForever(int* out_size)
 {
     *out_size = proggy_forever_minimal_ttf_compressed_size;
     return (const char*)proggy_forever_minimal_ttf_compressed_data;

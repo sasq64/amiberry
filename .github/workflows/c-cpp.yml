@@ -31,13 +31,14 @@ permissions:
 
 env:
   QEMU_UAE_RELEASE_REPO: BlitterStudio/amiberry-qemu-uae
-  QEMU_UAE_RELEASE_TAG: v11.0.1-amiberry.7
+  QEMU_UAE_RELEASE_TAG: v11.1.3-amiberry.1
   GH_TOKEN: ${{ github.token }}
 
 jobs:
   build-macOS:
+    name: build-macOS-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.arch == 'intel' && 120 || 45 }}
     permissions:
       contents: read
       actions: write
@@ -59,15 +60,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Cache Homebrew
-        if: matrix.arch == 'intel'
-        uses: actions/cache@v5
-        with:
-          path: /usr/local/Homebrew
-          key: ${{ runner.os }}-brew-${{ hashFiles('Brewfile') }}
-          restore-keys: |
-            ${{ runner.os }}-brew-
-
       - name: Fix homebrew in Github Runner
         if: matrix.arch == 'intel'
         run: |
@@ -87,18 +79,27 @@ jobs:
 
           glib_prefix="$(brew --prefix glib)"
           test -f "$glib_prefix/lib/libglib-2.0.0.dylib"
-          test -f "$glib_prefix/lib/libgmodule-2.0.0.dylib"
 
       - name: Install dependencies (Homebrew)
         run: |
-          brew update
           # `brew bundle` installs formulae concurrently, so sdl3 (which depends on
           # cmake) races the cmake entry for the cmake lock and intermittently fails
           # ("a `brew install --formula sdl3` process has already locked .../cmake").
           # Install the shared build dependency first, then retry the bundle once to
           # ride out any remaining transient lock contention.
-          brew install cmake || true
-          brew bundle || { sleep 10; brew bundle; }
+          if [ "${{ matrix.arch }}" = "intel" ]; then
+            # Homebrew no longer builds new Intel bottles. Keep the runner's
+            # installed formulae and show source-build output in the job log.
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            if ! brew list --formula cmake >/dev/null 2>&1; then
+              brew install cmake
+            fi
+            brew bundle --no-upgrade --verbose || { sleep 10; brew bundle --no-upgrade --verbose; }
+          else
+            brew update
+            brew install cmake || true
+            brew bundle || { sleep 10; brew bundle; }
+          fi
 
       - name: Download QEMU-UAE plugin
         run: .github/scripts/download-qemu-uae-plugin.sh qemu-uae-macos-universal.zip
@@ -106,6 +107,31 @@ jobs:
       - name: Build for macOS (${{ matrix.name }})
         run: |
           cmake -B build -DQEMU_UAE_PLUGIN="$QEMU_UAE_PLUGIN" && cmake --build build -j$(sysctl -n hw.ncpu)
+
+      # GPL/LGPL compliance: record which Homebrew libraries this leg's build
+      # actually bundled, at the exact keg versions. The merge job turns the
+      # per-arch scans into the third-party source archive attached to the
+      # release. Tag builds only; PR/branch builds are untouched.
+      - name: Scan bundled third-party libraries (release tags)
+        if: github.ref_type == 'tag'
+        run: |
+          case "${{ matrix.arch }}" in
+            intel) scan_arch=x86_64 ;;
+            *) scan_arch=arm64 ;;
+          esac
+          python3 packaging/sources/collect-third-party-sources.py scan \
+            --app build/Amiberry.app \
+            --variant macos \
+            --arch "$scan_arch" \
+            --out "third-party-scan-${scan_arch}.json"
+
+      - name: Upload third-party scan for the release
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: third-party-scan-${{ matrix.arch }}
+          path: third-party-scan-*.json
+          retention-days: 1
 
       - name: Archive intermediate app bundle
         run: |
@@ -125,6 +151,11 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      # Pull requests from forks get no repository secrets, so signing and
+      # notarization run only where the Apple credentials are available. The
+      # bundle and dependency checks above run for every pull request.
+      SIGN_MACOS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Check out repository code
         uses: actions/checkout@v6
@@ -357,19 +388,46 @@ jobs:
               if ! lipo "$binary" -verify_arch "$arch" >/dev/null 2>&1; then
                 continue
               fi
+              own_id=$(otool -arch "$arch" -D "$binary" 2>/dev/null | sed -n '2p')
               while read -r line; do
-                dep_name=$(echo "$line" | sed -E 's|.*@executable_path/../Frameworks/([^ ]+).*|\1|')
+                dep=$(echo "$line" | awk '{print $1}')
+                [ "$dep" = "$own_id" ] && continue
+                dep_name=$(echo "$dep" | sed -E 's#^(@rpath/|@executable_path/\.\./Frameworks/)##')
+
+                if [ -z "$dep_name" ] || [ "$dep_name" = "$dep" ]; then
+                  continue
+                fi
+
                 if [ ! -f "$UNI_FW/$dep_name" ]; then
                   echo "  MISSING ($arch, $label): $dep_name"
+                  echo "    reference: $dep"
+                  missing_deps=1
+                elif ! lipo "$UNI_FW/$dep_name" -verify_arch "$arch" >/dev/null 2>&1; then
+                  echo "  WRONG ARCHITECTURE ($arch, $label): $dep_name"
                   missing_deps=1
                 fi
-              done < <(otool -arch "$arch" -L "$binary" 2>/dev/null | grep '@executable_path/../Frameworks/' || true)
-              if otool -arch "$arch" -L "$binary" 2>/dev/null | grep -E '/opt/homebrew|/usr/local'; then
-                echo "  EXTERNAL HOMEBREW DEPENDENCY ($arch, $label)"
+              done < <(
+                otool -arch "$arch" -L "$binary" 2>/dev/null |
+                grep -E '@rpath/|@executable_path/../Frameworks/' || true
+              )
+
+              if otool -arch "$arch" -L "$binary" 2>/dev/null |
+                  grep -E '/opt/homebrew|/usr/local|/opt/local'; then
+                echo "  EXTERNAL PACKAGE MANAGER DEPENDENCY ($arch, $label)"
                 missing_deps=1
               fi
             done
           }
+
+          # Bundled dylibs and plugins carry no LC_RPATH of their own; every
+          # @rpath/ reference resolves through the executable's runpath.
+          for arch in x86_64 arm64; do
+            if ! otool -arch "$arch" -l "$MAIN_BIN" | grep -A2 LC_RPATH |
+                grep -qF '@executable_path/../Frameworks/'; then
+              echo "  MISSING LC_RPATH @executable_path/../Frameworks/ ($arch, Amiberry)"
+              missing_deps=1
+            fi
+          done
 
           check_framework_refs "$MAIN_BIN" "Amiberry"
           for dylib in "$UNI_PLUGINS"/*.dylib "$UNI_FW"/*.dylib; do
@@ -378,11 +436,12 @@ jobs:
             check_framework_refs "$dylib" "$(basename "$dylib")"
           done
           if [ "$missing_deps" = "1" ]; then
-            echo "::error::Some dylib references are unresolved or still point at Homebrew paths"
+            echo "::error::Some dylib references are unresolved or still point at Homebrew/MacPorts paths"
             exit 1
           fi
 
       - name: Install the Apple certificate
+        if: env.SIGN_MACOS == 'true'
         env:
           APPLE_DEVID_CERT_BASE64: ${{ secrets.APPLE_DEVID_CERT_BASE64 }}
           APPLE_DEVID_CERT_P12_PASSWORD: ${{ secrets.APPLE_DEVID_CERT_P12_PASSWORD }}
@@ -400,6 +459,7 @@ jobs:
           security list-keychains -d user -s $KEYCHAIN_PATH
 
       - name: Codesign the dylibs
+        if: env.SIGN_MACOS == 'true'
         env:
           CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
         run: |
@@ -415,22 +475,26 @@ jobs:
           done
 
       - name: Codesign the app
+        if: env.SIGN_MACOS == 'true'
         env:
           CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
         run: |
           codesign -s "$CODESIGN_IDENTITY" -f -o runtime,hard --entitlements packaging/macos/Amiberry.entitlements universal-app/Amiberry.app
 
       - name: Verify app entitlements and signature
+        if: env.SIGN_MACOS == 'true'
         run: |
           codesign -d --entitlements :- universal-app/Amiberry.app
           codesign --verify --deep --strict universal-app/Amiberry.app
           echo "Signature verification passed"
 
       - name: Create a zip to send to the notary service
+        if: env.SIGN_MACOS == 'true'
         run: |
           ditto -c -k --keepParent universal-app/Amiberry.app Amiberry-${{ github.sha }}-macOS-universal.zip
 
       - name: Send the file to be notarized by Apple
+        if: env.SIGN_MACOS == 'true'
         run: |
           set -uo pipefail
           ZIP="Amiberry-${{ github.sha }}-macOS-universal.zip"
@@ -456,8 +520,22 @@ jobs:
           fi
 
       - name: Staple the notary receipt to the application bundle
+        if: env.SIGN_MACOS == 'true'
         run: |
-          xcrun stapler staple universal-app/Amiberry.app
+          # Right after notarization is accepted, fetching the ticket from
+          # Apple's CloudKit service can fail ("The network connection was
+          # lost", error 68) until it has propagated: retry with a pause.
+          for attempt in 1 2 3 4 5 6; do
+            if xcrun stapler staple universal-app/Amiberry.app; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::Stapling failed after $attempt attempts"
+              exit 1
+            fi
+            echo "Stapling failed (attempt $attempt); retrying in 30 seconds"
+            sleep 30
+          done
           rm Amiberry-${{ github.sha }}-macOS-universal.zip
 
       - name: Create DMG package
@@ -486,16 +564,42 @@ jobs:
           cp packaging/dmg/AppDMGBackground.tiff "$STAGING/.background/background.tiff"
 
           # Create a writable DMG, apply Finder layout/background, then compress.
+          # A runner's disk image services can briefly refuse a new image with
+          # "Resource busy", so retry the create with backoff.
           RW_DMG="${DMG_NAME}-rw.dmg"
-          hdiutil create -volname "Amiberry" \
-            -srcfolder "$STAGING" \
-            -ov -format UDRW \
-            "$RW_DMG"
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "Amiberry" \
+              -srcfolder "$STAGING" \
+              -ov -format UDRW \
+              "$RW_DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::hdiutil create failed after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
           DEVICE=""
+
+          # Spotlight/QuickLook or diskimages-helper can still hold the
+          # freshly-scripted volume open ("Resource busy", hdiutil exit 16),
+          # so retry with backoff and force-detach only as a last resort.
+          detach_dmg() {
+            local dev="$1" i
+            for i in 1 2 3 4 5; do
+              if hdiutil detach "$dev"; then
+                return 0
+              fi
+              sleep $((i * 5))
+            done
+            hdiutil detach -force "$dev"
+          }
+
           cleanup() {
             if [ -n "$DEVICE" ]; then
-              hdiutil detach "$DEVICE" || true
+              detach_dmg "$DEVICE" || true
             fi
           }
           trap cleanup EXIT
@@ -507,7 +611,7 @@ jobs:
           fi
 
           osascript packaging/dmg/AppDMGSetup.scpt "Amiberry"
-          hdiutil detach "$DEVICE"
+          detach_dmg "$DEVICE"
           DEVICE=""
           trap - EXIT
 
@@ -524,10 +628,45 @@ jobs:
           path: Amiberry-*.dmg
           retention-days: 7
 
+      # GPL/LGPL compliance: build the third-party source archive for this
+      # release from the per-arch scans of the two build legs, and offer it
+      # next to the DMG. Tag builds only.
+      - name: Download third-party scans
+        if: github.ref_type == 'tag'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: third-party-scan-*
+          path: third-party-scans
+          merge-multiple: true
+
+      - name: Collect third-party sources for the release
+        if: github.ref_type == 'tag'
+        env:
+          # For homebrew-core history lookups when a pinned (e.g. Intel) keg
+          # is older than the current formula.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 packaging/sources/collect-third-party-sources.py assemble \
+            --scan third-party-scans/third-party-scan-x86_64.json \
+            --scan third-party-scans/third-party-scan-arm64.json \
+            --tag "${{ github.ref_name }}" \
+            --out "amiberry-${{ github.ref_name }}-third-party-sources.tar.xz"
+
+      - name: Upload third-party sources for the release
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry-third-party-sources
+          path: amiberry-*-third-party-sources.tar.xz
+          retention-days: 7
+
   build-ubuntu:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
-    timeout-minutes: 30
+    # The 24.04-amd64 job also runs the test suite, except the slow settings
+    # tests: test-settings-schema runs the schema test against its package,
+    # and settings-apply.yml runs the apply test nightly.
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: write
@@ -583,6 +722,22 @@ jobs:
             codename: resolute
             extra_cmake_args:
             qemu_uae_asset: qemu-uae-linux-aarch64.tar.xz
+          - name: 26.10-amd64
+            runner: ubuntu-24.04
+            container: ubuntu:26.10
+            artifact_name: amiberry-ubuntu-26.10-amd64
+            sdl_source: apt
+            codename: stonking
+            extra_cmake_args:
+            qemu_uae_asset: qemu-uae-linux-x86_64.tar.xz
+          - name: 26.10-arm64
+            runner: ubuntu-24.04-arm
+            container: ubuntu:26.10
+            artifact_name: amiberry-ubuntu-26.10-arm64
+            sdl_source: apt
+            codename: stonking
+            extra_cmake_args:
+            qemu_uae_asset: qemu-uae-linux-aarch64.tar.xz
     steps:
       - name: Install prerequisites
         run: |
@@ -617,7 +772,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build file zip libflac-dev libmpeg2-4-dev libpng-dev libasound2-dev libmpg123-dev libportmidi-dev libserialport-dev libenet-dev libpcap-dev libzstd-dev libcurl4-openssl-dev nlohmann-json3-dev libdbus-1-dev
+          sudo apt-get install -y build-essential cmake ninja-build file zip libflac-dev libmpeg2-4-dev libpng-dev libwebp-dev libasound2-dev libmpg123-dev libportmidi-dev libserialport-dev libenet-dev libpcap-dev libzstd-dev libcurl4-openssl-dev nlohmann-json3-dev libdbus-1-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
 
       - name: Install SDL3 and SDL3_image
         if: matrix.sdl_source == 'setup-sdl'
@@ -627,9 +782,10 @@ jobs:
         uses: libsdl-org/setup-sdl@4ebea449684c989388fe6bcea0460e300d13a5ae
         with:
           install-linux-dependencies: true
-          version: 3.4.10
-          version-sdl-image: 3.4.4
+          version: 3.4.16
+          version-sdl-image: 3.4.6
           pre-release: false
+          discriminator: ${{ matrix.container }}
 
       - name: Install SDL3 and SDL3_image from apt
         if: matrix.sdl_source == 'apt'
@@ -640,7 +796,7 @@ jobs:
 
       - name: Verify QEMU-UAE plugin dependencies
         run: |
-          for needed in libglib-2.0.so.0 libgmodule-2.0.so.0 libz.so.1; do
+          for needed in libglib-2.0.so.0 libz.so.1; do
             readelf -d "$QEMU_UAE_PLUGIN" | grep -F "Shared library: [$needed]"
           done
 
@@ -659,6 +815,20 @@ jobs:
           export PATH="/usr/lib/ccache:$PATH"
           cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DDISTRO_CODENAME=${{ matrix.codename }} -DQEMU_UAE_PLUGIN="$QEMU_UAE_PLUGIN" && cmake --build build -j$(nproc)
           cpack -G DEB --config build/CPackConfig.cmake
+
+      - name: Run test suite
+        if: matrix.name == '24.04-amd64'
+        env:
+          # The behavioral tests exercise headless early-exit modes only;
+          # the dummy drivers keep SDL initialization display-server-free.
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          LD_LIBRARY_PATH: ${{ steps.sdl.outputs.prefix }}/lib
+        run: |
+          sudo apt-get install -y ripgrep python3 ffmpeg
+          # Retain the compiled /usr installation while relocation tests run its copied binary.
+          sudo cmake --install build
+          tests/run_tests.sh --skip-slow /usr/bin/amiberry
 
       - name: Verify QEMU-UAE plugin in DEB
         run: |
@@ -686,6 +856,255 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: amiberry-*.zip
+
+  test-host-architecture:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Verify the 64-bit host ABI policy
+        run: bash tests/test_host_architecture.sh
+
+  # The test suite's settings schema test (one of tests/run_tests.sh's
+  # SLOW_TESTS) against the Ubuntu 24.04 package, beside the other jobs: it
+  # regenerates the availability, transition and preset tables and loads
+  # every preset level (about 12 minutes). The other slow test, the settings
+  # apply test, runs nightly (settings-apply.yml).
+  test-settings-schema:
+    needs: [build-ubuntu]
+    # Another Ubuntu leg's failure does not stop it; a failed 24.04 leg
+    # leaves no package, and the download fails.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Download Ubuntu 24.04 package
+        uses: actions/download-artifact@v8
+        with:
+          name: amiberry-ubuntu-24.04-amd64
+          path: package
+
+      - name: Install the package
+        run: |
+          apt-get update
+          apt-get install -y python3 unzip
+          cd package
+          # Tag builds upload the package zipped for the release.
+          for archive in *.zip; do
+            if [ -e "$archive" ]; then unzip -o "$archive"; fi
+          done
+          apt-get install -y ./amiberry_*.deb
+
+      - name: Run test_settings_schema.sh
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          AMIBERRY_BIN: /usr/bin/amiberry
+        run: sh tests/test_settings_schema.sh
+
+  build-appimage:
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install AppImage build prerequisites
+        run: |
+          apt-get update
+          # setup-sdl lists SDL releases with the GitHub CLI.
+          apt-get install -y sudo git gh ca-certificates curl build-essential cmake ninja-build pkg-config patchelf binutils file dpkg xz-utils ripgrep python3 ffmpeg libflac-dev libmpeg2-4-dev libpng-dev libwebp-dev libasound2-dev libmpg123-dev libportmidi-dev libserialport-dev libenet-dev libpcap-dev libzstd-dev libcurl4-openssl-dev nlohmann-json3-dev libdbus-1-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
+
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install SDL3 and SDL3_image
+        id: sdl
+        uses: libsdl-org/setup-sdl@4ebea449684c989388fe6bcea0460e300d13a5ae
+        with:
+          install-linux-dependencies: true
+          version: 3.4.16
+          version-sdl-image: 3.4.6
+          pre-release: false
+          discriminator: appimage-${{ matrix.arch }}-ubuntu-22.04
+
+      - name: Resolve AppImage version and channel
+        id: appimage
+        shell: bash
+        run: |
+          base_version=
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*VERSION[[:space:]]+([0-9][0-9.]*) ]]; then
+              base_version="${BASH_REMATCH[1]}"
+              break
+            fi
+          done < CMakeLists.txt
+          [[ -n "$base_version" ]] || { echo "Could not determine CMake project version" >&2; exit 1; }
+
+          channel=stable
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == preview-v* ]]; then
+            version="${GITHUB_REF_NAME#preview-v}"
+            channel=preview
+          elif [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${base_version}-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Build AppImage
+        env:
+          LD_LIBRARY_PATH: ${{ steps.sdl.outputs.prefix }}/lib
+        run: |
+          bash packaging/appimage/build-appimage.sh \
+            --version "${{ steps.appimage.outputs.version }}" \
+            --channel "${{ steps.appimage.outputs.channel }}" \
+            --arch "${{ matrix.arch }}" \
+            --build-dir "build/appimage-${{ matrix.arch }}" \
+            --output-dir dist/appimage \
+            --cmake-arg "-DCMAKE_PREFIX_PATH=${{ steps.sdl.outputs.prefix }}"
+
+      - name: Upload AppImage artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry-appimage-${{ matrix.arch }}
+          path: |
+            dist/appimage/Amiberry-*.AppImage
+            dist/appimage/Amiberry-*.AppImage.zsync
+          retention-days: 7
+
+  smoke-appimage-mount:
+    needs: [build-appimage]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      # The image deliberately uses the host's OpenGL, Wayland client, ALSA and
+      # D-Bus libraries, which the runner images do not all preinstall.
+      - name: Install runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopengl0 libwayland-client0 libasound2t64 libdbus-1-3
+
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: amiberry-appimage-${{ matrix.arch }}
+          path: appimage
+
+      - name: Smoke test mounted AppImage
+        shell: bash
+        run: |
+          shopt -s nullglob
+          images=(appimage/*.AppImage)
+          [[ "${#images[@]}" == 1 ]] || { echo "Expected exactly one AppImage artifact" >&2; exit 1; }
+          bash packaging/appimage/smoke-appimage.sh --image "${images[0]}" --mode mount
+
+  smoke-appimage-extract:
+    needs: [build-appimage]
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            distribution: Fedora
+            container: fedora:latest
+          - arch: x86_64
+            runner: ubuntu-24.04
+            distribution: openSUSE Tumbleweed
+            container: opensuse/tumbleweed
+          - arch: x86_64
+            runner: ubuntu-24.04
+            distribution: Manjaro
+            container: manjarolinux/base:latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            distribution: Fedora
+            container: fedora:latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            distribution: openSUSE Tumbleweed
+            container: opensuse/tumbleweed
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            distribution: Manjaro
+            container: manjarolinux/base:latest
+    steps:
+      - name: Install runtime prerequisites
+        shell: bash
+        run: |
+          case "${{ matrix.distribution }}" in
+            Fedora)
+              dnf install -y ca-certificates bash coreutils grep git libglvnd-opengl libwayland-client alsa-lib dbus-libs
+              ;;
+            "openSUSE Tumbleweed")
+              zypper --non-interactive install -y ca-certificates bash coreutils grep git libglvnd libwayland-client0 libasound2 libdbus-1-3 libcom_err2
+              ;;
+            Manjaro)
+              pacman -Syu --noconfirm --needed ca-certificates bash coreutils grep git libglvnd wayland alsa-lib dbus
+              ;;
+          esac
+
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: amiberry-appimage-${{ matrix.arch }}
+          path: appimage
+
+      - name: Smoke test extracted AppImage on ${{ matrix.distribution }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          images=(appimage/*.AppImage)
+          [[ "${#images[@]}" == 1 ]] || { echo "Expected exactly one AppImage artifact" >&2; exit 1; }
+          bash packaging/appimage/smoke-appimage.sh --image "${images[0]}" --mode extract
 
   build-fedora:
     runs-on: ${{ matrix.runner }}
@@ -726,7 +1145,8 @@ jobs:
           bash -euo pipefail -c '
             QEMU_PLUGIN="$1"
             test -f "$QEMU_PLUGIN"
-            for needed in libglib-2.0.so.0 libgmodule-2.0.so.0 libz.so.1; do
+            dnf install -y ffmpeg-free-devel libwebp-devel
+            for needed in libglib-2.0.so.0 libz.so.1; do
               readelf -d "$QEMU_PLUGIN" | grep -F "Shared library: [$needed]"
             done
             cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DDISTRO_CODENAME=${{ matrix.codename }} -DQEMU_UAE_PLUGIN="$QEMU_PLUGIN"
@@ -756,6 +1176,7 @@ jobs:
         path: amiberry-*.zip
 
   build-debian-amd64:
+    name: build-debian-${{ matrix.name }}-amd64
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -794,7 +1215,9 @@ jobs:
             bash -euo pipefail -c '
               QEMU_PLUGIN="$1"
               test -f "$QEMU_PLUGIN"
-              for needed in libglib-2.0.so.0 libgmodule-2.0.so.0 libz.so.1; do
+              apt-get update
+              apt-get install -y libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libwebp-dev
+              for needed in libglib-2.0.so.0 libz.so.1; do
                 readelf -d "$QEMU_PLUGIN" | grep -F "Shared library: [$needed]"
               done
               cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DDISTRO_CODENAME=${{ matrix.codename }} -DQEMU_UAE_PLUGIN="$QEMU_PLUGIN" ${{ matrix.extra_cmake_args }}
@@ -802,6 +1225,8 @@ jobs:
               cpack -G DEB --config build/CPackConfig.cmake
               dpkg-deb -c /build/amiberry_*.deb | grep -E "/amiberry/qemu-uae\\.so$"
               dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libglib2\\.0-0"
+              dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libavcodec"
+              dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libwebpdemux"
             ' bash "$QEMU_PLUGIN"
 
       - name: Upload artifact
@@ -824,6 +1249,7 @@ jobs:
           path: "amiberry-*.zip"
 
   build-debian-arm64:
+    name: build-debian-${{ matrix.name }}-arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -862,7 +1288,11 @@ jobs:
           bash -euo pipefail -c '
             QEMU_PLUGIN="$1"
             test -f "$QEMU_PLUGIN"
-            for needed in libglib-2.0.so.0 libgmodule-2.0.so.0 libz.so.1; do
+            apt-get update
+            # This job cross-compiles; the FFmpeg and WebP headers and libraries
+            # must be the arm64 ones, or CMake silently drops ZZ9000 media codecs.
+            apt-get install -y libavformat-dev:arm64 libavcodec-dev:arm64 libavutil-dev:arm64 libswscale-dev:arm64 libswresample-dev:arm64 libwebp-dev:arm64
+            for needed in libglib-2.0.so.0 libz.so.1; do
               readelf -d "$QEMU_PLUGIN" | grep -F "Shared library: [$needed]"
             done
             cmake -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-aarch64-linux-gnu.cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DDISTRO_CODENAME=${{ matrix.codename }} -DQEMU_UAE_PLUGIN="$QEMU_PLUGIN" ${{ matrix.extra_cmake_args }}
@@ -870,6 +1300,8 @@ jobs:
             cpack -G DEB --config build/CPackConfig.cmake
             dpkg-deb -c /build/amiberry_*.deb | grep -E "/amiberry/qemu-uae\\.so$"
             dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libglib2\\.0-0"
+            dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libavcodec"
+            dpkg-deb -I /build/amiberry_*.deb control | grep -E "Depends: .*libwebpdemux"
           ' bash "$QEMU_PLUGIN"
 
     - name: Upload artifact
@@ -899,9 +1331,7 @@ jobs:
     runs-on: windows-2025
     # Cold-cache runs (vcpkg + llvm-mingw downloads) finish in ~24 min,
     # warm-cache runs in ~10-15 min — see build-windows-arm64 for comparison.
-    # Release signing can require manual SignPath approval, so keep enough
-    # headroom for the build, signing round-trip, and approval window.
-    timeout-minutes: 120
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: write
@@ -992,6 +1422,9 @@ jobs:
         shell: bash
         run: |
           cmake --build out/build/windows-release -j$NUMBER_OF_PROCESSORS
+          for library in avcodec avformat avutil swresample swscale webp webpdemux; do
+            find out/build/windows-release -maxdepth 1 -iname "*${library}*.dll" -print -quit | grep -q .
+          done
 
       - name: Install (portable layout)
         shell: bash
@@ -999,6 +1432,9 @@ jobs:
           rm -rf out/install/windows-release
           rm -rf out/package/windows-release
           cmake --install out/build/windows-release --prefix out/install/windows-release
+          for library in avcodec avformat avutil swresample swscale webp webpdemux; do
+            find out/install/windows-release -maxdepth 1 -iname "*${library}*.dll" -print -quit | grep -q .
+          done
 
       - name: Package (Portable ZIP)
         shell: bash
@@ -1160,14 +1596,19 @@ jobs:
           Assert-PortablePath "config_path" $expectedConfig
           Assert-PortablePath "settings_dir" $expectedSettings
           Assert-PortablePath "data_dir" $expectedData
-          Assert-PortablePath "plugins_dir" $expectedPlugins
+          if (-not [string]::IsNullOrWhiteSpace($lines["plugins_dir"])) {
+            throw "plugins_dir must be empty in portable mode, got '$($lines["plugins_dir"])'."
+          }
+          Assert-PortablePath "user_plugins_dir" $expectedPlugins
+          Assert-PortablePath "plugin_search_path_0" $expectedPlugins
           Assert-NotUnderBlockedRoots "portable_root"
           Assert-NotUnderBlockedRoots "portable_marker_file"
           Assert-NotUnderBlockedRoots "home_dir"
           Assert-NotUnderBlockedRoots "config_path"
           Assert-NotUnderBlockedRoots "settings_dir"
           Assert-NotUnderBlockedRoots "data_dir"
-          Assert-NotUnderBlockedRoots "plugins_dir"
+          Assert-NotUnderBlockedRoots "user_plugins_dir"
+          Assert-NotUnderBlockedRoots "plugin_search_path_0"
           if (Test-Path (Join-Path $portableDir.FullName "Settings")) {
             throw "--dump-paths should not create Settings in the portable tree."
           }
@@ -1177,6 +1618,26 @@ jobs:
           if (Test-Path (Join-Path $portableDir.FullName "conf")) {
             throw "--dump-paths should not create conf in the portable tree."
           }
+
+          # --dump-config behavioral coverage lives in the shared test script
+          # (also run by the Linux CI leg), so the assertions stay in one
+          # place. It includes the LF-only check that pins the Windows
+          # binary stdout mode.
+          $env:SDL_VIDEODRIVER = "dummy"
+          $env:SDL_AUDIODRIVER = "dummy"
+          $env:AMIBERRY_BIN = $exePath
+          bash tests/test_dump_config.sh
+          if ($LASTEXITCODE -ne 0) {
+            throw "--dump-config behavioral test failed with exit code $LASTEXITCODE."
+          }
+          if (Test-Path (Join-Path $portableDir.FullName "Settings")) {
+            throw "--dump-config should not create Settings in the portable tree."
+          }
+          if (Test-Path (Join-Path $portableDir.FullName "Configurations")) {
+            throw "--dump-config should not create Configurations in the portable tree."
+          }
+          Write-Host "x64 (llvm-mingw) Amiberry.exe ran the --dump-config behavioral test successfully."
+
 
           # x86_64 builds include the JIT, so exercise --jit-selftest from the
           # portable layout. Mirrors the build-windows-arm64 smoke test.
@@ -1192,169 +1653,17 @@ jobs:
           }
           Write-Host "x64 (llvm-mingw) Amiberry.exe ran --jit-selftest successfully."
 
+          # The IPC test starts real emulator instances, which write settings
+          # into the portable tree, so it runs after the tree assertions.
+          bash tests/test_ipc_transport.sh
+          if ($LASTEXITCODE -ne 0) {
+            throw "IPC transport behavioral test failed with exit code $LASTEXITCODE."
+          }
+
       - name: Package (InnoSetup)
         shell: pwsh
         run: |
           cpack -G INNOSETUP --config out/build/windows-release/CPackConfig.cmake
-
-      - name: Detect SignPath configuration
-        id: signpath-config
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          SIGNPATH_TEST_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_TEST_SIGNING_POLICY_SLUG || vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-          SIGNPATH_RELEASE_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_RELEASE_SIGNING_POLICY_SLUG }}
-          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-        run: |
-          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
-            "enabled=false" >> $env:GITHUB_OUTPUT
-            Write-Host "SignPath disabled for pull_request events."
-            exit 0
-          }
-
-          $isReleaseTag = $env:GITHUB_REF_TYPE -eq "tag"
-          if ($isReleaseTag) {
-            $policyKind = "release"
-            $signingPolicySlug = $env:SIGNPATH_RELEASE_SIGNING_POLICY_SLUG
-            $signingPolicySetting = "SIGNPATH_RELEASE_SIGNING_POLICY_SLUG"
-            $waitTimeoutSeconds = "5400"
-          } else {
-            $policyKind = "test"
-            $signingPolicySlug = $env:SIGNPATH_TEST_SIGNING_POLICY_SLUG
-            $signingPolicySetting = "SIGNPATH_TEST_SIGNING_POLICY_SLUG (or legacy SIGNPATH_SIGNING_POLICY_SLUG)"
-            $waitTimeoutSeconds = "1200"
-          }
-
-          $required = [ordered]@{
-            SIGNPATH_API_TOKEN = $env:SIGNPATH_API_TOKEN
-            SIGNPATH_ORGANIZATION_ID = $env:SIGNPATH_ORGANIZATION_ID
-            SIGNPATH_PROJECT_SLUG = $env:SIGNPATH_PROJECT_SLUG
-            SIGNPATH_ARTIFACT_CONFIGURATION_SLUG = $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
-            AMIBERRY_PRODUCT_VERSION = $env:AMIBERRY_PRODUCT_VERSION
-          }
-          $missing = @()
-          foreach ($item in $required.GetEnumerator()) {
-            if ([string]::IsNullOrWhiteSpace($item.Value)) {
-              $missing += $item.Key
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($signingPolicySlug)) {
-            $missing += $signingPolicySetting
-          }
-          $missing = $missing | Sort-Object
-
-          if ($missing.Count -gt 0) {
-            if ($isReleaseTag) {
-              throw "SignPath release signing is required for release tags, but the following settings are missing: $($missing -join ', ')"
-            }
-            "enabled=false" >> $env:GITHUB_OUTPUT
-            Write-Host "SignPath disabled because the following settings are missing: $($missing -join ', ')"
-            exit 0
-          }
-
-          "enabled=true" >> $env:GITHUB_OUTPUT
-          "signing-policy-slug=$signingPolicySlug" >> $env:GITHUB_OUTPUT
-          "policy-kind=$policyKind" >> $env:GITHUB_OUTPUT
-          "wait-timeout-seconds=$waitTimeoutSeconds" >> $env:GITHUB_OUTPUT
-          "product-version=$($env:AMIBERRY_PRODUCT_VERSION)" >> $env:GITHUB_OUTPUT
-          Write-Host "SignPath $policyKind signing enabled with policy '$signingPolicySlug'."
-
-      - name: Upload unsigned Windows artifacts for SignPath
-        if: steps.signpath-config.outputs.enabled == 'true'
-        id: signpath-unsigned
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}-signpath-unsigned
-          path: |
-            amiberry-*.zip
-            amiberry-*.exe
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-      - name: Submit SignPath signing request
-        if: steps.signpath-config.outputs.enabled == 'true'
-        id: signpath
-        uses: SignPath/github-action-submit-signing-request@v2
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ steps.signpath-config.outputs.signing-policy-slug }}
-          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-          github-artifact-id: ${{ steps.signpath-unsigned.outputs.artifact-id }}
-          wait-for-completion: true
-          wait-for-completion-timeout-in-seconds: ${{ steps.signpath-config.outputs.wait-timeout-seconds }}
-          output-artifact-directory: signpath-signed
-          parameters: |
-            version: "${{ steps.signpath-config.outputs.product-version }}"
-
-      - name: Replace unsigned artifacts with signed outputs
-        if: steps.signpath-config.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $downloadDir = Join-Path $PWD "signpath-signed"
-          if (-not (Test-Path $downloadDir)) {
-            throw "Signed artifact directory '$downloadDir' was not created."
-          }
-
-          $portableZip = Get-ChildItem $downloadDir -Recurse -File -Filter "amiberry-*-portable.zip" | Select-Object -First 1
-          if (-not $portableZip) {
-            throw "Signed portable ZIP was not found in '$downloadDir'."
-          }
-
-          $installer = Get-ChildItem $downloadDir -Recurse -File -Filter "amiberry-*.exe" | Select-Object -First 1
-          if (-not $installer) {
-            throw "Signed installer EXE was not found in '$downloadDir'."
-          }
-
-          Copy-Item $portableZip.FullName $PWD -Force
-          Copy-Item $installer.FullName $PWD -Force
-          Write-Host "Replaced workspace artifacts with SignPath-signed outputs."
-
-      - name: Verify SignPath-signed artifacts
-        if: steps.signpath-config.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem "$PWD/amiberry-*.exe" | Select-Object -First 1
-          if (-not $installer) {
-            throw "Signed installer EXE not found in workspace."
-          }
-
-          $installerSignature = Get-AuthenticodeSignature $installer.FullName
-          if ($installerSignature.Status -eq "NotSigned" -or -not $installerSignature.SignerCertificate) {
-            throw "Installer EXE is missing an Authenticode signature."
-          }
-          Write-Host "Installer signature status: $($installerSignature.Status)"
-
-          $portableZip = Get-ChildItem "$PWD/amiberry-*-portable.zip" | Select-Object -First 1
-          if (-not $portableZip) {
-            throw "Signed portable ZIP not found in workspace."
-          }
-
-          $verifyRoot = Join-Path $PWD "portable-signed-smoke"
-          Remove-Item -Recurse -Force $verifyRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
-          Expand-Archive -Path $portableZip.FullName -DestinationPath $verifyRoot
-
-          $portableExe = Get-ChildItem $verifyRoot -Recurse -File -Filter "Amiberry.exe" | Select-Object -First 1
-          if (-not $portableExe) {
-            throw "Portable ZIP is missing Amiberry.exe after SignPath signing."
-          }
-          $portablePlugin = Get-ChildItem $verifyRoot -Recurse -File -Filter "qemu-uae.dll" | Select-Object -First 1
-          if (-not $portablePlugin) {
-            throw "Portable ZIP is missing qemu-uae.dll after SignPath signing."
-          }
-
-          $portableSignature = Get-AuthenticodeSignature $portableExe.FullName
-          if ($portableSignature.Status -eq "NotSigned" -or -not $portableSignature.SignerCertificate) {
-            throw "Portable ZIP Amiberry.exe is missing an Authenticode signature."
-          }
-          Write-Host "Portable EXE signature status: $($portableSignature.Status)"
-
-          Write-Host "QEMU-UAE plugin present after SignPath signing: $($portablePlugin.FullName)"
 
       - name: Upload artifact
         if: github.ref_type != 'tag'
@@ -1387,9 +1696,8 @@ jobs:
     runs-on: windows-11-arm
     # Cold-cache runs finish in ~24 min, warm-cache runs in ~8 min. The
     # extra time vs. x64 mostly comes from the InnoSetup-via-Chocolatey
-    # install path (windows-11-arm doesn't preinstall ISCC). Release signing
-    # can require manual SignPath approval, so match build-windows headroom.
-    timeout-minutes: 120
+    # install path (windows-11-arm doesn't preinstall ISCC).
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: write
@@ -1478,6 +1786,11 @@ jobs:
         shell: bash
         run: |
           cmake --build out/build/windows-arm64-release -j$NUMBER_OF_PROCESSORS
+          # vcpkg's FFmpeg port does not configure for arm64-mingw, so this
+          # build has WebP but not the FFmpeg codecs (see vcpkg.json).
+          for library in webp webpdemux; do
+            find out/build/windows-arm64-release -maxdepth 1 -iname "*${library}*.dll" -print -quit | grep -q .
+          done
 
       - name: Install (portable layout)
         shell: bash
@@ -1485,6 +1798,9 @@ jobs:
           rm -rf out/install/windows-arm64-release
           rm -rf out/package/windows-arm64-release
           cmake --install out/build/windows-arm64-release --prefix out/install/windows-arm64-release
+          for library in webp webpdemux; do
+            find out/install/windows-arm64-release -maxdepth 1 -iname "*${library}*.dll" -print -quit | grep -q .
+          done
 
       - name: Package (Portable ZIP)
         shell: bash
@@ -1587,6 +1903,22 @@ jobs:
           }
           Write-Host "ARM64 Amiberry.exe ran --dump-paths successfully."
 
+          # Shared dump-mode behavioral tests also run on the x64 and Linux
+          # legs; ARM64 has no JIT, but every path assertion applies.
+          $env:SDL_VIDEODRIVER = "dummy"
+          $env:SDL_AUDIODRIVER = "dummy"
+          $env:AMIBERRY_BIN = $exePath
+          bash tests/test_dump_config.sh
+          if ($LASTEXITCODE -ne 0) {
+            throw "--dump-config behavioral test failed with exit code $LASTEXITCODE."
+          }
+          bash tests/test_plugin_search_paths.sh
+          if ($LASTEXITCODE -ne 0) {
+            throw "plugin search path behavioral test failed with exit code $LASTEXITCODE."
+          }
+          Write-Host "ARM64 Amiberry.exe ran the dump-mode behavioral tests successfully."
+
+
           $jitStdoutFile = Join-Path $verifyRoot "jit-selftest.stdout"
           $jitStderrFile = Join-Path $verifyRoot "jit-selftest.stderr"
           $jitProc = Start-Process -FilePath $exePath -ArgumentList "--jit-selftest" `
@@ -1633,165 +1965,6 @@ jobs:
         run: |
           cpack -G INNOSETUP --config out/build/windows-arm64-release/CPackConfig.cmake
 
-      - name: Detect SignPath configuration
-        id: signpath-config
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          SIGNPATH_TEST_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_TEST_SIGNING_POLICY_SLUG || vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-          SIGNPATH_RELEASE_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_RELEASE_SIGNING_POLICY_SLUG }}
-          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-        run: |
-          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
-            "enabled=false" >> $env:GITHUB_OUTPUT
-            Write-Host "SignPath disabled for pull_request events."
-            exit 0
-          }
-
-          $isReleaseTag = $env:GITHUB_REF_TYPE -eq "tag"
-          if ($isReleaseTag) {
-            $policyKind = "release"
-            $signingPolicySlug = $env:SIGNPATH_RELEASE_SIGNING_POLICY_SLUG
-            $signingPolicySetting = "SIGNPATH_RELEASE_SIGNING_POLICY_SLUG"
-            $waitTimeoutSeconds = "5400"
-          } else {
-            $policyKind = "test"
-            $signingPolicySlug = $env:SIGNPATH_TEST_SIGNING_POLICY_SLUG
-            $signingPolicySetting = "SIGNPATH_TEST_SIGNING_POLICY_SLUG (or legacy SIGNPATH_SIGNING_POLICY_SLUG)"
-            $waitTimeoutSeconds = "1200"
-          }
-
-          $required = [ordered]@{
-            SIGNPATH_API_TOKEN = $env:SIGNPATH_API_TOKEN
-            SIGNPATH_ORGANIZATION_ID = $env:SIGNPATH_ORGANIZATION_ID
-            SIGNPATH_PROJECT_SLUG = $env:SIGNPATH_PROJECT_SLUG
-            SIGNPATH_ARTIFACT_CONFIGURATION_SLUG = $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
-            AMIBERRY_PRODUCT_VERSION = $env:AMIBERRY_PRODUCT_VERSION
-          }
-          $missing = @()
-          foreach ($item in $required.GetEnumerator()) {
-            if ([string]::IsNullOrWhiteSpace($item.Value)) {
-              $missing += $item.Key
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($signingPolicySlug)) {
-            $missing += $signingPolicySetting
-          }
-          $missing = $missing | Sort-Object
-
-          if ($missing.Count -gt 0) {
-            if ($isReleaseTag) {
-              throw "SignPath release signing is required for release tags, but the following settings are missing: $($missing -join ', ')"
-            }
-            "enabled=false" >> $env:GITHUB_OUTPUT
-            Write-Host "SignPath disabled because the following settings are missing: $($missing -join ', ')"
-            exit 0
-          }
-
-          "enabled=true" >> $env:GITHUB_OUTPUT
-          "signing-policy-slug=$signingPolicySlug" >> $env:GITHUB_OUTPUT
-          "policy-kind=$policyKind" >> $env:GITHUB_OUTPUT
-          "wait-timeout-seconds=$waitTimeoutSeconds" >> $env:GITHUB_OUTPUT
-          "product-version=$($env:AMIBERRY_PRODUCT_VERSION)" >> $env:GITHUB_OUTPUT
-          Write-Host "SignPath $policyKind signing enabled with policy '$signingPolicySlug'."
-
-      - name: Upload unsigned Windows artifacts for SignPath
-        if: steps.signpath-config.outputs.enabled == 'true'
-        id: signpath-unsigned
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}-signpath-unsigned
-          path: |
-            amiberry-*.zip
-            amiberry-*.exe
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-      - name: Submit SignPath signing request
-        if: steps.signpath-config.outputs.enabled == 'true'
-        id: signpath
-        uses: SignPath/github-action-submit-signing-request@v2
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ steps.signpath-config.outputs.signing-policy-slug }}
-          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-          github-artifact-id: ${{ steps.signpath-unsigned.outputs.artifact-id }}
-          wait-for-completion: true
-          wait-for-completion-timeout-in-seconds: ${{ steps.signpath-config.outputs.wait-timeout-seconds }}
-          output-artifact-directory: signpath-signed
-          parameters: |
-            version: "${{ steps.signpath-config.outputs.product-version }}"
-
-      - name: Replace unsigned artifacts with signed outputs
-        if: steps.signpath-config.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $downloadDir = Join-Path $PWD "signpath-signed"
-          if (-not (Test-Path $downloadDir)) {
-            throw "Signed artifact directory '$downloadDir' was not created."
-          }
-
-          $portableZip = Get-ChildItem $downloadDir -Recurse -File -Filter "amiberry-*-portable.zip" | Select-Object -First 1
-          if (-not $portableZip) {
-            throw "Signed portable ZIP was not found in '$downloadDir'."
-          }
-
-          $installer = Get-ChildItem $downloadDir -Recurse -File -Filter "amiberry-*.exe" | Select-Object -First 1
-          if (-not $installer) {
-            throw "Signed installer EXE was not found in '$downloadDir'."
-          }
-
-          Copy-Item $portableZip.FullName $PWD -Force
-          Copy-Item $installer.FullName $PWD -Force
-          Write-Host "Replaced workspace artifacts with SignPath-signed outputs."
-
-      - name: Verify SignPath-signed artifacts
-        if: steps.signpath-config.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem "$PWD/amiberry-*.exe" | Select-Object -First 1
-          if (-not $installer) {
-            throw "Signed installer EXE not found in workspace."
-          }
-
-          $installerSignature = Get-AuthenticodeSignature $installer.FullName
-          if ($installerSignature.Status -eq "NotSigned" -or -not $installerSignature.SignerCertificate) {
-            throw "Installer EXE is missing an Authenticode signature."
-          }
-          Write-Host "Installer EXE signature status: $($installerSignature.Status)"
-
-          $portableZip = Get-ChildItem "$PWD/amiberry-*-windows-arm64-portable.zip" | Select-Object -First 1
-          if (-not $portableZip) {
-            throw "Signed portable ZIP not found in workspace."
-          }
-
-          $verifyRoot = Join-Path $PWD "portable-signed-smoke"
-          Remove-Item -Recurse -Force $verifyRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
-          Expand-Archive -Path $portableZip.FullName -DestinationPath $verifyRoot
-
-          $portableExe = Get-ChildItem $verifyRoot -Recurse -File -Filter "Amiberry.exe" | Select-Object -First 1
-          if (-not $portableExe) {
-            throw "Portable ZIP is missing Amiberry.exe after SignPath signing."
-          }
-          $portablePlugin = Get-ChildItem $verifyRoot -Recurse -File -Filter "qemu-uae.dll" | Select-Object -First 1
-          if (-not $portablePlugin) {
-            throw "Portable ZIP is missing qemu-uae.dll after SignPath signing."
-          }
-
-          $portableSignature = Get-AuthenticodeSignature $portableExe.FullName
-          if ($portableSignature.Status -eq "NotSigned" -or -not $portableSignature.SignerCertificate) {
-            throw "Portable ZIP Amiberry.exe is missing an Authenticode signature."
-          }
-          Write-Host "Portable EXE signature status: $($portableSignature.Status)"
-
-          Write-Host "QEMU-UAE plugin present after SignPath signing: $($portablePlugin.FullName)"
-
       - name: Upload artifact
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v7
@@ -1810,6 +1983,68 @@ jobs:
           path: |
             amiberry-*.zip
             amiberry-*.exe
+          retention-days: 7
+
+  # Signs both Windows architectures with the Certum SimplySign cloud
+  # certificate: the installer EXE, and Amiberry.exe inside the portable ZIP.
+  # One job signs both, so there is a single SimplySign login per release,
+  # and the signing secrets live in the windows-signing environment, out of
+  # reach of the jobs that run the build.
+  sign-windows:
+    needs: [build-windows, build-windows-arm64]
+    if: github.ref_type == 'tag'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: windows-signing
+    steps:
+      - name: Check out signing script
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Download Windows x64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: amiberry-windows-x64
+          path: windows-artifacts/amiberry-windows-x64
+
+      - name: Download Windows arm64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: amiberry-windows-arm64
+          path: windows-artifacts/amiberry-windows-arm64
+
+      - name: Sign with Certum SimplySign
+        shell: pwsh
+        env:
+          CERTUM_OTPAUTH_URI: ${{ secrets.CERTUM_OTPAUTH_URI }}
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_CERT_THUMBPRINT: ${{ vars.CERTUM_CERT_THUMBPRINT }}
+        run: |
+          .github/scripts/sign-windows-certum.ps1 -ArtifactDirectory `
+            windows-artifacts/amiberry-windows-x64, `
+            windows-artifacts/amiberry-windows-arm64
+
+      - name: Replace Windows x64 artifacts with signed ones
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry-windows-x64
+          path: |
+            windows-artifacts/amiberry-windows-x64/amiberry-*.zip
+            windows-artifacts/amiberry-windows-x64/amiberry-*.exe
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+      - name: Replace Windows arm64 artifacts with signed ones
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry-windows-arm64
+          path: |
+            windows-artifacts/amiberry-windows-arm64/amiberry-*.zip
+            windows-artifacts/amiberry-windows-arm64/amiberry-*.exe
+          if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   build-libretro:
@@ -1934,7 +2169,7 @@ jobs:
           path: amiberry/libretro/amiberry_libretro.info
 
   create-release:
-    needs: [merge-macOS-universal, build-fedora, build-ubuntu, build-debian-amd64, build-debian-arm64, build-windows, build-windows-arm64, build-libretro]
+    needs: [merge-macOS-universal, build-appimage, smoke-appimage-mount, smoke-appimage-extract, build-fedora, build-ubuntu, test-settings-schema, build-debian-amd64, build-debian-arm64, build-windows, build-windows-arm64, sign-windows, build-libretro]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'preview-v'))
@@ -1957,7 +2192,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          sha256sum amiberry-*.zip amiberry-*.exe amiberry-libretro-*.* amiberry_libretro.info Amiberry-*.dmg 2>/dev/null | tee SHA256SUMS
+          sha256sum amiberry-*.zip amiberry-*.exe amiberry-libretro-*.* amiberry_libretro.info Amiberry-*.dmg Amiberry-*.AppImage Amiberry-*.AppImage.zsync amiberry-*-third-party-sources.tar.xz 2>/dev/null | tee SHA256SUMS
           cat SHA256SUMS
 
       - name: Create Release
@@ -1968,13 +2203,16 @@ jobs:
           omitBodyDuringUpdate: true
           generateReleaseNotes: true
           body: |
-            Windows release binaries are signed through SignPath. See the Code signing policy: https://amiberry.com/code-signing-policy
+            Windows release binaries are signed with a Certum open source code signing certificate. See the Code signing policy: https://amiberry.com/code-signing-policy
           artifacts: |
             artifacts/amiberry-*.zip
             artifacts/amiberry-libretro-*.*
             artifacts/amiberry_libretro.info
             artifacts/amiberry-*.exe
             artifacts/Amiberry-*.dmg
+            artifacts/Amiberry-*.AppImage
+            artifacts/Amiberry-*.AppImage.zsync
+            artifacts/amiberry-*-third-party-sources.tar.xz
             artifacts/SHA256SUMS
 
   update-repos:

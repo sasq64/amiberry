@@ -139,6 +139,9 @@ sudo apt install amiberry</code></pre>
       <a href="https://aur.archlinux.org/packages/amiberry">AUR</a> ·
       <a href="https://github.com/BlitterStudio/amiberry/releases/latest">.deb/.rpm</a>
     </p>
+    <p class="platform-alt">
+      <strong>AppImage:</strong> no installation needed. Download the <code>x86_64</code> or <code>aarch64</code> AppImage from <a href="https://github.com/BlitterStudio/amiberry/releases/latest">Releases</a>, make it executable with <code>chmod +x</code> and run it. Requires glibc 2.35 or newer; see the <a href="/linux-packages#appimage">AppImage guide</a>.
+    </p>
   </div>
 
   <div class="platform-card macos">
@@ -161,22 +164,44 @@ sudo apt install amiberry</code></pre>
     <p class="platform-alt">
       Running ARM64 in a VM (VMware Fusion / Parallels / Hyper-V)?  Drop <code>opengl32.dll</code> from <a href="https://github.com/mmozeiko/build-mesa/releases"><code>mesa-llvmpipe-arm64</code></a> next to <code>Amiberry.exe</code> so the GUI can start — guest VMs typically lack an OpenGL ICD.
     </p>
+    <p class="platform-alt">
+      An <a href="#experimental-windows-11-native-ui">experimental Windows 11 WinUI 3 frontend</a> is available separately for x64 and ARM64. Default Windows releases still use Dear ImGui.
+    </p>
   </div>
 
   <div class="platform-card android">
     <h3>🤖 Android</h3>
     <p>AArch64 &amp; x86_64 with full ARM64 JIT support for maximum performance.</p>
+    <p>Currently in Closed Testing on Google Play for <a href="https://ko-fi.com/midwan">Ko-fi</a> members. Open Testing is planned after the next release, followed by a public paid release.</p>
     <p class="platform-alt">
-      See the <a href="https://github.com/BlitterStudio/amiberry/wiki/Compile-from-source">build instructions</a> for details.
+      See the <a href="https://github.com/BlitterStudio/amiberry/wiki/Android">Android guide</a> for details, or the <a href="https://github.com/BlitterStudio/amiberry/wiki/Compile-from-source#android">build instructions</a> to build it yourself.
     </p>
   </div>
 </div>
+
+### Experimental Windows 11 native UI
+
+The optional WinUI 3 frontend targets **Windows 11, build 22000 or newer**, on x64 and ARM64. It is experimental and disabled by default. [Windows native CI](https://github.com/BlitterStudio/amiberry/actions/workflows/windows-native.yml) provides separate unsigned artifacts; these do not replace the standard Windows releases or their CI.
+
+Extract the complete portable package and run `Amiberry.exe`. Keep `native-ui/` beside it: this contains `Amiberry.Windows.exe` and its self-contained **.NET 10 and Windows App SDK runtimes**. No separate runtime installation is needed. The core launches and connects the frontend; do not launch the frontend directly. Portable packages keep writable data beside the emulator using `amiberry.portable`, as usual.
+
+To build, use Windows 11 with **.NET SDK 10** on `PATH`, plus the existing Windows llvm-mingw, vcpkg, CMake and Ninja setup (`LLVM_MINGW_ROOT` and `VCPKG_ROOT`):
+
+```powershell
+cmake --preset windows-native-release
+cmake --build --preset windows-native-release
+cmake --install out/build/windows-native-release --prefix out/install/windows-native-release
+```
+
+For ARM64, substitute `windows-arm64-native-release`. Debug presets are `windows-native-debug` and `windows-arm64-native-debug`. These inherit the existing Windows presets and set `AMIBERRY_NATIVE_WINDOWS_UI=ON`. The Windows-only option defaults to `OFF`; enabling it excludes ImGui and requires `USE_VULKAN=OFF` (the default). The normal presets and releases remain unchanged.
+
+The UI project is `windows/Amiberry.Windows/Amiberry.Windows.csproj`. CMake publishes it for the core's architecture (`win-x64` or `win-arm64`) to `out/build/<preset>/native-ui/`. Run `out/build/<preset>/Amiberry.exe` for development, or `out/install/<preset>/Amiberry.exe` after installation; the complete UI directory is copied with the core. Use separate build directories for native and default frontends.
 
 ---
 
 ## Code Signing Policy
 
-Windows release binaries are signed through SignPath with a certificate provided by the SignPath Foundation. See the [Code signing policy](/code-signing-policy) for signing scope, release approval roles, and privacy notes.
+Windows release binaries are signed with a Certum open source code signing certificate. See the [Code signing policy](/code-signing-policy) for signing scope, roles, and privacy notes.
 
 ---
 
@@ -185,9 +210,13 @@ Windows release binaries are signed through SignPath with a certificate provided
 Guides, tutorials, and references to help you get the most out of Amiberry.
 
 <div class="resource-grid">
-  <a href="https://github.com/BlitterStudio/amiberry/wiki/First-Installation" class="resource-link">
+  <a href="https://github.com/BlitterStudio/amiberry/wiki/Quick-start-guide" class="resource-link">
     <span class="resource-icon">🚀</span>
     Getting Started
+  </a>
+  <a href="/linux-packages" class="resource-link">
+    <span class="resource-icon">🐧</span>
+    Linux Packages &amp; AppImage
   </a>
   <a href="https://github.com/BlitterStudio/amiberry/wiki" class="resource-link">
     <span class="resource-icon">📘</span>
@@ -196,6 +225,10 @@ Guides, tutorials, and references to help you get the most out of Amiberry.
   <a href="https://github.com/BlitterStudio/amiberry/wiki/Compile-from-source" class="resource-link">
     <span class="resource-icon">🔨</span>
     Build from Source
+  </a>
+  <a href="/plugin-locations" class="resource-link">
+    <span class="resource-icon">PLG</span>
+    Plugin Locations
   </a>
   <a href="/ppc-qemu-plugin" class="resource-link">
     <span class="resource-icon">PPC</span>
@@ -208,6 +241,10 @@ Guides, tutorials, and references to help you get the most out of Amiberry.
   <a href="/ipc" class="resource-link">
     <span class="resource-icon">IPC</span>
     IPC Controller Interface
+  </a>
+  <a href="/gdb-debugging" class="resource-link">
+    <span class="resource-icon">GDB</span>
+    GDB Remote Debugging
   </a>
   <a href="https://github.com/BlitterStudio/amiberry/wiki/Troubleshooting" class="resource-link">
     <span class="resource-icon">🔍</span>

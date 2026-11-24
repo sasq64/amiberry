@@ -242,11 +242,13 @@ extern int is_touch_lightpen (void);
 extern int inputdevice_is_tablet (void);
 extern int input_mousehack_status(TrapContext *ctx, int mode, uaecptr diminfo, uaecptr dispinfo, uaecptr vp, uae_u32 moffset);
 extern void input_mousehack_mouseoffset (uaecptr pointerprefs);
+#ifdef AMIBERRY
 extern void input_mousehack_cursor_hotspot(int cursor_width, int cursor_height, int* hotspot_x, int* hotspot_y,
 	int* residual_x, int* residual_y);
 extern bool input_mousehack_get_last_abs_position(int* x, int* y);
 extern void input_mousehack_invalidate_last_abs_position();
 extern void input_mousehack_set_host_cursor_uses_hotspot(bool enabled, int residual_x, int residual_y);
+#endif
 extern int mousehack_alive (void);
 extern void mousehack_wakeup(void);
 extern bool mousehack_pending(void);
@@ -259,9 +261,20 @@ extern void inputdevice_read_msg(bool);
 extern void setmousebuttonstateall (int mouse, uae_u32 buttonbits, uae_u32 buttonmask);
 extern void setjoybuttonstateall (int joy, uae_u32 buttonbits, uae_u32 buttonmask);
 extern void setjoybuttonstate (int joy, int button, int state);
+extern bool inputdevice_joystick_is_cd32(int port);
+extern void inputdevice_set_joystick_state(uae_u64 client, int port, int directions, int buttons);
+extern void inputdevice_release_joystick(uae_u64 client);
+extern void setjoybuttonstate_osk(int joy, int button, int state);
+extern void setjoystickstate_osk(int joy, int axis, int state, int max);
 extern void setmousebuttonstate (int mouse, int button, int state);
 extern uae_u32 getmousebuttonstate (int mouse);
 extern void setjoystickstate (int joy, int axle, int state, int max);
+// Whether an axis sample survives the enabled device's actual mapped consumers.
+extern bool inputdevice_is_joystick_axis_active(int joy, int axis, int state, int max);
+// Forget a host input edge that the OSK owned without dispatching its release
+// through gameplay mappings.
+extern void inputdevice_discard_osk_button_state(int joy, int button);
+extern void inputdevice_discard_osk_axis_state(int joy, int axis);
 extern int getjoystickstate (int mouse);
 void setmousestate (int mouse, int axis, int data, int isabs);
 extern int getmousestate (int mouse);
@@ -271,6 +284,17 @@ extern bool inputdevice_devicechange (struct uae_prefs *prefs);
 #ifdef AMIBERRY
 extern void inputdevice_mouse_reinit(struct uae_prefs *prefs);
 #endif
+
+// SDL gamepad routing has already decided which events belong to the OSK.
+// Keep forwarded gameplay events out of the core's generic joystick capture.
+class inputdevice_osk_passthrough {
+	bool previous;
+public:
+	explicit inputdevice_osk_passthrough(bool enabled = true);
+	~inputdevice_osk_passthrough();
+	inputdevice_osk_passthrough(const inputdevice_osk_passthrough&) = delete;
+	inputdevice_osk_passthrough& operator=(const inputdevice_osk_passthrough&) = delete;
+};
 
 #define INTERNALEVENT_CPURESET 0
 #define INTERNALEVENT_KBRESET 1
@@ -283,6 +307,7 @@ extern void inputdevice_checkqualifierkeycode (int keyboard, int scancode, int s
 extern void inputdevice_setkeytranslation (struct uae_input_device_kbr_default **trans, int **kbmaps);
 extern void inputdevice_do_keyboard(int code, int state);
 extern void inputdevice_do_kb_reset(void);
+extern void inputdevice_kb_custom_reset(bool hardreset, bool keyboardreset);
 extern int inputdevice_iskeymapped (int keyboard, int scancode);
 extern int inputdevice_synccapslock (int, int*);
 extern void inputdevice_testrecord (int type, int num, int wtype, int wnum, int state, int max);
@@ -322,8 +347,23 @@ extern int inputdevice_joyport_config(struct uae_prefs *p, const TCHAR *value1, 
 extern void inputdevice_joyport_config_store(struct uae_prefs *p, const TCHAR *value, int portnum, int mode, int submode, int type);
 extern int inputdevice_getjoyportdevice (int port, int val);
 extern void inputdevice_validate_jports (struct uae_prefs *p, int changedport, bool *fixedports);
+#ifdef AMIBERRY
+// The shared settings layer's variant: validates a configuration (which
+// may be a session copy) without updating the device usage history.
+extern void inputdevice_validate_jports_prefs_only (struct uae_prefs *p, int changedport);
+#endif
 extern void inputdevice_fix_prefs(struct uae_prefs *p, bool userconfig);
 extern void inputdevice_jportcustom_fixup(struct uae_prefs *p, TCHAR*, int);
+extern void inputdevice_joyport_keyboard_default(struct uae_prefs *p, const TCHAR *value, int portnum);
+// Configuring a joyport records process-global port memory: each port's
+// keyboard-layout fallback and the devices recently used in it.
+// Configuration previews save it first and restore it afterwards, so
+// building a preview leaves the running configuration's port memory alone.
+// Restoring frees the snapshot; a null snapshot (out of memory) restores
+// nothing.
+struct inputdevice_port_memory;
+extern struct inputdevice_port_memory *inputdevice_port_memory_save(void);
+extern void inputdevice_port_memory_restore(struct inputdevice_port_memory *saved);
 
 extern void inputdevice_init (void);
 extern void inputdevice_close (void);

@@ -3,8 +3,9 @@
 Amiberry provides a self-hosted APT/YUM package repository at `packages.amiberry.com`,
 allowing you to install and receive automatic updates through your system's package manager.
 
-> **Alternative**: Amiberry is also available on [Flathub](https://flathub.org/apps/com.blitterstudio.amiberry),
-> which works on all major Linux distributions without any additional configuration.
+> **Alternatives**: Amiberry is also available on [Flathub](https://flathub.org/apps/com.blitterstudio.amiberry),
+> which works on all major Linux distributions without any additional configuration, and as a
+> no-install [AppImage](#appimage) for x86_64 and aarch64 from every GitHub release.
 
 ---
 
@@ -87,6 +88,46 @@ sudo dnf update amiberry
 
 ---
 
+## AppImage
+
+Each GitHub release publishes `Amiberry-<version>-x86_64.AppImage` for Intel and AMD systems and `Amiberry-<version>-aarch64.AppImage` for 64-bit ARM systems, with a corresponding `.zsync` file for each image. Download the matching image from the [GitHub releases page](https://github.com/BlitterStudio/amiberry/releases/latest), make it executable, and run it:
+
+```bash
+chmod +x Amiberry-<version>-x86_64.AppImage
+./Amiberry-<version>-x86_64.AppImage
+```
+
+Replace `x86_64` with `aarch64` on 64-bit ARM. AppImage is a single-file, no-install option and lets stable and preview releases run side by side. Native packages remain the best choice for system integration and distribution-managed updates; Flatpak is the broad fallback and sandboxed option.
+
+AppImage mount mode needs working FUSE. The image has a static runtime and does not require the legacy `libfuse2` package; do not install it just for Amiberry. If FUSE is unavailable, run without mounting:
+
+```bash
+./Amiberry-<version>-x86_64.AppImage --appimage-extract-and-run
+```
+
+AppImages require glibc 2.35 or newer. On an older distribution, use Flatpak or a supported native package rather than replacing the system glibc.
+
+### Portable home and updates
+
+To keep configuration and writable data beside a specific image, create a sibling directory named for the complete image filename before its first launch:
+
+```bash
+mkdir Amiberry-8.6.0-x86_64.AppImage.home
+./Amiberry-8.6.0-x86_64.AppImage
+```
+
+AppImage managers can integrate the image and use its `.zsync` file for updates. The Amiberry Linux updater only notifies about updates; it does not update an AppImage itself.
+
+### AppImage troubleshooting
+
+If normal launch reports a FUSE or mount error, use `--appimage-extract-and-run` as shown above. If it reports an unsupported GLIBC version, use Flatpak or a supported native package; never replace the system glibc.
+
+If it reports a missing `libOpenGL.so.0`, `libwayland-client.so.0`, `libasound.so.2` or `libdbus-1.so.3`, install your distribution's OpenGL (libglvnd), Wayland client, ALSA and D-Bus runtime packages. The AppImage deliberately uses these from the host so it works with your graphics drivers and sound server.
+
+The AppImage uses your system's certificate store for update checks and downloads. If your trust store lives somewhere non-standard, point `SSL_CERT_FILE` (or `CURL_CA_BUNDLE`) at the CA bundle before launching the image.
+
+---
+
 ## Supported Distributions
 
 | Distribution | Version | Repository suite | Architectures |
@@ -95,6 +136,7 @@ sudo dnf update amiberry
 | Ubuntu | 24.04 LTS (Noble) | noble | amd64 |
 | Ubuntu | 25.10 (Questing) | questing | amd64, arm64 |
 | Ubuntu | 26.04 LTS (Resolute) | resolute | amd64, arm64 |
+| Ubuntu | 26.10 (Stonking) | stonking | amd64, arm64 |
 | Debian | 12 (Bookworm) | bookworm | amd64, arm64 |
 | Debian | 13 (Trixie) | trixie | amd64, arm64 |
 | Raspberry Pi OS | Bookworm, Trixie | bookworm, trixie | arm64 |
@@ -171,6 +213,20 @@ Possible causes:
 - Your distribution version is not in the supported list above
 - Your architecture is not supported for your distro version (e.g., `arm64` on Ubuntu 22.04)
 - The repository was not configured correctly — re-run the install steps
+
+### "The Amiberry repository has no packages for ..."
+
+The install script found your release, but the repository does not publish a suite
+for it yet (new Ubuntu releases are added after their first Amiberry build). The
+script stops without changing your apt configuration. To try the packages of the
+closest older release, name its suite explicitly:
+
+```bash
+curl -fsSL https://packages.amiberry.com/install.sh | sudo AMIBERRY_APT_SUITE=resolute sh
+```
+
+Older-release packages can fail to install if your release has moved to newer
+library versions; Flatpak is the fallback in that case.
 
 ### Conflicting versions (Flatpak + APT/DNF both installed)
 

@@ -1,3 +1,28 @@
+# Building the core into another program rather than loading it as a shared
+# library:
+#   STATIC_LINKING=1        build amiberry_libretro.a, not a shared core
+#                           (TARGET=<path> names the file)
+#   OBJDIR=<dir>            put the objects in <dir>, not next to their
+#                           sources, so one tree can build several setups
+#   EXTRA_SOURCES=<files>   the program's own .cpp and .c files, built with
+#                           the core's flags so they can use its headers
+#   NLOHMANN_JSON_INCLUDE=<dir>  the folder holding nlohmann/json.hpp,
+#                           instead of downloading it into deps/
+#   CPPFLAGS, CFLAGS, CXXFLAGS   added to every compile
+#   NET_CFLAGS              added to the network sources only (SLiRP,
+#                           slirp_uae.cpp, bsdsocket_host.cpp), e.g. to
+#                           send their socket calls to the host's own stack
+# For hosts without some of what the core expects (bare metal):
+#   NO_JIT=1                leave the JIT out
+#   NO_STD_THREAD=1         no std::thread: CHD's work queues run their
+#                           work on the thread that queues it
+#   NO_HOST_SIGNALS=1       no fault or SIGTERM handlers
+#   NO_CHD_SPECIAL_FILES=1  CHD's file layer opens every name as a file
+#                           (no "socket.", "domain." or pty names)
+# Such a program can also make the calls in libretro/amiberry_embed.h.
+# To shrink uae_prefs (three copies of its input tables, ~10 MB each at the
+# default of 20 devices), pass CPPFLAGS=-DMAX_INPUT_DEVICES=<n>, 4 to 32.
+
 STATIC_LINKING := 0
 ARGT := 
 
@@ -68,6 +93,33 @@ ifeq ($(platform), unix)
    else
    SHARED := -shared $(NO_UNDEFINED) -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,-Bsymbolic-functions
    endif
+else ifneq (,$(findstring android,$(platform)))
+   TARGET := $(TARGET_NAME)_libretro_android.so
+   fpic := -fPIC
+   CHD_OSDLIB := $(AMIBERRY_DIR)/src/archivers/chd/osdlib_unix.cpp
+   CHD_FILEIMP := $(AMIBERRY_DIR)/src/archivers/chd/posixfile.cpp
+   CHD_DIR := $(AMIBERRY_DIR)/src/archivers/chd/posixdir.cpp
+   CHD_PTTY := $(AMIBERRY_DIR)/src/archivers/chd/posixptty.cpp
+   CHD_SOCKET := $(AMIBERRY_DIR)/src/archivers/chd/posixsocket.cpp
+   SHARED := -shared $(NO_UNDEFINED) -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,-Bsymbolic-functions
+   # bionic grew forkpty() (uaelib's host shell) in API 23; the core
+   # targets API 28 — Android 9 and newer.
+   ANDROID_API ?= 28
+   ANDROID_NDK_LLVM ?= $(ANDROID_NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64
+   ifeq ($(platform), android-arm64)
+      ANDROID_TRIPLE := aarch64-linux-android
+      ARCH := aarch64
+   else ifneq (,$(filter $(platform),android-x86_64 android-x64))
+      ANDROID_TRIPLE := x86_64-linux-android
+      ARCH := x86_64
+   else
+      $(error unknown Android platform '$(platform)')
+   endif
+   CC = $(ANDROID_NDK_LLVM)/bin/$(ANDROID_TRIPLE)$(ANDROID_API)-clang
+   CXX = $(ANDROID_NDK_LLVM)/bin/$(ANDROID_TRIPLE)$(ANDROID_API)-clang++
+   AR = $(ANDROID_NDK_LLVM)/bin/llvm-ar
+   RANLIB = $(ANDROID_NDK_LLVM)/bin/llvm-ranlib
+   STRIP = $(ANDROID_NDK_LLVM)/bin/llvm-strip
 else ifeq ($(platform), osx)
    TARGET := $(TARGET_NAME)_libretro.dylib
    fpic := -fPIC
@@ -77,7 +129,7 @@ else ifeq ($(platform), osx)
    CHD_PTTY := $(AMIBERRY_DIR)/src/archivers/chd/posixptty.cpp
    CHD_SOCKET := $(AMIBERRY_DIR)/src/archivers/chd/posixsocket.cpp
    SHARED := -dynamiclib
-   LDFLAGS += -framework CoreFoundation -framework DiskArbitration -lz -liconv
+   LDFLAGS += -framework CoreFoundation -framework DiskArbitration -lz
 else
    TARGET := $(TARGET_NAME)_libretro.dll
    CC ?= gcc
@@ -89,6 +141,15 @@ else
    CHD_SOCKET := $(AMIBERRY_DIR)/src/archivers/chd/winsocket.cpp
    SHARED := -shared -static -Wl,--no-undefined
 endif
+
+ifneq (,$(filter arm64 ARM64,$(ARCH)))
+   override ARCH := aarch64
+endif
+
+ifeq ($(STATIC_LINKING), 1)
+   TARGET := $(basename $(TARGET)).a
+endif
+
 
 LDFLAGS += $(fpic) $(SHARED)
 FLAGS += $(fpic)
@@ -142,13 +203,9 @@ FLAGS += -DCHD_FLAC_PLATFORM_HEADER=\"flac_platform_internal_libretro.h\"
 FLAGS += -DSOUND_PLATFORM_HEADER=\"sound_platform_internal_libretro.h\"
 FLAGS += -DWITH_MIDI
 
-ifneq (,$(findstring aarch64,$(ARCH)))
+ifeq ($(ARCH),aarch64)
    FLAGS += -DCPU_AARCH64
-else ifneq (,$(findstring arm64,$(ARCH)))
-   FLAGS += -DCPU_AARCH64
-else ifneq (,$(findstring arm,$(ARCH)))
-   FLAGS += -DCPU_ARM
-else
+else ifneq (,$(filter x86_64 amd64 AMD64,$(ARCH)))
    FLAGS += -DCPU_X86_64
 endif
 
@@ -193,9 +250,11 @@ INCFLAGS += -I$(AMIBERRY_DIR)/src/osdep
 INCFLAGS += -I$(AMIBERRY_DIR)/src/threaddep
 INCFLAGS += -I$(AMIBERRY_DIR)/src/archivers
 INCFLAGS += -I$(AMIBERRY_DIR)/external/floppybridge/src
+INCFLAGS += -I$(AMIBERRY_DIR)/external/lhasa/lib
 INCFLAGS += -I$(LIBRETRO_DIR)
 INCFLAGS += -I$(LIBCO_DIR)
 INCFLAGS += -I$(LIBRETRO_COMMON)/include
+INCFLAGS += -I$(AMIBERRY_DIR)/external/imgui
 
 ZLIB_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags zlib 2>/dev/null)
 ZLIB_LIBS ?= $(shell $(PKG_CONFIG) --libs zlib 2>/dev/null)
@@ -203,14 +262,23 @@ ZLIB_LIBS ?= $(shell $(PKG_CONFIG) --libs zlib 2>/dev/null)
 INCFLAGS += $(ZLIB_CFLAGS)
 LDFLAGS += $(ZLIB_LIBS)
 
-# nlohmann/json (header-only) — fetched once into deps/
+# nlohmann/json (header-only): NLOHMANN_JSON_INCLUDE holds nlohmann/json.hpp.
+# The default folder, deps/, gets the header downloaded once.
 NLOHMANN_JSON_VERSION ?= v3.11.3
-NLOHMANN_JSON_DIR := $(LIBRETRO_DIR)/deps/nlohmann
-NLOHMANN_JSON_HEADER := $(NLOHMANN_JSON_DIR)/json.hpp
-INCFLAGS += -I$(LIBRETRO_DIR)/deps
+NLOHMANN_JSON_INCLUDE ?= $(LIBRETRO_DIR)/deps
+NLOHMANN_JSON_HEADER := $(NLOHMANN_JSON_INCLUDE)/nlohmann/json.hpp
+INCFLAGS += -I$(NLOHMANN_JSON_INCLUDE)
 
 ifeq ($(platform), unix)
-LDFLAGS += -ldl -lm -pthread
+# forkpty() (uaelib's host shell) lives in libutil on glibc/BSD systems.
+LDFLAGS += -ldl -lm -pthread -lutil
+endif
+
+ifneq (,$(findstring android,$(platform)))
+# bionic keeps pthread and forkpty in libc; only the log sink is separate.
+# NDK clang++ links libc++_shared by default, and RetroArch does not ship
+# that library alongside downloaded cores, so link libc++ statically.
+LDFLAGS += -ldl -lm -llog -static-libstdc++
 endif
 
 ifeq ($(platform), osx)
@@ -218,12 +286,31 @@ LDFLAGS += -lm -lpthread
 endif
 
 ifeq ($(platform), win)
+# Target Windows 7 or newer: bsdsocket_host.cpp reads IP_ADAPTER_ADDRESSES
+# fields (Ipv4Enabled, Ipv4Metric) that the MinGW headers only expose from
+# Vista on, and default to the XP layout otherwise.
+FLAGS += -D_WIN32_WINNT=0x0601
 # llvm-mingw / MSYS2 CLANG64: clang's mingw driver does not auto-link
 # libwinpthread the way GCC's does, so pthread/sem symbols (used by the
 # SDL stubs in libretro/sdl_stub.o etc.) come up undefined at link time.
 # Link winpthread explicitly. The link is also harmless under MinGW-w64
 # GCC, where it's normally pulled in implicitly.
-LDFLAGS += -liconv -lws2_32 -lz -liphlpapi -lgdi32 -lwinmm -lpthread
+LDFLAGS += -lws2_32 -lz -liphlpapi -lgdi32 -lwinmm -lole32 -lpthread
+endif
+
+# The target must have 8-byte pointers. Probed here, after the platform
+# sections above have chosen the compiler (e.g. CLANG64 on Windows) and its
+# flags. No "#" in the command: GNU make 3.81 (macOS) would read it as the
+# start of a comment. tr strips the CR of Windows toolchains.
+# Not when only clean/distclean are made: they must work without a target
+# compiler. "make clean all" still probes.
+ifneq (,$(if $(MAKECMDGOALS),$(filter-out clean distclean,$(MAKECMDGOALS)),all))
+TARGET_POINTER_SIZE := $(strip $(shell printf '' | $(CXX) $(CPPFLAGS) $(CXXFLAGS) $(FLAGS) -dM -E -x c++ - 2>/dev/null | grep __SIZEOF_POINTER__ | awk '{ print $$3 }' | tr -d '\r'))
+ifeq ($(TARGET_POINTER_SIZE),)
+   $(error Could not determine the target pointer size with $(CXX) (Amiberry requires a 64-bit target ABI); check the target compiler and flags)
+else ifneq ($(TARGET_POINTER_SIZE),8)
+   $(error Amiberry requires a 64-bit target ABI, $(CXX) targets $(TARGET_POINTER_SIZE)-byte pointers; check the target compiler and flags)
+endif
 endif
 
 # Source files - Core Amiga Emulation
@@ -233,6 +320,7 @@ SOURCES_CORE := $(AMIBERRY_DIR)/src/a2065.cpp \
                $(AMIBERRY_DIR)/src/amax.cpp \
                $(AMIBERRY_DIR)/src/ar.cpp \
                $(AMIBERRY_DIR)/src/arcadia.cpp \
+               $(AMIBERRY_DIR)/src/atonce.cpp \
                $(AMIBERRY_DIR)/src/audio.cpp \
                $(AMIBERRY_DIR)/src/autoconf.cpp \
                $(AMIBERRY_DIR)/src/blitfunc.cpp \
@@ -280,11 +368,21 @@ SOURCES_CORE := $(AMIBERRY_DIR)/src/a2065.cpp \
                $(AMIBERRY_DIR)/src/softfloat/softfloat.cpp \
                $(AMIBERRY_DIR)/src/softfloat/softfloat_decimal.cpp \
                $(AMIBERRY_DIR)/src/softfloat/softfloat_fpsp.cpp \
+               $(AMIBERRY_DIR)/src/softfloat/softfloat_dd.cpp \
                $(AMIBERRY_DIR)/src/framebufferboards.cpp \
                $(AMIBERRY_DIR)/src/zz9000.cpp \
+               $(AMIBERRY_DIR)/src/zz9000_sdk.cpp \
+               $(AMIBERRY_DIR)/src/zz9000_sdk_audio_codec.cpp \
+               $(AMIBERRY_DIR)/src/zz9000_sdk_webp.cpp \
+               $(AMIBERRY_DIR)/src/zz9000_sdk_media_av.cpp \
+               $(AMIBERRY_DIR)/src/zz9000_sdk_console.cpp \
                $(AMIBERRY_DIR)/src/fsdb.cpp \
                $(AMIBERRY_DIR)/src/fsusage.cpp \
                $(AMIBERRY_DIR)/src/gayle.cpp \
+               $(AMIBERRY_DIR)/src/gdb_monitor.cpp \
+               $(AMIBERRY_DIR)/src/gdb_protocol.cpp \
+               $(AMIBERRY_DIR)/src/gdb_server.cpp \
+               $(AMIBERRY_DIR)/src/gdb_target.cpp \
                $(AMIBERRY_DIR)/src/gfxboard.cpp \
                $(AMIBERRY_DIR)/src/gfxlib.cpp \
                $(AMIBERRY_DIR)/src/gfxutil.cpp \
@@ -341,6 +439,8 @@ SOURCES_OSDEP := $(LIBRETRO_DIR)/libretro.cpp \
                 $(LIBRETRO_DIR)/sdl_stub.cpp \
                 $(LIBRETRO_DIR)/libretro_gui_stubs.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry.cpp \
+                $(AMIBERRY_DIR)/src/osdep/amiberry_actions.cpp \
+                $(AMIBERRY_DIR)/src/osdep/amiberry_curl.cpp \
                 $(AMIBERRY_DIR)/src/osdep/perf_monitor.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_adpf.cpp \
                 $(AMIBERRY_DIR)/src/osdep/host_detect.cpp \
@@ -348,9 +448,14 @@ SOURCES_OSDEP := $(LIBRETRO_DIR)/libretro.cpp \
                 $(AMIBERRY_DIR)/src/osdep/gfx_window.cpp \
                 $(AMIBERRY_DIR)/src/osdep/gfx_colors.cpp \
                 $(AMIBERRY_DIR)/src/osdep/gfx_prefs_check.cpp \
+                $(AMIBERRY_DIR)/src/osdep/imgui_osk.cpp \
                 $(AMIBERRY_DIR)/src/osdep/display_modes.cpp \
                 $(AMIBERRY_DIR)/src/osdep/renderer_factory.cpp \
                 $(AMIBERRY_DIR)/src/osdep/sdl_renderer.cpp \
+                $(AMIBERRY_DIR)/src/osdep/service_transport.cpp \
+                $(AMIBERRY_DIR)/src/osdep/minigl_display.cpp \
+                $(AMIBERRY_DIR)/src/osdep/dmabuf_surface.cpp \
+                $(AMIBERRY_DIR)/src/osdep/gl_context_ladder.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_input.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_mem.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_serial.cpp \
@@ -363,6 +468,7 @@ SOURCES_OSDEP := $(LIBRETRO_DIR)/libretro.cpp \
                 $(AMIBERRY_DIR)/src/osdep/cda_play.cpp \
                 $(AMIBERRY_DIR)/src/osdep/charset.cpp \
                 $(AMIBERRY_DIR)/src/osdep/clipboard.cpp \
+                $(AMIBERRY_DIR)/src/osdep/clipboard_common.cpp \
                 $(AMIBERRY_DIR)/src/osdep/dpi_handler.cpp \
                 $(AMIBERRY_DIR)/src/osdep/libretro/input_platform.cpp \
                 $(AMIBERRY_DIR)/src/osdep/libretro/posixemu_vfs.cpp \
@@ -428,14 +534,30 @@ SOURCES_JIT := $(AMIBERRY_DIR)/src/jit/compemu.cpp \
                $(AMIBERRY_DIR)/src/jit/compemu_support.cpp \
                $(AMIBERRY_DIR)/src/jit/compstbl.cpp
 
-# Build the recompiler on every JIT-capable target (x86_64 and AArch64, see
-# sysconfig.h), matching the CMake desktop build's USE_JIT default.  x86_64 was
-# excluded here, which shipped cores whose "JIT Recompiler" core option did
-# nothing but switch cycle-exact timing off.  `make JIT=0` drops back to the
+# Build the recompiler on every JIT-capable target (x86_64 and AArch64), not
+# just AArch64 as upstream does.  `make JIT=0` (or NO_JIT=1) drops back to the
 # interpreter; object files do not track this, so run `make clean` when flipping it.
 ifeq ($(JIT), 0)
+   override NO_JIT := 1
+endif
+ifeq ($(NO_JIT), 1)
    FLAGS += -DLIBRETRO_NO_JIT
    SOURCES_JIT :=
+endif
+
+ifeq ($(NO_STD_THREAD), 1)
+   FLAGS += -DAMIBERRY_NO_STD_THREAD
+endif
+ifeq ($(NO_HOST_SIGNALS), 1)
+   FLAGS += -DAMIBERRY_NO_HOST_SIGNALS
+endif
+ifeq ($(NO_CHD_SPECIAL_FILES), 1)
+   ifeq ($(platform), win)
+      $(error NO_CHD_SPECIAL_FILES is for the POSIX file layer, not platform=win)
+   endif
+   FLAGS += -DAMIBERRY_NO_CHD_SPECIAL_FILES
+   CHD_PTTY :=
+   CHD_SOCKET :=
 endif
 
 SOURCES_PPC := $(AMIBERRY_DIR)/src/ppc/ppc.cpp \
@@ -463,18 +585,8 @@ SOURCES_ARCHIVE := $(AMIBERRY_DIR)/src/archivers/dms/crc_csum.cpp \
                   $(AMIBERRY_DIR)/src/archivers/dms/u_medium.cpp \
                   $(AMIBERRY_DIR)/src/archivers/dms/u_quick.cpp \
                   $(AMIBERRY_DIR)/src/archivers/dms/u_rle.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/crcio.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/dhuf.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/header.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/huf.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/larc.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/lhamaketbl.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/lharc.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/shuf.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/slide.cpp \
                   $(AMIBERRY_DIR)/src/archivers/lha/uae_lha.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lha/util.cpp \
-                  $(AMIBERRY_DIR)/src/archivers/lzx/unlzx.cpp \
+                  $(AMIBERRY_DIR)/src/archivers/lzx/lzx.cpp \
                   $(AMIBERRY_DIR)/src/archivers/mp2/kjmp2.cpp \
                   $(AMIBERRY_DIR)/src/archivers/wrp/warp.cpp \
                   $(AMIBERRY_DIR)/src/archivers/zip/unzip.cpp \
@@ -564,65 +676,6 @@ SOURCES_SLIRP := $(AMIBERRY_DIR)/src/slirp/bootp.cpp \
                 $(AMIBERRY_DIR)/src/slirp/tftp.cpp \
                 $(AMIBERRY_DIR)/src/slirp/udp.cpp
 
-# PCem
-SOURCES_PCEM := $(AMIBERRY_DIR)/src/pcem/386.cpp \
-               $(AMIBERRY_DIR)/src/pcem/386_common.cpp \
-               $(AMIBERRY_DIR)/src/pcem/386_dynarec.cpp \
-               $(AMIBERRY_DIR)/src/pcem/808x.cpp \
-               $(AMIBERRY_DIR)/src/pcem/cpu.cpp \
-               $(AMIBERRY_DIR)/src/pcem/dosbox/dbopl.cpp \
-               $(AMIBERRY_DIR)/src/pcem/dma.cpp \
-               $(AMIBERRY_DIR)/src/pcem/keyboard.cpp \
-               $(AMIBERRY_DIR)/src/pcem/keyboard_at.cpp \
-               $(AMIBERRY_DIR)/src/pcem/keyboard_at_draco.cpp \
-               $(AMIBERRY_DIR)/src/pcem/mem.cpp \
-               $(AMIBERRY_DIR)/src/pcem/mouse_ps2.cpp \
-               $(AMIBERRY_DIR)/src/pcem/mouse_serial.cpp \
-               $(AMIBERRY_DIR)/src/pcem/dosbox/nukedopl.cpp \
-               $(AMIBERRY_DIR)/src/pcem/nvr.cpp \
-               $(AMIBERRY_DIR)/src/pcem/pcemglue.cpp \
-               $(AMIBERRY_DIR)/src/pcem/pcemrtc.cpp \
-               $(AMIBERRY_DIR)/src/pcem/pic.cpp \
-               $(AMIBERRY_DIR)/src/pcem/pit.cpp \
-               $(AMIBERRY_DIR)/src/pcem/serial.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_cms.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_dbopl.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_mpu401_uart.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_opl.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_sb.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_sb_dsp.cpp \
-               $(AMIBERRY_DIR)/src/pcem/sound_speaker.cpp \
-               $(AMIBERRY_DIR)/src/pcem/timer.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_bt482_ramdac.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_cl5429.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_et4000.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_et4000w32.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_inmos.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_mga.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_ncr.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_permedia2.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_s3.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_s3_virge.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_sc1502x_ramdac.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_sdac_ramdac.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_svga.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_svga_render.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_tvp3026_ramdac.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_banshee.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_banshee_blitter.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_blitter.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_display.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_fb.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_fifo.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_reg.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_render.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_setup.cpp \
-               $(AMIBERRY_DIR)/src/pcem/vid_voodoo_texture.cpp \
-               $(AMIBERRY_DIR)/src/pcem/x86seg.cpp \
-               $(AMIBERRY_DIR)/src/pcem/x87.cpp \
-               $(AMIBERRY_DIR)/src/pcem/x87_timings.cpp
-
 # Miscellaneous hardware / support
 SOURCES_MISC := $(AMIBERRY_DIR)/src/caps/caps_amiberry.cpp \
                $(AMIBERRY_DIR)/src/dsp3210/dsp_glue.cpp \
@@ -638,12 +691,28 @@ SOURCES_MISC := $(AMIBERRY_DIR)/src/caps/caps_amiberry.cpp \
                $(AMIBERRY_DIR)/src/mame/tm34010/tms34010.cpp \
                $(AMIBERRY_DIR)/external/floppybridge/src/floppybridge_lib.cpp
 
+# Object paths. Without OBJDIR an object sits next to its source. With it,
+# ../src/x.cpp becomes $(OBJDIR)/src/x.o and ./x.cpp $(OBJDIR)/libretro/x.o
+# (../libretro/x.cpp is the same file, so one pattern rule builds both);
+# a source elsewhere, such as an EXTRA_SOURCES file, goes under
+# $(OBJDIR)/extra/ by its whole path.
+ifeq ($(OBJDIR),)
+obj_of = $(addsuffix .o,$(basename $(1)))
+else
+obj_rel = $(if $(filter $(AMIBERRY_DIR)/%,$(1)),$(patsubst $(AMIBERRY_DIR)/%,%,$(1)),$(if $(filter $(LIBRETRO_DIR)/%,$(1)),libretro/$(patsubst $(LIBRETRO_DIR)/%,%,$(1)),extra/$(subst ..,__,$(subst :,,$(1)))))
+obj_of = $(foreach s,$(1),$(OBJDIR)/$(basename $(call obj_rel,$(s))).o)
+endif
+
 SOURCES_CXX := $(SOURCES_CORE) $(SOURCES_OSDEP) $(SOURCES_CPU) $(SOURCES_JIT) $(SOURCES_PPC) $(SOURCES_QEMUVGA) $(SOURCES_ARCHIVE) $(SOURCES_SLIRP) $(SOURCES_MISC)
 
-ifeq ($(USE_PCEM),1)
-FLAGS += -DUSE_PCEM
-SOURCES_CXX += $(SOURCES_PCEM)
+NET_SOURCES := $(SOURCES_SLIRP) $(AMIBERRY_DIR)/src/slirp_uae.cpp $(AMIBERRY_DIR)/src/osdep/bsdsocket_host.cpp
+ifneq ($(NET_CFLAGS),)
+$(call obj_of,$(NET_SOURCES)): FLAGS += $(NET_CFLAGS)
 endif
+
+# 86Box (x86 bridgeboards, DraCo, RTG boards): source lists, the opt-in
+# USE_86BOX wiring and the per-object flags live in 86box.mk.
+include 86box.mk
 
 # Optional MT-32/CM-32L emulation via MUNT
 # Note: WITH_MIDIEMU is already defined in sysconfig.h;
@@ -679,37 +748,92 @@ INCFLAGS += -I$(MT32EMU_DIR)
 SOURCES_CXX += $(SOURCES_MT32EMU) $(AMIBERRY_DIR)/src/midiemu.cpp
 endif
 
-SOURCES_C := $(SOURCES_7Z) $(LIBCO_DIR)/libco.c $(SOURCES_LIBRETRO_COMMON)
+# Lhasa (ISC, vendored in external/lhasa): the decoders #include
+# bit_stream_reader.c, lh_new_decoder.c, pma_common.c and tree_decode.c.
+LHASA_DIR := $(AMIBERRY_DIR)/external/lhasa/lib
+SOURCES_LHASA := $(addprefix $(LHASA_DIR)/,crc16.c ext_header.c lha_decoder.c \
+                 lha_endian.c lha_file_header.c lha_input_stream.c \
+                 lha_basic_reader.c lha_reader.c macbinary.c null_decoder.c \
+                 lh1_decoder.c lh5_decoder.c lh6_decoder.c lh7_decoder.c \
+                 lhx_decoder.c lk7_decoder.c lz5_decoder.c lzs_decoder.c \
+                 pm1_decoder.c pm2_decoder.c)
+ifeq ($(platform), win)
+SOURCES_LHASA += $(LHASA_DIR)/lha_arch_win32.c
+else
+SOURCES_LHASA += $(LHASA_DIR)/lha_arch_unix.c
+endif
 
-OBJECTS := $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
+SOURCES_C := $(SOURCES_7Z) $(SOURCES_LHASA) $(LIBCO_DIR)/libco.c $(SOURCES_LIBRETRO_COMMON)
+
+SOURCES_CXX += $(filter %.cpp,$(EXTRA_SOURCES))
+SOURCES_C += $(filter %.c,$(EXTRA_SOURCES))
+ifneq ($(filter-out %.cpp %.c,$(EXTRA_SOURCES)),)
+   $(error EXTRA_SOURCES takes .cpp and .c files: $(filter-out %.cpp %.c,$(EXTRA_SOURCES)))
+endif
+
+OBJECTS := $(call obj_of,$(SOURCES_CXX) $(SOURCES_C))
 
 all: $(TARGET) $(LIBRETRO_INFO)
 
 $(NLOHMANN_JSON_HEADER):
-	@mkdir -p $(NLOHMANN_JSON_DIR)
+	@mkdir -p $(dir $@)
 	curl -sfL -o $@ https://github.com/nlohmann/json/releases/download/$(NLOHMANN_JSON_VERSION)/json.hpp
 
+ifeq ($(STATIC_LINKING), 1)
+$(TARGET): $(OBJECTS)
+	@rm -f $@
+	$(AR) rcs $@ $^
+else
 $(TARGET): $(OBJECTS)
 	$(CXX) $(INCFLAGS) $(FLAGS) -o $@ $^ $(LDFLAGS)
+endif
 
-$(LIBRETRO_INFO): $(LIBRETRO_DIR)/libretro.cpp $(AMIBERRY_DIR)/CMakeLists.txt
-	@printf 'display_name = "Amiberry"\n' > $@
-	@printf 'authors = "Amiberry Team"\n' >> $@
-	@printf 'supported_extensions = "%s"\n' "$(LIBRETRO_SUPPORTED_EXTENSIONS)" >> $@
-	@printf 'corename = "Amiberry"\n' >> $@
-	@printf 'categories = "Emulator"\n' >> $@
-	@printf 'license = "GPLv3"\n' >> $@
-	@printf 'permissions = "Content loading"\n' >> $@
-	@printf 'display_version = "v%s"\n' "$(AMIBERRY_VERSION)" >> $@
-	@printf 'supports_no_game = "true"\n' >> $@
-	@printf 'database = "Commodore - Amiga"\n' >> $@
-	@printf 'notes = "Requires Kickstart ROM files in the frontend system directory."\n' >> $@
+# Canonical core info entry: whenever it changes, submit the generated file to
+# libretro/libretro-super as dist/info/amiberry_libretro.info.
+# libretro/libretro-core-info only mirrors that copy.
+$(LIBRETRO_INFO): $(LIBRETRO_DIR)/amiberry_libretro.info.in $(LIBRETRO_DIR)/libretro.cpp $(AMIBERRY_DIR)/CMakeLists.txt
+	sed -e 's/@SUPPORTED_EXTENSIONS@/$(LIBRETRO_SUPPORTED_EXTENSIONS)/' \
+		-e 's/@VERSION@/$(AMIBERRY_VERSION)/' $< > $@
+
+# STD_CXX is a variable so 86box.mk can build the imported 86Box sources as
+# C++20 (see 86box.mk); everything else stays on C++17.
+STD_CXX := -std=gnu++17
+COMPILE_CXX = $(CXX) $(INCFLAGS) $(FLAGS) $(STD_CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+COMPILE_C = $(CC) $(INCFLAGS) $(FLAGS) -std=gnu99 $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp | $(NLOHMANN_JSON_HEADER)
-	$(CXX) $(INCFLAGS) $(FLAGS) -std=gnu++17 -c -o $@ $<
+	$(COMPILE_CXX)
 
 %.o: %.c
-	$(CC) $(INCFLAGS) $(FLAGS) -std=gnu99 -c -o $@ $<
+	$(COMPILE_C)
+
+ifneq ($(OBJDIR),)
+$(OBJDIR)/%.o: $(AMIBERRY_DIR)/%.cpp | $(NLOHMANN_JSON_HEADER)
+	@mkdir -p $(@D)
+	$(COMPILE_CXX)
+
+$(OBJDIR)/%.o: $(AMIBERRY_DIR)/%.c
+	@mkdir -p $(@D)
+	$(COMPILE_C)
+
+define outside_source_rule
+$(call obj_of,$(1)): $(1) | $(NLOHMANN_JSON_HEADER)
+	@mkdir -p $$(@D)
+	$$(COMPILE_$(if $(filter %.cpp,$(1)),CXX,C))
+endef
+$(foreach s,$(filter-out $(AMIBERRY_DIR)/% $(LIBRETRO_DIR)/%,$(SOURCES_CXX) $(SOURCES_C)),$(eval $(call outside_source_rule,$(s))))
+endif
+
+ifeq ($(platform), win)
+# On Windows, GCC/Clang select libco's amd64.c raw stack-switching backend for
+# x86_64. Those stacks are not registered in the TEB, so SEH-based C++
+# exception unwinding (used by mingw GCC for throws, including the routine
+# caught throws inside the vendored MAME CHD code) cannot dispatch on the
+# emulation cothread stack and kills the process. Undefine __amd64__ for this
+# TU so libco falls through to fiber.c, which uses the Win32 Fiber API
+# (CreateFiber switches TEB stack bounds; exceptions unwind correctly).
+$(call obj_of,$(LIBCO_DIR)/libco.c): FLAGS += -U__amd64__
+endif
 
 clean:
 	rm -f $(OBJECTS) $(TARGET) $(LIBRETRO_INFO)

@@ -60,19 +60,19 @@ object LaunchDiagnostics {
 	}
 
 	private fun LaunchRequest.typeName(): String = when (this) {
-		is LaunchRequest.AdvancedGui -> "AdvancedGui"
 		is LaunchRequest.QuickStart -> "QuickStart"
 		is LaunchRequest.SavedConfig -> "SavedConfig"
 		is LaunchRequest.SettingsConfig -> "SettingsConfig"
+		is LaunchRequest.Autosave -> "Autosave"
 		is LaunchRequest.WhdLoad -> "WhdLoad"
 		is LaunchRequest.Rp9 -> "Rp9"
 	}
 
 	private fun LaunchRequest.configPathOrNull(): String? = when (this) {
-		is LaunchRequest.AdvancedGui -> configPath
 		is LaunchRequest.QuickStart -> configPath
 		is LaunchRequest.SavedConfig -> configPath
 		is LaunchRequest.SettingsConfig -> configPath
+		is LaunchRequest.Autosave -> null
 		is LaunchRequest.WhdLoad -> configPath
 		is LaunchRequest.Rp9 -> null
 	}

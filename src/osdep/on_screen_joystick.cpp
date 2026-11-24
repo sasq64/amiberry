@@ -14,7 +14,6 @@
  */
 
 #include <cmath>
-#include <cstring>
 #include <vector>
 #include <algorithm>
 
@@ -34,6 +33,7 @@ static inline SDL_FRect rect_to_frect(const SDL_Rect* r)
 
 #include "on_screen_joystick.h"
 #include "on_screen_joystick_capture.h"
+#include "on_screen_joystick_latch.h"
 #include "on_screen_joystick_layout.h"
 #include "sysdeps.h"
 #include "inputdevice.h"
@@ -134,6 +134,12 @@ static bool joy_fire1 = false, joy_fire2 = false;
 // Previous state for change detection
 static bool prev_up = false, prev_down = false, prev_left = false, prev_right = false;
 static bool prev_fire1 = false, prev_fire2 = false;
+// Releases are delayed until the next emulated frame so a short host tap is
+// visible to the input sampler.
+static std::uint64_t osj_frame = 0;
+static osj_latch::ReleaseLatch dpad_release_latch;
+static osj_latch::ReleaseLatch fire1_release_latch;
+static osj_latch::ReleaseLatch fire2_release_latch;
 // Keyboard button tapped flag (consumed on read)
 static bool kb_tapped = false;
 static bool joy_kb_pressed = false;
@@ -672,13 +678,17 @@ static void inject_buttons()
 	int dev = get_onscreen_joystick_device_index();
 	if (dev < 0) return;
 
-	if (joy_fire1 != prev_fire1) {
-		setjoybuttonstate(dev, OSJ_BTN_FIRE1, joy_fire1 ? 1 : 0);
-		prev_fire1 = joy_fire1;
+	// A deferred release keeps the button down until its frame boundary, even
+	// when the other button changes state in the meantime.
+	const bool fire1 = joy_fire1 || fire1_release_latch.pending();
+	const bool fire2 = joy_fire2 || fire2_release_latch.pending();
+	if (fire1 != prev_fire1) {
+		setjoybuttonstate(dev, OSJ_BTN_FIRE1, fire1 ? 1 : 0);
+		prev_fire1 = fire1;
 	}
-	if (joy_fire2 != prev_fire2) {
-		setjoybuttonstate(dev, OSJ_BTN_FIRE2, joy_fire2 ? 1 : 0);
-		prev_fire2 = joy_fire2;
+	if (fire2 != prev_fire2) {
+		setjoybuttonstate(dev, OSJ_BTN_FIRE2, fire2 ? 1 : 0);
+		prev_fire2 = fire2;
 	}
 }
 
@@ -714,7 +724,8 @@ static void update_dpad_from_position(int touch_x, int touch_y)
 	float deadzone_px = visual_radius * DPAD_DEADZONE;
 	if (dist < deadzone_px) {
 		joy_up = joy_down = joy_left = joy_right = false;
-		inject_directions();
+		if (!dpad_release_latch.pending())
+			inject_directions();
 		return;
 	}
 
@@ -733,6 +744,7 @@ static void update_dpad_from_position(int touch_x, int touch_y)
 	joy_down  = (sector == 1 || sector == 2 || sector == 3);
 	joy_up    = (sector == 5 || sector == 6 || sector == 7);
 
+	dpad_release_latch.press();
 	inject_directions();
 }
 
@@ -742,20 +754,21 @@ static void release_dpad()
 	knob_offset_x = 0.0f;
 	knob_offset_y = 0.0f;
 	knob_active = false;
-	inject_directions();
+	dpad_release_latch.defer_release(osj_frame);
 }
 
 static void release_button(ControlType ctl)
 {
 	if (ctl == ControlType::button1) {
 		joy_fire1 = false;
+		fire1_release_latch.defer_release(osj_frame);
 	} else if (ctl == ControlType::button2) {
 		joy_fire2 = false;
+		fire2_release_latch.defer_release(osj_frame);
 	} else if (ctl == ControlType::keyboard) {
 		joy_kb_pressed = false;
 		return;  // No Amiga input to inject
 	}
-	inject_buttons();
 }
 
 static void release_control(ControlType ctl)
@@ -803,6 +816,13 @@ static osj_capture::TouchKey event_touch_key(const SDL_Event& event)
 	};
 }
 
+// The KB button is a touch shortcut to the on-screen keyboard. It can be hidden
+// while the keyboard stays reachable through the gamepad toggle.
+static bool keyboard_button_visible()
+{
+	return currprefs.vkbd_enabled && currprefs.vkbd_touch_button;
+}
+
 static ControlType hit_test(int px, int py)
 {
 	if (!layout_snapshot.valid)
@@ -818,23 +838,51 @@ static ControlType hit_test(int px, int py)
 		return ControlType::button1;
 	if (in_circle(layout_snapshot.fire2.acquisition))
 		return ControlType::button2;
-	if (in_circle(layout_snapshot.keyboard.acquisition))
+	if (keyboard_button_visible() && in_circle(layout_snapshot.keyboard.acquisition))
 		return ControlType::keyboard;
 	return ControlType::none;
 }
 
 #ifdef USE_OPENGL
+// The GL context the textures and shader were made in. GL names belong to
+// one context: a context made after it hands the same numbers to its own
+// objects (the renderer's frame texture and programs), which deleting or
+// drawing with these names would hit instead.
+static SDL_GLContext osj_gl_context = nullptr;
+
+static void forget_osj_gl()
+{
+	gl_stick_base_tex = gl_knob_tex = gl_btn1_tex = gl_btn2_tex = gl_btnkb_tex = 0;
+	osj_forget_gl_shader();
+	osj_gl_initialized = false;
+	osj_gl_context = nullptr;
+}
+
 static void cleanup_osj_gl()
 {
-	if (gl_stick_base_tex) { glDeleteTextures(1, &gl_stick_base_tex); gl_stick_base_tex = 0; }
-	if (gl_knob_tex) { glDeleteTextures(1, &gl_knob_tex); gl_knob_tex = 0; }
-	if (gl_btn1_tex) { glDeleteTextures(1, &gl_btn1_tex); gl_btn1_tex = 0; }
-	if (gl_btn2_tex) { glDeleteTextures(1, &gl_btn2_tex); gl_btn2_tex = 0; }
-	if (gl_btnkb_tex) { glDeleteTextures(1, &gl_btnkb_tex); gl_btnkb_tex = 0; }
-	osj_cleanup_gl_shader();
-	osj_gl_initialized = false;
+	// Deleted only where they were made; elsewhere (or once that context is
+	// gone) they are forgotten.
+	if (osj_gl_context && osj_gl_context == SDL_GL_GetCurrentContext()) {
+		if (gl_stick_base_tex) glDeleteTextures(1, &gl_stick_base_tex);
+		if (gl_knob_tex) glDeleteTextures(1, &gl_knob_tex);
+		if (gl_btn1_tex) glDeleteTextures(1, &gl_btn1_tex);
+		if (gl_btn2_tex) glDeleteTextures(1, &gl_btn2_tex);
+		if (gl_btnkb_tex) glDeleteTextures(1, &gl_btnkb_tex);
+		osj_cleanup_gl_shader();
+	}
+	forget_osj_gl();
 }
 #endif // USE_OPENGL
+
+void on_screen_joystick_gl_context_destroyed(void* context)
+{
+#ifdef USE_OPENGL
+	if (context && context == osj_gl_context)
+		forget_osj_gl();
+#else
+	(void)context;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -853,9 +901,13 @@ void on_screen_joystick_init(SDL_Renderer* renderer)
 	btn2_surface = create_button_surface(BTN2_OUTER, BTN2_INNER, BTN2_HIGHLIGHT);
 	btnkb_surface = create_kb_button_surface();
 
-#ifndef USE_OPENGL
-	// Create SDL textures from surfaces (only when using SDL renderer)
+#if defined(USE_OPENGL)
+	// GL builds pass a null renderer (OpenGLRenderer owns no SDL_Renderer);
+	// a non-null renderer means we are on the SDL path — either a no-GL
+	// build or a USE_OPENGL build that demoted to SDLRenderer at runtime —
+	// so create the SDL textures whenever one is available.
 	if (renderer) {
+#endif
 		if (stick_base_surface) {
 			stick_base_tex = SDL_CreateTextureFromSurface(renderer, stick_base_surface);
 			if (stick_base_tex) SDL_SetTextureBlendMode(stick_base_tex, SDL_BLENDMODE_BLEND);
@@ -876,6 +928,7 @@ void on_screen_joystick_init(SDL_Renderer* renderer)
 			btnkb_tex = SDL_CreateTextureFromSurface(renderer, btnkb_surface);
 			if (btnkb_tex) SDL_SetTextureBlendMode(btnkb_tex, SDL_BLENDMODE_BLEND);
 		}
+#if defined(USE_OPENGL)
 	}
 #endif
 
@@ -884,6 +937,10 @@ void on_screen_joystick_init(SDL_Renderer* renderer)
 	joy_fire1 = joy_fire2 = false;
 	prev_up = prev_down = prev_left = prev_right = false;
 	prev_fire1 = prev_fire2 = false;
+	osj_frame = 0;
+	dpad_release_latch.clear();
+	fire1_release_latch.clear();
+	fire2_release_latch.clear();
 	knob_offset_x = 0.0f;
 	knob_offset_y = 0.0f;
 	knob_active = false;
@@ -923,11 +980,27 @@ bool on_screen_joystick_is_enabled()
 	return osj_enabled;
 }
 
+void on_screen_joystick_advance_frame()
+{
+	++osj_frame;
+
+	if (dpad_release_latch.release_due(osj_frame))
+		inject_directions();
+
+	const bool fire1_release_due = fire1_release_latch.release_due(osj_frame);
+	const bool fire2_release_due = fire2_release_latch.release_due(osj_frame);
+	if (fire1_release_due || fire2_release_due)
+		inject_buttons();
+}
+
 void on_screen_joystick_release_all()
 {
 	if (!osj_initialized)
 		return;
 
+	dpad_release_latch.clear();
+	fire1_release_latch.clear();
+	fire2_release_latch.clear();
 	joy_up = joy_down = joy_left = joy_right = false;
 	joy_fire1 = joy_fire2 = false;
 	joy_kb_pressed = false;
@@ -960,6 +1033,10 @@ void on_screen_joystick_set_enabled(bool enabled)
 			// emulation loop must re-run inputdevice_updateconfig.
 			inputdevice_config_change();
 			joystick_refresh_needed = true;
+			// The configuration's custom-control lines for port 1 could not
+			// apply while the file parsed (it does not name this device);
+			// they waited for exactly this assignment.
+			amiberry_apply_pending_custom_options(1);
 		}
 	}
 	else if (osj_initialized) {
@@ -1000,7 +1077,8 @@ bool on_screen_joystick_get_render_info(OsjRenderInfo& info)
 	info.knob = {knob_surface, compute_knob_rect(), knob_active ? (ALPHA_PRESSED / 255.0f) : (ALPHA_NORMAL / 255.0f)};
 	info.btn1 = {btn1_surface, to_sdl_rect(layout_snapshot.fire1.visual), joy_fire1 ? (ALPHA_PRESSED / 255.0f) : (ALPHA_NORMAL / 255.0f)};
 	info.btn2 = {btn2_surface, to_sdl_rect(layout_snapshot.fire2.visual), joy_fire2 ? (ALPHA_PRESSED / 255.0f) : (ALPHA_NORMAL / 255.0f)};
-	info.btnkb = {btnkb_surface, to_sdl_rect(layout_snapshot.keyboard.visual), ALPHA_NORMAL / 255.0f};
+	if (keyboard_button_visible())
+		info.btnkb = {btnkb_surface, to_sdl_rect(layout_snapshot.keyboard.visual), ALPHA_NORMAL / 255.0f};
 	info.screen_w = layout_snapshot.output_bounds.w;
 	info.screen_h = layout_snapshot.output_bounds.h;
 	return true;
@@ -1104,7 +1182,7 @@ void on_screen_joystick_redraw(SDL_Renderer* renderer)
 	}
 
 	// Keyboard button (green)
-	if (btnkb_tex) {
+	if (btnkb_tex && keyboard_button_visible()) {
 		uint8_t alpha = joy_kb_pressed ? ALPHA_PRESSED : ALPHA_NORMAL;
 		SDL_SetTextureAlphaMod(btnkb_tex, alpha);
 		if (joy_kb_pressed) {
@@ -1131,6 +1209,11 @@ void on_screen_joystick_redraw_gl(int drawable_w, int drawable_h,
 	const SDL_Rect btn2_rect = to_sdl_rect(layout_snapshot.fire2.visual);
 	const SDL_Rect btnkb_rect = to_sdl_rect(layout_snapshot.keyboard.visual);
 
+	// Made in the context drawing now; any from another are not usable here.
+	if (osj_gl_context != SDL_GL_GetCurrentContext()) {
+		cleanup_osj_gl();
+		osj_gl_context = SDL_GL_GetCurrentContext();
+	}
 	// Lazy-init GL resources
 	if (!osj_init_gl_shader()) return;
 
@@ -1195,7 +1278,7 @@ void on_screen_joystick_redraw_gl(int drawable_w, int drawable_h,
 	}
 
 	// Keyboard button (green)
-	if (gl_btnkb_tex) {
+	if (gl_btnkb_tex && keyboard_button_visible()) {
 		float alpha = joy_kb_pressed ? (ALPHA_PRESSED / 255.0f) : (ALPHA_NORMAL / 255.0f);
 		osj_render_gl_quad(gl_btnkb_tex, btnkb_rect, drawable_w, drawable_h, alpha);
 	}
@@ -1257,10 +1340,12 @@ bool on_screen_joystick_handle_finger_down(const SDL_Event& event)
 		update_dpad_from_position(px, py);
 		break;
 	case ControlType::button1:
+		fire1_release_latch.press();
 		joy_fire1 = true;
 		inject_buttons();
 		break;
 	case ControlType::button2:
+		fire2_release_latch.press();
 		joy_fire2 = true;
 		inject_buttons();
 		break;

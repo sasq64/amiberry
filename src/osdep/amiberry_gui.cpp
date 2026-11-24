@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdarg>
+#include <cmath>
 #include <fstream>
 #include <algorithm>
 #include <vector>
@@ -25,7 +26,6 @@
 #include "rommgr.h"
 #include "custom.h"
 #include "inputdevice.h"
-#include "audio.h"
 #include "sounddep/sound.h"
 #include "savestate.h"
 #include "filesys.h"
@@ -33,6 +33,15 @@
 #include "memory.h"
 #include "amiberry_gfx.h"
 #include "expansion_display_name.h"
+#include "settings/settings_definitions.h"
+#include "amiberry_reset_chipset_prefs.h"
+#include "amiberry_actions_host.h"
+#include "native_ui_tests.h"
+#include "native_ui_host.h"
+#include "android_overlay.h"
+#ifdef AMIBERRY_NATIVE_HOST
+#include "settings/amiberry_media.h"
+#endif
 #include "irenderer.h"
 #ifdef ARCADIA
 #include "arcadia.h"
@@ -40,7 +49,6 @@
 #include "autoconf.h"
 #include "disk.h"
 #include "xwin.h"
-#include "drawing.h"
 #include "fsdb.h"
 #include "gayle.h"
 #include "parser.h"
@@ -48,6 +56,9 @@
 #include "scsi.h"
 #include "target.h"
 #include "macos_bookmarks.h"
+#ifdef USE_IMGUI
+#include "imgui/imgui_panels.h"
+#endif
 
 #ifdef AMIBERRY
 #if defined(__linux__)
@@ -122,13 +133,17 @@ std::string get_full_path_from_disk_list(std::string element)
 	return full_path;
 }
 
+// Most recently used first: a path already listed moves to the front, an
+// empty path (a drive emptied by a configuration load) is not a file, and
+// the list keeps MAX_MRU_LIST entries.
 void add_file_to_mru_list(std::vector<std::string>& vec, const std::string& file)
 {
-	// Check if the string already exists in the vector
-	if (std::find(vec.begin(), vec.end(), file) == vec.end()) {
-		// The string does not exist in the vector, so add it at the first position
-		vec.insert(vec.begin(), file);
-	}
+	if (file.empty())
+		return;
+	const auto it = std::find(vec.begin(), vec.end(), file);
+	if (it != vec.end())
+		vec.erase(it);
+	vec.insert(vec.begin(), file);
 
 	while (vec.size() > MAX_MRU_LIST)
 		vec.pop_back();
@@ -169,7 +184,7 @@ static int addrom(UAEREG* fkey, struct romdata* rd, const TCHAR* name)
 		TCHAR* p = tmp1 + _tcslen(tmp1);
 		_sntprintf(p, sizeof tmp1 / sizeof(TCHAR) - (p - tmp1), _T("_%02d_%02d"), rd->group >> 16, rd->group & 65535);
 	}
-	getromname(rd, tmp2);
+	getromname(rd, tmp2, sizeof tmp2 / sizeof *tmp2);
 	pathname[0] = 0;
 
 	if (name) {
@@ -220,7 +235,7 @@ static int isromext(const std::string& path, bool deepscan)
 		return 0;
 	const std::string ext = path.substr(ext_pos + 1);
 
-	static const std::vector<std::string> extensions = { "rom", "bin", "a500", "a600", "a1200", "a3000", "a4000", "cdtv", "cd32", "roz" };
+	static const std::vector<std::string> extensions = { "rom", "bin", "a1000", "a500", "a600", "a1200", "a3000", "a4000", "cdtv", "cd32", "roz" };
 	for (const auto& extension : extensions)
 	{
 		if (strcasecmp(ext.c_str(), extension.c_str()) == 0)
@@ -281,7 +296,7 @@ static int scan_rom_2(struct zfile* f, void* vrsd)
 	if (rd)
 	{
 		TCHAR name[MAX_DPATH];
-		getromname(rd, name);
+		getromname(rd, name, sizeof name / sizeof *name);
 		addrom(rsd->fkey, rd, path);
 		if (rd->type & ROMTYPE_KEY)
 			addkeyfile(path);
@@ -633,127 +648,278 @@ ConfigFileInfo* SearchConfigInList(const char* name)
 	return nullptr;
 }
 
-void disk_selection(const int shortcut, uae_prefs* prefs)
+// What a shortcut's requester picked (gui_display(0..6)) takes effect as
+// the panels apply it: DF0-DF3 (0-3), a state to load (4), a state to save
+// (5) and the CD (6).
+// false when the file could not be used (gui_message said why).
+static bool apply_disk_selection(const int shortcut, uae_prefs* prefs, const std::string& selected)
 {
-	// Select Floppy Disk Image
+	if (selected.empty())
+		return true;
+	// Every target is a MAX_DPATH buffer (a save also gains ".uss").
+	if (selected.size() + 4 >= MAX_DPATH) {
+		gui_message("The path is too long: %s", selected.c_str());
+		return false;
+	}
 	if (shortcut >= 0 && shortcut < 4)
 	{
-		std::string tmp;
-		if (strlen(prefs->floppyslots[shortcut].df) > 0)
-			tmp = std::string(prefs->floppyslots[shortcut].df);
-		else
-			tmp = get_floppy_path();
-
-		if (!tmp.empty())
+		if (strncmp(prefs->floppyslots[shortcut].df, selected.c_str(), MAX_DPATH) != 0)
 		{
-			if (strncmp(prefs->floppyslots[shortcut].df, tmp.c_str(), MAX_DPATH) != 0)
-			{
-				strncpy(prefs->floppyslots[shortcut].df, tmp.c_str(), MAX_DPATH);
-				disk_insert(shortcut, tmp.c_str());
-				add_file_to_mru_list(lstMRUDiskList, tmp);
-				set_last_active_config_from_media(tmp.c_str());
-			}
+			strncpy(prefs->floppyslots[shortcut].df, selected.c_str(), MAX_DPATH);
+			disk_insert(shortcut, selected.c_str());
+			add_file_to_mru_list(lstMRUDiskList, selected);
+			set_last_active_config_from_media(selected.c_str());
 		}
 	}
 	else if (shortcut == 4)
 	{
-		// Load a Save state
-		TCHAR tmp[MAX_DPATH];
-		get_savestate_path(tmp, sizeof tmp / sizeof(TCHAR));
-
-		std::string selected;
-
-		if (!selected.empty())
-		{
-			_tcscpy(savestate_fname, selected.c_str());
-			savestate_initsave(savestate_fname, 1, true, true);
-			savestate_state = STATE_DORESTORE;
-
-			const auto filename = extract_filename(savestate_fname);
-			screenshot_filename = get_screenshot_path();
-			screenshot_filename += filename;
-			screenshot_filename = remove_file_extension(screenshot_filename);
-			screenshot_filename += ".png";
+		// A restore starts with a reset even when the file is then refused:
+		// check what restore_state() checks first, as the action API does.
+		if (!zfile_exists(selected.c_str()) || !savestate_is_state_file(selected.c_str())) {
+			gui_message("Not a state file: %s", selected.c_str());
+			return false;
 		}
-		else {
-			savestate_fname[0] = 0;
-		}
+		// As the state hotkey's restore (AKS_STATERESTOREDIALOG): restore
+		// mode, which leaves an input recording alone.
+		savestate_initsave(selected.c_str(), 1, true, false);
+		savestate_state = STATE_DORESTORE;
+		// Not a slot: gui_update() would put the slot's file back.
+		current_state_num = 99;
+
+		const auto filename = extract_filename(savestate_fname);
+		screenshot_filename = get_screenshot_path();
+		screenshot_filename += filename;
+		screenshot_filename = remove_file_extension(screenshot_filename);
+		screenshot_filename += ".png";
 	}
 	else if (shortcut == 5)
 	{
-		// Save a state
-		TCHAR tmp[MAX_DPATH];
-		get_savestate_path(tmp, sizeof tmp / sizeof(TCHAR));
-
-		std::string selected;
-		if (!selected.empty())
-		{
-			// ensure the selected filename ends with .uss
-			if (selected.size() < 4 || selected.substr(selected.size() - 4) != ".uss")
-			{
-				selected += ".uss";
-			}
-
-			_tcscpy(savestate_fname, selected.c_str());
-			_tcscat(tmp, savestate_fname);
-			save_state(savestate_fname, _T("Description!"));
-			if (create_screenshot())
-			{
-				const auto filename = extract_filename(savestate_fname);
-				screenshot_filename = get_screenshot_path();
-				screenshot_filename += filename;
-				screenshot_filename = remove_file_extension(screenshot_filename);
-				screenshot_filename += ".png";
-				save_thumb(screenshot_filename);
+		std::string path = selected;
+		// ensure the selected filename ends with .uss
+		if (path.size() < 4 || path.substr(path.size() - 4) != ".uss") {
+			path += ".uss";
+			// The requester confirmed replacing what was picked, not this.
+			if (zfile_exists(path.c_str())) {
+				gui_message("%s already exists. Choose it to replace it.", path.c_str());
+				return false;
 			}
 		}
+
+		// As the state hotkey's save (AKS_STATESAVEDIALOG): compressed, with
+		// the save's flags set up for this file.
+		TCHAR previous[MAX_DPATH];
+		_tcscpy(previous, savestate_fname);
+		savestate_initsave(path.c_str(), 1, true, true);
+		// save_state() returns 0 (or less) when the file was not written;
+		// no thumbnail then, which would look like a valid state's. The
+		// state name stays what it was (the GUI's slot still means it).
+		if (save_state(savestate_fname, STATE_SAVE_DESCRIPTION) <= 0) {
+			_tcscpy(savestate_fname, previous);
+			gui_message("The state could not be saved to %s", path.c_str());
+			return false;
+		}
+		// The preview follows the saved state; an older thumbnail of the
+		// same name would show a state that is no longer there.
+		const auto filename = extract_filename(savestate_fname);
+		screenshot_filename = get_screenshot_path();
+		screenshot_filename += filename;
+		screenshot_filename = remove_file_extension(screenshot_filename);
+		screenshot_filename += ".png";
+		if (!create_screenshot() || !save_thumb(screenshot_filename))
+			std::remove(screenshot_filename.c_str());
 	}
-	// Select CD Image
 	else if (shortcut == 6)
 	{
-		std::string tmp;
-		if (prefs->cdslots[0].inuse && strlen(prefs->cdslots[0].name) > 0)
-			tmp = std::string(prefs->cdslots[0].name);
-		else
-			tmp = get_cdrom_browse_path();
-
-		if (!tmp.empty())
+		if (strncmp(prefs->cdslots[0].name, selected.c_str(), MAX_DPATH) != 0)
 		{
-			if (strncmp(prefs->cdslots[0].name, tmp.c_str(), MAX_DPATH) != 0)
-			{
-				strncpy(prefs->cdslots[0].name, tmp.c_str(), MAX_DPATH);
-				changed_prefs.cdslots[0].inuse = true;
-				changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
-				add_file_to_mru_list(lstMRUCDList, tmp);
-				set_last_active_config_from_media(tmp.c_str());
-			}
+			strncpy(prefs->cdslots[0].name, selected.c_str(), MAX_DPATH);
+			changed_prefs.cdslots[0].inuse = true;
+			changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
+			add_file_to_mru_list(lstMRUCDList, selected);
+			set_last_active_config_from_media(selected.c_str());
+			// As AKS_CD0 with a path: the running emulation picks it up.
+			set_config_changed();
 		}
 	}
-}
-
-bool gui_ask_disk(int drv, TCHAR *name)
-{
-	_tcscpy(changed_prefs.floppyslots[drv].df, name);
-	disk_selection(drv, &changed_prefs);
-	_tcscpy(name, changed_prefs.floppyslots[drv].df);
 	return true;
 }
 
-static void prefs_to_gui()
+#ifdef USE_IMGUI
+void request_disk_selection(const int shortcut, const bool close_gui, std::function<void()> after)
 {
-	//
-	// GUI Theme section
-	//
+	std::string title, start;
+	const char* filters = floppy_file_filter;
+	bool save = false;
+	if (shortcut >= 0 && shortcut < 4) {
+		title = "Insert a disk image into DF" + std::to_string(shortcut) + ":";
+		start = changed_prefs.floppyslots[shortcut].df[0] ? changed_prefs.floppyslots[shortcut].df : get_floppy_path();
+	} else if (shortcut == 4 || shortcut == 5) {
+		title = shortcut == 4 ? "Load a state" : "Save the state";
+		// A save offers .uss only, so the dialog adds the extension and its
+		// overwrite check sees the file that is written.
+		filters = shortcut == 5 ? "Amiberry state files (*.uss){.uss}"
+			: "Amiberry state files (*.uss){.uss},All Files (*){.*}";
+		save = shortcut == 5;
+		TCHAR folder[MAX_DPATH];
+		get_savestate_path(folder, sizeof folder / sizeof(TCHAR));
+		start = folder;
+	} else if (shortcut == 6) {
+		title = "Insert a CD image";
+		filters = "CD Images (*.cue,*.iso,*.ccd,*.mds,*.chd,*.nrg){.cue,.iso,.ccd,.mds,.chd,.nrg},All Files (*){.*}";
+		start = changed_prefs.cdslots[0].inuse && changed_prefs.cdslots[0].name[0] ? changed_prefs.cdslots[0].name
+			: get_cdrom_browse_path();
+	} else {
+		return;
+	}
+	MediaRequestDialog_Open(title.c_str(), filters, start, save, close_gui,
+		[shortcut, after = std::move(after)](const std::string& path) {
+			if (!apply_disk_selection(shortcut, &changed_prefs, path))
+				return false;
+			if (after)
+				after();
+			return true;
+		});
+}
+#endif
+
+#ifdef AMIBERRY_NATIVE_HOST
+// The shortcuts' requesters on the native macOS front end.
+static void native_disk_selection(const int shortcut, uae_prefs* prefs)
+{
+	// A hotkey's requester: gui_display() runs between frames.
+	const native_host_between_frames between_frames;
+	std::string title, start, chosen;
+	native_host_file kind = native_host_file::floppy;
+	if (shortcut >= 0 && shortcut < 4) {
+		title = "Insert a disk image into DF" + std::to_string(shortcut) + ":";
+		start = prefs->floppyslots[shortcut].df[0] ? prefs->floppyslots[shortcut].df : get_floppy_path();
+	} else if (shortcut == 4 || shortcut == 5) {
+		kind = shortcut == 4 ? native_host_file::load_state : native_host_file::save_state;
+		title = shortcut == 4 ? "Load a state" : "Save the state";
+		TCHAR folder[MAX_DPATH];
+		get_savestate_path(folder, sizeof folder / sizeof(TCHAR));
+		start = folder;
+	} else {
+		kind = native_host_file::cd;
+		title = "Insert a CD image";
+		start = prefs->cdslots[0].inuse && prefs->cdslots[0].name[0] ? prefs->cdslots[0].name
+			: get_cdrom_browse_path();
+	}
+	if (!native_host_choose_file(kind, title, start, chosen))
+		return;
+	// Keeps the pick usable after a restart on a Mac App Store build.
+	amiberry_media_grant_access(chosen.c_str());
+	apply_disk_selection(shortcut, prefs, chosen);
+}
+#endif
+
+bool gui_ask_disk(const int drv, TCHAR* name, const int name_len)
+{
+	if (drv < 0 || drv >= 4 || !name || name_len <= 0)
+		return false;
+
+#if defined(AMIBERRY_NATIVE_HOST)
+	std::string chosen;
+	if (!native_host_choose_file(native_host_file::floppy,
+			"The disk image for DF" + std::to_string(drv) + ": was not found. Locate it or a replacement.",
+			name, chosen))
+		return false;
+	if (chosen.length() >= static_cast<size_t>(name_len)) {
+		write_log(_T("Replacement disk path is too long.\n"));
+		return false;
+	}
+	amiberry_media_grant_access(chosen.c_str());
+	_tcscpy(name, chosen.c_str());
+	return true;
+#elif defined(__ANDROID__)
+	// The recovery requester without the built-in GUI: the overlay's
+	// Compose dialog (Locate, Skip, Eject) answers over JNI while this
+	// thread waits. An empty replacement ejects the drive in the caller.
+	std::string chosen;
+	if (!android_overlay_ask_disk(drv, name, chosen))
+		return false;
+	if (chosen.length() >= static_cast<size_t>(name_len)) {
+		write_log(_T("Replacement disk path is too long.\n"));
+		return false;
+	}
+	_tcscpy(name, chosen.c_str());
+	return true;
+#elif defined(USE_IMGUI)
+	static bool active;
+	if (active)
+		return false;
+
+	active = true;
+	FloppyRecoveryDialog_Open(drv, name);
+	gui_display(-1);
+
+	std::string selected_path;
+	const bool selected = FloppyRecoveryDialog_ConsumeResult(selected_path);
+	active = false;
+	if (!selected)
+		return false;
+
+	if (selected_path.length() >= static_cast<size_t>(name_len)) {
+		write_log(_T("Replacement disk path is too long.\n"));
+		return false;
+	}
+
+	_tcscpy(name, selected_path.c_str());
+	return true;
+#else
+	return false;
+#endif
+}
+
+// The settings UI: the native window on macOS native UI builds, the
+// Android app's own menu there (at [page] for a media or state hotkey,
+// whose pickers and state slots take the requesters, or at its Home for
+// the settings), and the built-in (ImGui) GUI everywhere else. Android
+// has no built-in GUI: a start without -G (a direct one of the binary)
+// opens the menu before the emulation instead.
+static void run_settings_ui([[maybe_unused]] const bool requester = false,
+	[[maybe_unused]] const int page = -1)
+{
+#if defined(AMIBERRY_NATIVE_HOST)
+	native_host_run_settings();
+#elif defined(__ANDROID__)
+	android_overlay_run(page);
+#else
+	run_gui();
+#endif
+}
+
+static void load_gui_theme()
+{
 	if (amiberry_options.gui_theme[0])
 		load_theme(amiberry_options.gui_theme);
 	else
 		load_default_theme();
-	
-	copy_prefs(&currprefs, &changed_prefs);
+}
 
-	/* filesys hack */
+static void prefs_to_gui()
+{
+	load_gui_theme();
+
+	// Hard-reset-only chipset settings would otherwise snap back to the
+	// running machine's values here, hiding a pending change (#2459).
+	const auto pending_chipset = get_reset_only_chipset_prefs(changed_prefs);
+	// currprefs holds effective access modes, not a pending Direct choice.
+	const int comptrustbyte = changed_prefs.comptrustbyte;
+	const int comptrustword = changed_prefs.comptrustword;
+	const int comptrustlong = changed_prefs.comptrustlong;
+	const int comptrustnaddr = changed_prefs.comptrustnaddr;
+	copy_prefs(&currprefs, &changed_prefs);
+	set_reset_only_chipset_prefs(changed_prefs, pending_chipset);
+	changed_prefs.comptrustbyte = comptrustbyte;
+	changed_prefs.comptrustword = comptrustword;
+	changed_prefs.comptrustlong = comptrustlong;
+	changed_prefs.comptrustnaddr = comptrustnaddr;
+
+	/* filesys hack: the whole list (an entry is a uaedev_config_data, larger
+	   than the uaedev_config_info the copy was once sized by) */
 	changed_prefs.mountitems = currprefs.mountitems;
-	memcpy(&changed_prefs.mountconfig, &currprefs.mountconfig, MOUNT_CONFIG_SIZE * sizeof(struct uaedev_config_info));
+	memcpy(&changed_prefs.mountconfig, &currprefs.mountconfig, sizeof changed_prefs.mountconfig);
 }
 
 static void gui_to_prefs(void)
@@ -765,26 +931,10 @@ static void gui_to_prefs(void)
 		memory_hardreset(2);
 	}
 	/* filesys hack */
-	currprefs.mountitems = changed_prefs.mountitems;
-	memcpy(&currprefs.mountconfig, &changed_prefs.mountconfig, MOUNT_CONFIG_SIZE * sizeof(struct uaedev_config_info));
+	adopt_pending_mount_list();
 
 #ifdef AMIBERRY
-	if (currprefs.drawbridge_driver != changed_prefs.drawbridge_driver ||
-		currprefs.drawbridge_serial_auto != changed_prefs.drawbridge_serial_auto ||
-		_tcsicmp(currprefs.drawbridge_serial_port, changed_prefs.drawbridge_serial_port) != 0 ||
-		currprefs.drawbridge_smartspeed != changed_prefs.drawbridge_smartspeed ||
-		currprefs.drawbridge_autocache != changed_prefs.drawbridge_autocache ||
-		currprefs.drawbridge_drive_cable != changed_prefs.drawbridge_drive_cable)
-	{
-		currprefs.drawbridge_driver = changed_prefs.drawbridge_driver;
-		currprefs.drawbridge_serial_auto = changed_prefs.drawbridge_serial_auto;
-		_tcscpy(currprefs.drawbridge_serial_port, changed_prefs.drawbridge_serial_port);
-		currprefs.drawbridge_smartspeed = changed_prefs.drawbridge_smartspeed;
-		currprefs.drawbridge_autocache = changed_prefs.drawbridge_autocache;
-		currprefs.drawbridge_drive_cable = changed_prefs.drawbridge_drive_cable;
-		if (quit_program != UAE_QUIT)
-			drawbridge_update_profiles(&currprefs);
-	}
+	drawbridge_check_prefs_changed();
 #endif
 
 	fixup_prefs(&changed_prefs, true);
@@ -826,9 +976,18 @@ int gui_init()
 	auto ret = 0;
 
 	read_rom_list(false);
+#ifdef AMIBERRY_NATIVE_UI_TESTS
+	// The bridge tests run where a settings UI would, then the emulator
+	// quits without starting emulation.
+	if (native_ui_tests_requested()) {
+		native_ui_tests_run();
+		quit_program = UAE_QUIT;
+		return -2;
+	}
+#endif
 
 	prefs_to_gui();
-	run_gui();
+	run_settings_ui();
 	gui_to_prefs();
 
 	if (quit_program < 0)
@@ -865,29 +1024,21 @@ void gui_purge_events()
 void gui_update()
 {
 	if (current_state_num == 99) return;
+	// A state load scheduled while the GUI was open (a load_state action
+	// from the Android menu or IPC) names its own file in savestate_fname;
+	// renaming it to the slot's would restore the wrong file, or none.
+	if (savestate_state & (STATE_DORESTORE | STATE_RESTORE)) return;
 
-	std::string filename;
+	const std::string name = current_content_name();
+	if (name.empty())
+		return;
 	const std::string suffix = current_state_num >= 1 && current_state_num <= 14 ?
 		"-" + std::to_string(current_state_num) : "";
 
-	if (strlen(currprefs.floppyslots[0].df) > 0)
-		filename = extract_filename(currprefs.floppyslots[0].df);
-	else if (currprefs.cdslots[0].inuse && strlen(currprefs.cdslots[0].name) > 0)
-		filename = extract_filename(currprefs.cdslots[0].name);
-	else if (!whdload_prefs.whdload_filename.empty())
-		filename = extract_filename(whdload_prefs.whdload_filename);
-	else if (strlen(last_active_config) > 0)
-		filename = std::string(last_active_config) + ".uss";
-	else
-		return;
-
 	get_savestate_path(savestate_fname, MAX_DPATH - 1);
-	strncat(savestate_fname, filename.c_str(), MAX_DPATH - 1);
-	remove_file_extension(savestate_fname);
-	strncat(savestate_fname, (suffix + ".uss").c_str(), MAX_DPATH - 1);
+	strncat(savestate_fname, (name + suffix + ".uss").c_str(), MAX_DPATH - 1 - strlen(savestate_fname));
 
-	screenshot_filename = remove_file_extension(get_screenshot_path() + filename);
-	screenshot_filename.append(suffix + ".png");
+	screenshot_filename = get_screenshot_path() + name + suffix + ".png";
 }
 
 /* if drive is -1, show the full GUI, otherwise file-requester for DF[drive] */
@@ -912,21 +1063,48 @@ void gui_display(int shortcut)
 		setmouseactive(0, 0);
 	}
 
+	bool requester = false;
+	int page = 0;
+#ifdef __ANDROID__
+	// A hotkey opens the menu at its page: the menu's own pickers and
+	// state slots answer it (run_settings_ui opens it at [page], and its
+	// actions insert, load and save). There is no built-in GUI whose file
+	// requester could take it instead.
+	if (shortcut >= 0 && shortcut <= 6) {
+		page = shortcut;
+		shortcut = -1;
+		requester = true;
+	}
+#elif defined(USE_IMGUI)
+	// A hotkey's requester shows over the GUI, which closes once it is
+	// answered.
+	if (shortcut >= 0 && shortcut <= 6) {
+		page = shortcut;
+		shortcut = -1;
+		requester = true;
+		request_disk_selection(page, true);
+	}
+#endif
 	if (shortcut == -1)
 	{
-		prefs_to_gui();
-		run_gui();
+		// A requester keeps changed_prefs as it is: changes not yet applied
+		// (another hotkey's, earlier in the same input pass) must survive
+		// it, as they did before the requester used the GUI.
+		if (requester)
+			load_gui_theme();
+		else
+			prefs_to_gui();
+		run_settings_ui(requester, requester ? page : -1);
 		gui_to_prefs();
 
 		gui_update();
 		gui_purge_events();
-		gui_active--;
 	}
 	else if (shortcut >= 0 && shortcut <= 6)
 	{
-		amiberry_gui_init();
-		disk_selection(shortcut, &changed_prefs);
-		amiberry_gui_halt();
+#ifdef AMIBERRY_NATIVE_HOST
+		native_disk_selection(shortcut, &changed_prefs);
+#endif
 	}
 
 	reset_sound();
@@ -940,6 +1118,9 @@ void gui_display(int shortcut)
 	if (mon->amiga_window) {
 		SDL_RaiseWindow(mon->amiga_window);
 	}
+	// The GUI may have loaded another config; the emulation window can be
+	// reused without recreation, and shared-window setups still show the GUI title.
+	refreshtitle();
 
 	if (resumepaused_without_mouse_capture(7)) {
 		const bool restore_capture_allowed = restore_capture && (!restore_capture_was_automatic || currprefs.capture_always);
@@ -967,6 +1148,8 @@ void gui_display(int shortcut)
 			inputdevice_releasebuttons();
 		}
 	}
+	// A PAUSE action executed while the GUI held its pause takes over now.
+	amiberry_actions_gui_closed();
 	//rawinput_alloc();
 	// Drain any mouse events generated by re-enabling grabs / relative mode.
 	// The clickthrough hint (reset in amiberry_gui_halt) only helps windowed
@@ -1205,7 +1388,23 @@ void gui_message(const char* format, ...)
 	va_start(parms, format);
 	_vsntprintf(msg, sizeof(msg), format, parms);
 	va_end(parms);
-#ifdef USE_IMGUI
+#if defined(AMIBERRY_NATIVE_HOST)
+	// Shown at once while the emulation is held for the settings window or
+	// a requester (on the main thread); otherwise when the settings window
+	// next opens, as the built-in GUI showed its message box. Worker threads
+	// (hard drives, PPC) report here too.
+	write_log(_T("%s\n"), msg);
+	if (is_mainthread() && (gui_active > 0 || native_host_settings_open()))
+		native_host_message("Message", msg);
+	else
+		native_host_message_deferred(msg);
+#elif defined(__ANDROID__)
+	// The overlay's Compose message box, over whatever runs (the
+	// emulation does not stop for it); worker threads report here too.
+	// The text is in the log as everywhere.
+	write_log(_T("%s\n"), msg);
+	android_overlay_message(msg);
+#elif defined(USE_IMGUI)
 	ShowMessageBox("Message", msg);
 #endif
 }
@@ -1341,40 +1540,9 @@ struct tapedlg_vals current_tapedlg;
 struct fsvdlg_vals current_fsvdlg;
 struct hfdlg_vals current_hfdlg;
 
-void hardfile_testrdb (struct hfdlg_vals* hdf) 
+void hardfile_testrdb (struct hfdlg_vals* hdf)
 {
-	uae_u8 id[512];
-	struct hardfiledata hfd{};
-
-	memset(id, 0, sizeof id);
-	memset(&hfd, 0, sizeof hfd);
-	hfd.ci.readonly = true;
-	hfd.ci.blocksize = 512;
-	hdf->rdb = 0;
-	if (hdf_open(&hfd, hdf->ci.rootdir) > 0) {
-		for (auto i = 0; i < 16; i++) {
-			hdf_read_rdb(&hfd, id, i * 512, 512);
-			auto babe = id[0] == 0xBA && id[1] == 0xBE; // A2090
-			if (!memcmp(id, "RDSK\0\0\0", 7) || !memcmp(id, "CDSK\0\0\0", 7) || !memcmp(id, "DRKS\0\0", 6) ||
-				(id[0] == 0x53 && id[1] == 0x10 && id[2] == 0x9b && id[3] == 0x13 && id[4] == 0 && id[5] == 0) || babe) {
-				// RDSK or ADIDE "encoded" RDSK
-				auto blocksize = 512;
-				if (!babe)
-					blocksize = (id[16] << 24) | (id[17] << 16) | (id[18] << 8) | (id[19] << 0);
-				hdf->ci.cyls = hdf->ci.highcyl = hdf->forcedcylinders = 0;
-				hdf->ci.sectors = 0;
-				hdf->ci.surfaces = 0;
-				hdf->ci.reserved = 0;
-				hdf->ci.bootpri = 0;
-				//hdf->ci.devname[0] = 0;
-				if (blocksize >= 512)
-					hdf->ci.blocksize = blocksize;
-				hdf->rdb = 1;
-				break;
-			}
-		}
-		hdf_close(&hfd);
-	}
+	hdf->rdb = amiberry_settings::mount_rdb_geometry(hdf->ci.rootdir, hdf->ci) ? 1 : 0;
 }
 
 void default_fsvdlg(struct fsvdlg_vals* f)
@@ -1601,122 +1769,35 @@ void new_harddrive(int entry)
 	}
 }
 
-void addhdcontroller(const struct expansionromtype* erc, int firstid, int flags)
-{
-	TCHAR name[MAX_DPATH];
-	const TCHAR* display_name = expansion_display_name(erc->friendlyname, erc->friendlymanufacturer);
-	name[0] = 0;
-	if (erc->friendlymanufacturer && _tcsicmp(erc->friendlymanufacturer, display_name)) {
-		_tcscat(name, erc->friendlymanufacturer);
-		_tcscat(name, _T(" "));
-	}
-	_tcscat(name, display_name);
-	if (changed_prefs.cpuboard_type && erc->romtype == ROMTYPE_CPUBOARD) {
-		const struct cpuboardsubtype* cbt = &cpuboards[changed_prefs.cpuboard_type].subtypes[changed_prefs.cpuboard_subtype];
-		if (!(cbt->deviceflags & flags))
-			return;
-		_tcscat(name, _T(" ("));
-		_tcscat(name, cbt->name);
-		_tcscat(name, _T(")"));
-	}
-	if (get_boardromconfig(&changed_prefs, erc->romtype, nullptr) || get_boardromconfig(&changed_prefs, erc->romtype_extra, nullptr)) {
-		auto name_string = std::string(name);
-		controller.push_back({ firstid, name_string });
-		for (int j = 1; j < MAX_DUPLICATE_EXPANSION_BOARDS; j++) {
-			if (is_board_enabled(&changed_prefs, erc->romtype, j)) {
-				TCHAR tmp[MAX_DPATH];
-				_sntprintf(tmp, sizeof tmp, _T("%s [%d]"), name, j + 1);
-				auto tmp_string = std::string(tmp);
-				controller.push_back({ firstid + j * HD_CONTROLLER_NEXT_UNIT, tmp_string });
-			}
-		}
-	}
-}
 
 void inithdcontroller(int ctype, int ctype_unit, int devtype, bool media)
 {
+	(void)media;
 	controller.clear();
-	// A CD-ROM cannot be attached to the UAE (uaehf.device) controller as a
-	// mountconfig entry: add_filesys_config() rejects it (UAE CDs are handled
-	// via the uaescsi.device/cdslot mechanism instead). Offering it here would
-	// let the user pick a controller that silently fails to apply.
-	if (devtype != UAEDEV_CD)
-		controller.push_back({ HD_CONTROLLER_TYPE_UAE, _T("UAE (uaehf.device)") });
-	controller.push_back({ HD_CONTROLLER_TYPE_IDE_AUTO, _T("IDE (Auto)") });
-
-	for (auto i = 0; expansionroms[i].name; i++) {
-		const auto* const erc = &expansionroms[i];
-		if (erc->deviceflags & EXPANSIONTYPE_IDE) {
-			addhdcontroller(erc, HD_CONTROLLER_TYPE_IDE_EXPANSION_FIRST + i, EXPANSIONTYPE_IDE);
-		}
-	}
-
-	controller.push_back({ HD_CONTROLLER_TYPE_SCSI_AUTO, _T("SCSI (Auto)") });
-	for (int i = 0; expansionroms[i].name; i++) {
-		const struct expansionromtype* erc = &expansionroms[i];
-		if (erc->deviceflags & EXPANSIONTYPE_SCSI) {
-			addhdcontroller(erc, HD_CONTROLLER_TYPE_SCSI_EXPANSION_FIRST + i, EXPANSIONTYPE_SCSI);
-		}
-	}
-
-	for (int i = 0; expansionroms[i].name; i++) {
-		const struct expansionromtype* erc = &expansionroms[i];
-		if (erc->deviceflags & EXPANSIONTYPE_CUSTOMDISK) {
-			addhdcontroller(erc, HD_CONTROLLER_TYPE_CUSTOM_FIRST + i, EXPANSIONTYPE_CUSTOMDISK);
-			break;
-		}
+	const unsigned int kind = devtype == UAEDEV_CD ? amiberry_settings::MOUNT_KIND_CD
+		: devtype == UAEDEV_TAPE ? amiberry_settings::MOUNT_KIND_TAPE : amiberry_settings::MOUNT_KIND_HDF;
+	const std::vector<amiberry_settings::mount_controller> controllers =
+		amiberry_settings::mount_controllers(&changed_prefs);
+	for (const amiberry_settings::mount_controller& item : controllers) {
+		if (item.kinds & kind)
+			controller.push_back({item.type + item.type_unit * HD_CONTROLLER_NEXT_UNIT, item.label});
 	}
 
 	controller_unit.clear();
-	if (ctype >= HD_CONTROLLER_TYPE_IDE_FIRST && ctype <= HD_CONTROLLER_TYPE_IDE_LAST) {
-		const struct expansionromtype* ert = get_unit_expansion_rom(ctype);
-		int ports = 2 + (ert ? ert->extrahdports : 0);
-		for (int i = 0; i < ports; i += 2) {
-			TCHAR tmp[100];
-			_sntprintf(tmp, sizeof tmp, _T("%d"), i + 0);
-			controller_unit.push_back({ std::string(tmp) });
-			_sntprintf(tmp, sizeof tmp, _T("%d"), i + 1);
-			controller_unit.push_back({ std::string(tmp) });
-		}
-		//if (media)
-		//	ew(hDlg, IDC_HDF_CONTROLLER_UNIT, TRUE);
-	}
-	else if (ctype >= HD_CONTROLLER_TYPE_SCSI_FIRST && ctype <= HD_CONTROLLER_TYPE_SCSI_LAST) {
-		const struct expansionromtype* ert = get_unit_expansion_rom(ctype);
-		controller_unit.emplace_back("0");
-		controller_unit.emplace_back("1");
-		if (!ert || !(ert->deviceflags & (EXPANSIONTYPE_SASI | EXPANSIONTYPE_CUSTOM))) {
-			controller_unit.emplace_back("2");
-			controller_unit.emplace_back("3");
-			controller_unit.emplace_back("4");
-			controller_unit.emplace_back("5");
-			controller_unit.emplace_back("6");
-			controller_unit.emplace_back("7");
-			if (devtype == UAEDEV_HDF && ert && !_tcscmp(ert->name, _T("a2091")))
-				controller_unit.emplace_back("XT");
-			if (devtype == UAEDEV_HDF && ert && !_tcscmp(ert->name, _T("a2090a"))) {
-				controller_unit.emplace_back("ST-506 #1");
-				controller_unit.emplace_back("ST-506 #2");
+	const auto add_units = [&](const std::vector<amiberry_settings::mount_controller>& list) {
+		for (const amiberry_settings::mount_controller& item : list) {
+			if (item.type != ctype || item.type_unit != ctype_unit)
+				continue;
+			for (const amiberry_settings::mount_controller_unit& unit : item.units) {
+				if (unit.kinds & kind)
+					controller_unit.push_back(unit.label);
 			}
+			return true;
 		}
-		//if (media)
-		//	ew(hDlg, IDC_HDF_CONTROLLER_UNIT, TRUE);
-	}
-	else if (ctype >= HD_CONTROLLER_TYPE_CUSTOM_FIRST && ctype <= HD_CONTROLLER_TYPE_CUSTOM_LAST) {
-		//ew(hDlg, IDC_HDF_CONTROLLER_UNIT, FALSE);
-	}
-	else if (ctype == HD_CONTROLLER_TYPE_UAE) {
-		for (int i = 0; i < MAX_FILESYSTEM_UNITS; i++) {
-			TCHAR tmp[100];
-			_sntprintf(tmp, sizeof tmp, _T("%d"), i);
-			controller_unit.push_back({ std::string(tmp) });
-		}
-		//if (media)
-		//	ew(hDlg, IDC_HDF_CONTROLLER_UNIT, TRUE);
-	}
-	//else {
-	//	ew(hDlg, IDC_HDF_CONTROLLER_UNIT, FALSE);
-	//}
+		return false;
+	};
+	if (!add_units(controllers))
+		add_units(amiberry_settings::mount_controllers(nullptr));
 
 	controller_type.clear();
 	controller_type.emplace_back("HD");
@@ -1727,8 +1808,7 @@ void inithdcontroller(int ctype, int ctype_unit, int devtype, bool media)
 		controller_feature_level.emplace_back("ATA-1");
 		controller_feature_level.emplace_back("ATA-2+");
 		controller_feature_level.emplace_back("ATA-2+ Strict");
-	}
-	else if (ctype >= HD_CONTROLLER_TYPE_SCSI_FIRST && ctype <= HD_CONTROLLER_TYPE_SCSI_LAST) {
+	} else if (ctype >= HD_CONTROLLER_TYPE_SCSI_FIRST && ctype <= HD_CONTROLLER_TYPE_SCSI_LAST) {
 		const struct expansionromtype* ert = get_unit_expansion_rom(ctype);
 		controller_feature_level.emplace_back("SCSI-1");
 		controller_feature_level.emplace_back("SCSI-2");
@@ -1738,6 +1818,7 @@ void inithdcontroller(int ctype, int ctype_unit, int devtype, bool media)
 		}
 	}
 }
+
 
 bool isguiactive()
 {
@@ -1876,7 +1957,10 @@ void DisplayDiskInfo(int num)
 		linebuffer[w * 3 + 1 + w] = 0;
 		infotext.emplace_back(linebuffer);
 	}
+	// The ImGui window; native front ends build without it.
+#if !defined(AMIBERRY_NATIVE_HOST) && defined(USE_IMGUI)
 	ShowDiskInfo(title.c_str(), infotext);
+#endif
 }
 
 void save_mapping_to_file(const std::string& mapping)
@@ -1891,6 +1975,89 @@ void save_mapping_to_file(const std::string& mapping)
 		file_output << '\n' << mapping << '\n';
 		file_output.close();
 	}
+}
+
+struct gui_status_colors
+{
+	amiberry_gui_color warning;
+	amiberry_gui_color error;
+	amiberry_gui_color success;
+};
+
+// Status text needs dark shades on light window backgrounds and bright ones
+// on dark backgrounds to stay legible (#2485).
+static gui_status_colors default_status_colors(const bool dark_background)
+{
+	if (dark_background)
+		return { { 255, 153, 51 }, { 255, 102, 102 }, { 77, 255, 77 } };
+	return { { 120, 50, 0 }, { 140, 0, 0 }, { 0, 80, 0 } };
+}
+
+static void set_status_colors(const gui_status_colors& status)
+{
+	gui_theme.warning_color = status.warning;
+	gui_theme.error_color = status.error;
+	gui_theme.success_color = status.success;
+}
+
+static double relative_luminance(const amiberry_gui_color& c)
+{
+	auto linear = [](const uint8_t v) {
+		const double s = v / 255.0;
+		return s <= 0.04045 ? s / 12.92 : std::pow((s + 0.055) / 1.055, 2.4);
+	};
+	return 0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b);
+}
+
+static double contrast_ratio(const amiberry_gui_color& a, const amiberry_gui_color& b)
+{
+	const double la = relative_luminance(a);
+	const double lb = relative_luminance(b);
+	return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
+// Shift a status color toward black or white until it is legible against
+// both the window and input field backgrounds, taking whichever direction
+// needs the smaller change so as much of the hue as possible survives.
+// The goal is WCAG AA contrast (4.5:1). Mid-tone backgrounds cap what any
+// text can reach (even black or white manages only about 4.5:1 on mid grey),
+// and chasing that cap would wash all three colors out to the same white or
+// black, so the goal is also limited to 75% of the best black/white contrast.
+static amiberry_gui_color legible_status_color(const amiberry_gui_color& hue,
+	const amiberry_gui_color& base, const amiberry_gui_color& frame)
+{
+	constexpr int steps = 100;
+	auto worst_contrast = [&](const amiberry_gui_color& c) {
+		return std::min(contrast_ratio(c, base), contrast_ratio(c, frame));
+	};
+	auto mix = [&](const int level, const int step) {
+		auto channel = [&](const uint8_t v) {
+			return static_cast<uint8_t>(std::lround(v + (level - v) * static_cast<double>(step) / steps));
+		};
+		return amiberry_gui_color{ channel(hue.r), channel(hue.g), channel(hue.b) };
+	};
+
+	const double reachable = std::max(worst_contrast({ 0, 0, 0 }), worst_contrast({ 255, 255, 255 }));
+	const double target_contrast = std::min(4.5, 0.75 * reachable);
+
+	// Fully mixed (step == steps) is pure black or white, so at least one
+	// direction always meets the target.
+	int best_step = steps + 1;
+	amiberry_gui_color best = hue;
+	for (const int level : { 0, 255 })
+	{
+		for (int step = 0; step < best_step; step++)
+		{
+			const amiberry_gui_color candidate = mix(level, step);
+			if (worst_contrast(candidate) >= target_contrast)
+			{
+				best_step = step;
+				best = candidate;
+				break;
+			}
+		}
+	}
+	return best;
 }
 
 void load_default_theme()
@@ -1915,6 +2082,8 @@ void load_default_theme()
 	gui_theme.table_header_color = { 160, 160, 160 };
 	// Modal
 	gui_theme.modal_dim_color = { 0, 0, 0 };
+	// Status text
+	set_status_colors(default_status_colors(false));
 	// Font rendering
 	// Legacy
 	gui_theme.selector_inactive = { 170, 170, 170 };
@@ -1944,6 +2113,8 @@ void load_default_dark_theme()
 	gui_theme.table_header_color = { 40, 40, 45 };
 	// Modal
 	gui_theme.modal_dim_color = { 0, 0, 0 };
+	// Status text
+	set_status_colors(default_status_colors(true));
 	// Font rendering
 	// Legacy
 	gui_theme.selector_inactive = { 32, 32, 37 };
@@ -1990,6 +2161,9 @@ bool save_theme(const std::string& theme_filename)
 		write_color("button_hover_color", gui_theme.button_hover_color);
 		write_color("table_header_color", gui_theme.table_header_color);
 		write_color("modal_dim_color", gui_theme.modal_dim_color);
+		write_color("warning_color", gui_theme.warning_color);
+		write_color("error_color", gui_theme.error_color);
+		write_color("success_color", gui_theme.success_color);
 		// Legacy fields for backward compatibility
 		write_color("selector_inactive", gui_theme.selector_inactive);
 		write_color("background_color", gui_theme.background_color);
@@ -2019,9 +2193,12 @@ void load_theme(const std::string& theme_filename)
 	{
 		auto read_color = [](const std::string& value, amiberry_gui_color& c) {
 			const std::vector<int> rgb = parse_color_string(value);
-			if (rgb.size() >= 3)
-				c = { (uint8_t)rgb[0], (uint8_t)rgb[1], (uint8_t)rgb[2] };
+			if (rgb.size() < 3)
+				return false;
+			c = { (uint8_t)rgb[0], (uint8_t)rgb[1], (uint8_t)rgb[2] };
+			return true;
 		};
+		bool has_warning = false, has_error = false, has_success = false;
 
 		std::string line;
 		while (std::getline(file_input, line))
@@ -2044,11 +2221,25 @@ void load_theme(const std::string& theme_filename)
 			else if (key == "button_hover_color") read_color(value, gui_theme.button_hover_color);
 			else if (key == "table_header_color") read_color(value, gui_theme.table_header_color);
 			else if (key == "modal_dim_color") read_color(value, gui_theme.modal_dim_color);
+			else if (key == "warning_color") has_warning = read_color(value, gui_theme.warning_color);
+			else if (key == "error_color") has_error = read_color(value, gui_theme.error_color);
+			else if (key == "success_color") has_success = read_color(value, gui_theme.success_color);
 			// Legacy fields
 			else if (key == "selector_inactive") read_color(value, gui_theme.selector_inactive);
 			else if (key == "background_color") read_color(value, gui_theme.background_color);
 			else if (key == "foreground_color") read_color(value, gui_theme.foreground_color);
 		}
 		file_input.close();
+
+		// Theme files saved before the status colors existed: derive them
+		// from the saturated (dark theme) hues so they stay legible on this
+		// theme's own backgrounds.
+		const gui_status_colors hues = default_status_colors(true);
+		if (!has_warning)
+			gui_theme.warning_color = legible_status_color(hues.warning, gui_theme.base_color, gui_theme.frame_color);
+		if (!has_error)
+			gui_theme.error_color = legible_status_color(hues.error, gui_theme.base_color, gui_theme.frame_color);
+		if (!has_success)
+			gui_theme.success_color = legible_status_color(hues.success, gui_theme.base_color, gui_theme.frame_color);
 	}
 }

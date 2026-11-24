@@ -1,125 +1,157 @@
 package com.blitterstudio.amiberry.data.model
 
+/** What an installed ROM file is. */
+sealed interface RomIdentity {
+	/** A ROM the emulator's ROM table knows, by its name there ("KS ROM v1.3 (A500,A1000,A2000)"). */
+	data class Kickstart(val name: String) : RomIdentity
+
+	/** One of the free AROS ROM files the emulator boots when a Kickstart is missing. */
+	data object BuiltInAros : RomIdentity
+
+	data object Unknown : RomIdentity
+}
+
 object ModelRomAvailability {
 
+	/** The built-in AROS replacement as the emulator knows it (the schema's); null without a schema. */
+	private val aros: SettingsSchema.Aros?
+		get() = SettingsSchema.current?.aros
+
+	/**
+	 * The kickstart_rom_file value that boots the built-in AROS ROM (empty
+	 * without a schema). No file at all would first look for a kick.rom, so
+	 * the launcher names AROS explicitly.
+	 */
+	val arosRomFile: String
+		get() = aros?.romFile.orEmpty()
+
+	/**
+	 * The ROM files for a model, and the preset configuration they belong to.
+	 * [aros] is set when no Kickstart for the model is installed and it boots
+	 * the built-in AROS ROM instead.
+	 */
 	data class SelectedRoms(
 		val kick: AmigaFile?,
-		val ext: AmigaFile?
-	)
+		val ext: AmigaFile?,
+		val config: Int = 0,
+		val aros: Boolean = false
+	) {
+		/** The model can start: with its Kickstart, or on AROS. */
+		val isBootable: Boolean
+			get() = kick != null || aros
+
+		/** The kickstart_rom_file to write; empty when the model cannot start. */
+		val romFile: String
+			get() = kick?.path ?: if (aros) arosRomFile else ""
+
+		val romExtFile: String
+			get() = ext?.path.orEmpty()
+	}
 
 	fun availableModels(roms: List<AmigaFile>): List<AmigaModel> {
 		return AmigaModel.entries.filter { model -> isModelAvailable(model, roms) }
 	}
 
+	/** The model can start, with its Kickstart or on AROS. */
 	fun isModelAvailable(model: AmigaModel, roms: List<AmigaFile>): Boolean {
-		return selectRomsForModel(model, roms).kick != null
+		return selectRomsForModel(model, roms).isBootable
 	}
 
-	fun isRecognizedRom(rom: AmigaFile): Boolean =
-		detectRomId(rom) != null
+	/** One of the model's Kickstart ROM sets is installed. */
+	fun hasKickstart(model: AmigaModel, roms: List<AmigaFile>): Boolean =
+		selectRomsForModel(model, roms).kick != null
 
+	/**
+	 * After a ROM import: settings that boot AROS (or name no ROM) move to the model's
+	 * Kickstart once one is installed, as the emulator would otherwise keep booting
+	 * AROS. Null when nothing changes.
+	 */
+	fun withInstalledKickstart(settings: EmulatorSettings, roms: List<AmigaFile>): EmulatorSettings? {
+		if (settings.romFile.isNotBlank() && !isBuiltInArosRom(settings.romFile)) return null
+		val selected = selectRomsForModel(settings.baseModel, roms)
+		val kick = selected.kick ?: return null
+		return settings.copy(
+			baseConfig = selected.config,
+			romFile = kick.path,
+			romExtFile = selected.ext?.path.orEmpty()
+		)
+	}
+
+	fun romIdentity(rom: AmigaFile): RomIdentity {
+		if (isBuiltInArosFile(rom)) return RomIdentity.BuiltInAros
+		val id = detectRomId(rom) ?: return RomIdentity.Unknown
+		val name = SettingsSchema.current?.roms?.get(id)?.name ?: return RomIdentity.Unknown
+		return RomIdentity.Kickstart(name)
+	}
+
+	/** Whether a kickstart_rom_file value names the built-in AROS ROM (an RP9's "<file>:AROS" too). */
+	fun isBuiltInArosRom(romFile: String): Boolean {
+		val token = aros?.romFile?.takeIf { it.isNotEmpty() } ?: return false
+		return romFile.endsWith(token)
+	}
+
+	/** The installed file is the AROS extension ROM, the second of the two AROS files. */
+	fun isBuiltInArosExtension(rom: AmigaFile): Boolean =
+		aros?.let { rom.name.equals(it.extFile, ignoreCase = true) } ?: false
+
+	/** Both AROS ROM files are installed, so a model without its Kickstart can boot AROS. */
+	fun hasBuiltInAros(roms: List<AmigaFile>): Boolean {
+		val aros = aros ?: return false
+		return listOf(aros.mainFile, aros.extFile).all { file -> roms.any { it.name.equals(file, ignoreCase = true) } }
+	}
+
+	private fun isBuiltInArosFile(rom: AmigaFile): Boolean =
+		aros?.let { rom.name.equals(it.mainFile, ignoreCase = true) || rom.name.equals(it.extFile, ignoreCase = true) } ?: false
+
+	/**
+	 * Whether AROS can stand in for the model's ROMs: only for a computer
+	 * that needs nothing but a Kickstart. The CD32 and CDTV play their discs
+	 * with their own (extended) ROMs and boards such as the DraCo need their
+	 * own boot ROM, which AROS does not replace.
+	 */
+	fun canBootAros(model: AmigaModel): Boolean =
+		!model.hasCd && model.configs.first().romSets.all { set -> set.all { it.role == "kick" } }
+
+	/**
+	 * The ROMs a model is built with: the first ROM set (from the emulator's
+	 * preset builder, in the bundled settings schema) whose every request has
+	 * an installed ROM, recognised by checksum. The first configuration's
+	 * sets come first; a later configuration (an A500 with Kickstart 1.2, an
+	 * A3000 with 3.1) is chosen only when none of the earlier ones can be built.
+	 * With none installed, a model AROS can stand in for boots the built-in
+	 * AROS ROM in its first configuration.
+	 */
 	fun selectRomsForModel(model: AmigaModel, roms: List<AmigaFile>): SelectedRoms {
 		if (roms.isEmpty()) return SelectedRoms(null, null)
-		val profile = MODEL_ROM_PROFILE[model] ?: return SelectedRoms(null, null)
-
 		val romsById = roms
 			.mapNotNull { rom -> detectRomId(rom)?.let { id -> id to rom } }
 			.groupBy({ it.first }, { it.second })
 
-		val selectedKickId = profile.kickIds.firstOrNull { id -> !romsById[id].isNullOrEmpty() }
-		val kick = selectedKickId?.let { id -> pickDeterministic(romsById[id].orEmpty()) }
-
-		if (kick == null) {
-			return SelectedRoms(null, null)
-		}
-
-		val ext = when (model) {
-			AmigaModel.CD32 -> {
-				// id 64 is combined KS+ext ROM; id 18 requires ext id 19.
-				if (selectedKickId == 64) {
-					null
-				} else {
-					val extId = profile.extIds.firstOrNull { id -> !romsById[id].isNullOrEmpty() }
-					if (extId == null) return SelectedRoms(null, null)
-					pickDeterministic(romsById[extId].orEmpty())
+		model.configs.forEachIndexed { config, presetConfig ->
+			for (set in presetConfig.romSets) {
+				val picks = set.map { request ->
+					val id = request.ids.firstOrNull { !romsById[it].isNullOrEmpty() } ?: return@map null
+					request.role to pickDeterministic(romsById[id].orEmpty())
 				}
+				if (picks.any { it == null }) continue
+				val kick = picks.firstOrNull { it!!.first == "kick" }?.second ?: continue
+				val ext = picks.firstOrNull { it!!.first == "ext" }?.second
+				return SelectedRoms(kick, ext, config)
 			}
-			AmigaModel.CDTV -> {
-				// CDTV defaults require both Kickstart and extended ROM.
-				val extId = profile.extIds.firstOrNull { id -> !romsById[id].isNullOrEmpty() }
-				if (extId == null) return SelectedRoms(null, null)
-				pickDeterministic(romsById[extId].orEmpty())
-			}
-			else -> null
 		}
-
-		return SelectedRoms(kick, ext)
+		return SelectedRoms(null, null, aros = canBootAros(model) && hasBuiltInAros(roms))
 	}
 
-	private fun detectRomId(rom: AmigaFile): Int? {
+	internal fun detectRomId(rom: AmigaFile): Int? {
 		val crc = rom.crc32 ?: return null
-		return ROM_CRC_TO_ID[crc and 0xffffffffL]
+		val masked = crc and 0xffffffffL
+		// The emulator identifies a few ROMs from several files; the schema
+		// lists those with no checksum, which an empty file would match.
+		if (masked == 0L) return null
+		return SettingsSchema.current?.roms?.values?.firstOrNull { it.crc32 == masked }?.id
 	}
 
 	private fun pickDeterministic(candidates: List<AmigaFile>): AmigaFile? {
 		return candidates.sortedBy { it.name.lowercase() }.firstOrNull()
 	}
-
-	private data class ModelRomProfile(
-		val kickIds: List<Int>,
-		val extIds: List<Int> = emptyList()
-	)
-
-	/**
-	 * Exact --model ROM priority behavior from main.cpp wrappers:
-	 * A500->bip_a500(130), A500P->bip_a500plus(-1), A2000->bip_a2000(130), etc.
-	 */
-	private val MODEL_ROM_PROFILE = mapOf(
-		AmigaModel.A500 to ModelRomProfile(kickIds = listOf(6, 5, 4)),
-		AmigaModel.A500_PLUS to ModelRomProfile(kickIds = listOf(7, 6, 5)),
-		AmigaModel.A600 to ModelRomProfile(kickIds = listOf(10, 9, 8)),
-		AmigaModel.A1000 to ModelRomProfile(kickIds = listOf(24)),
-		AmigaModel.A2000 to ModelRomProfile(kickIds = listOf(6, 5, 4)),
-		AmigaModel.A3000 to ModelRomProfile(kickIds = listOf(59)),
-		AmigaModel.A1200 to ModelRomProfile(kickIds = listOf(11, 15, 276, 281, 286, 291, 304)),
-		AmigaModel.A4000 to ModelRomProfile(kickIds = listOf(16, 31, 13, 12, 46, 278, 283, 288, 293, 306)),
-		AmigaModel.CD32 to ModelRomProfile(kickIds = listOf(64, 18), extIds = listOf(19)),
-		AmigaModel.CDTV to ModelRomProfile(kickIds = listOf(6, 32), extIds = listOf(20, 21, 22))
-	)
-
-	// CRC32 -> ROM ID mapping for the ids used above.
-	private val ROM_CRC_TO_ID: Map<Long, Int> = mapOf(
-		0x9ed783d0L to 4,
-		0xa6ce1636L to 5,
-		0xc4f0f55fL to 6,
-		0xc3bdb240L to 7,
-		0x83028fb5L to 8,
-		0x64466c2aL to 9,
-		0x43b0df7bL to 10,
-		0x6c9b07d2L to 11,
-		0x9e6ac152L to 12,
-		0x2b4566f1L to 13,
-		0x1483a091L to 15,
-		0xd6bae334L to 16,
-		0x1e62d4a5L to 18,
-		0x87746be2L to 19,
-		0x42baa124L to 20,
-		0x30b54232L to 21,
-		0xceae68d2L to 22,
-		0x0b1ad2d0L to 24,
-		0x43b6dd22L to 31,
-		0xe0f37258L to 32,
-		0xbc0ec13fL to 59,
-		0xf5d4f3c8L to 64,
-		0xf17fa97fL to 276,
-		0xd47e18fdL to 278,
-		0xb87506a7L to 281,
-		0x1b84cb33L to 283,
-		0xbd1ff75eL to 286,
-		0x9bb8fc93L to 288,
-		0x2b653371L to 291,
-		0xf3ced3b8L to 293,
-		0x5c40328aL to 304,
-		0x4bea9798L to 306,
-	)
 }

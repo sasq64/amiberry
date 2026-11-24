@@ -866,6 +866,9 @@ TCHAR *filesys_createvolname (const TCHAR *volname, const TCHAR *rootdir, struct
 static int set_filesys_volume (const TCHAR *rootdir, int *flags, bool *readonly, bool *emptydrive, struct zvolume **zvp)
 {
 	*emptydrive = 0;
+#ifdef AMIBERRY
+	my_register_mount_root (rootdir);
+#endif
 	if (my_existsfile (rootdir)) {
 		struct zvolume *zv;
 		zv = zfile_fopen_archive (rootdir);
@@ -1190,7 +1193,9 @@ int kill_filesys_unitconfig (struct uae_prefs *p, int nr)
 	} else {
 		pcmcia_disk_reinsert(p, &uci->ci, true);
 	}
-	while (nr < MOUNT_CONFIG_SIZE) {
+	/* The last entry has no successor to move down (reading one would run
+	   past the array). */
+	while (nr < MOUNT_CONFIG_SIZE - 1) {
 		memmove (&p->mountconfig[nr], &p->mountconfig[nr + 1], sizeof (struct uaedev_config_data));
 		nr++;
 	}
@@ -2634,6 +2639,29 @@ static void move_aino_children (Unit *unit, a_inode *from, a_inode *to)
 	from->child = 0;
 	update_child_names (unit, to->child, to);
 }
+/* Dispose of the cached a_inodes below a directory, except those that are
+   still in use, and those above them.  Returns true if none is left.  */
+static bool dispose_children (Unit *unit, a_inode *dir)
+{
+	a_inode **aip = &dir->child;
+	bool all = true;
+
+	if (dir->exnext_count > 0)
+		return dir->child == 0;
+	while (*aip) {
+		a_inode *aino = *aip;
+		aino_test (aino);
+		if (aino->shlock > 0 || aino->elock || !dispose_children (unit, aino)) {
+			all = false;
+			aip = &aino->sibling;
+			continue;
+		}
+		de_recycle_aino (unit, aino);
+		dispose_aino (unit, aip, aino);
+	}
+	return all;
+}
+
 
 static void delete_aino (Unit *unit, a_inode *aino)
 {
@@ -2645,6 +2673,14 @@ static void delete_aino (Unit *unit, a_inode *aino)
 	aino->dirty = 1;
 	aino->deleted = 1;
 	de_recycle_aino (unit, aino);
+	/* A directory that disappeared on the host can still have cached
+	   children, which point back to it as their parent.  Dispose of them
+	   with it, or, if any of them is still in use, keep it.  */
+	if (aino->child && !dispose_children (unit, aino)) {
+		write_log (_T("FILESYS: keeping deleted directory '%s', its contents are in use\n"), aino->nname);
+		return;
+	}
+
 
 	/* If any ExKeys are currently pointing at us, advance them.  */
 	if (aino->parent->exnext_count > 0) {
@@ -6397,6 +6433,17 @@ static void	action_rename_object(TrapContext *ctx, Unit *unit, dpacket *packet)
 	a2->db_offset = a1->db_offset;
 	a2->dirty = 0;
 	a2->vfso = a1->vfso;
+	/* Files still open under the old name (for reading: renaming a file
+	 * open for writing fails above) keep valid host handles when the
+	 * host rename succeeds, as it does on Unix. Their keys must follow
+	 * the object, since a1 is freed below. */
+	for (k1 = unit->keys; k1; k1 = knext) {
+		knext = k1->next;
+		if (k1->aino == a1) {
+			k1->aino = a2;
+			wehavekeys++;
+		}
+	}
 	move_exkeys (unit, a1, a2);
 	move_aino_children (unit, a1, a2);
 	delete_aino (unit, a1);
@@ -9809,8 +9856,9 @@ static TCHAR *makenativepath (UnitInfo *ui, TCHAR *apath)
 {
 	TCHAR *pn;
 	/* create native path. FIXME: handle 'illegal' characters */
-	pn = xcalloc (TCHAR, uaetcslen (apath) + 1 + uaetcslen (ui->rootdir) + 1);
-	_sntprintf (pn, sizeof pn, _T("%s/%s"), ui->rootdir, apath);
+	const size_t pn_len = uaetcslen (apath) + 1 + uaetcslen (ui->rootdir) + 1;
+	pn = xcalloc (TCHAR, pn_len);
+	_sntprintf (pn, pn_len, _T("%s/%s"), ui->rootdir, apath);
 	if (FSDB_DIR_SEPARATOR != '/') {
 		for (int i = 0; i < uaetcslen (pn); i++) {
 			if (pn[i] == '/')

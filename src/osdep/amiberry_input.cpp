@@ -1,4 +1,3 @@
-#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -14,8 +13,6 @@
 #include "input_platform.h"
 #include "amiberry_gfx.h"
 #include "fsdb.h"
-#include "uae.h"
-#include "xwin.h"
 #include "target.h"
 #include "tabletlibrary.h"
 
@@ -82,6 +79,13 @@ std::array<cached_joystick_custom_mapping, MAX_INPUT_DEVICES> cached_joystick_cu
 int cached_joystick_custom_mapping_count;
 uae_u64 cached_joystick_custom_mapping_generation;
 std::array<preserved_port_joystick_custom_mapping, MAX_JPORTS> preserved_port_joystick_custom_mappings;
+// A configuration's joyportN_amiberry_custom lines for a port that has no
+// joystick while the file parses: the on-screen joystick, which the file
+// does not name (the launcher leaves joyport1 out and the runtime assigns
+// the device later, on_screen_joystick_set_enabled). The lines wait here
+// and are applied when the port's device appears; cleared with the
+// preserved mappings when the next configuration loads (cfgfile.cpp).
+std::array<std::vector<std::pair<std::string, std::string>>, MAX_JPORTS> pending_config_custom_options;
 
 bool matches_joystick_config(const struct inputdevconfig& idc,
 	const TCHAR* name, const TCHAR* configname)
@@ -197,6 +201,7 @@ void amiberry_clear_port_joystick_custom_mapping(const int portnum)
 void amiberry_clear_port_joystick_custom_mappings()
 {
 	preserved_port_joystick_custom_mappings = {};
+	pending_config_custom_options = {};
 }
 
 bool amiberry_get_port_joystick_custom_mapping(const int portnum,
@@ -570,7 +575,11 @@ constexpr int remap_event_list[] = {
 
 	INPUTEVENT_SPC_MOUSEMAP_PORT0_LEFT, INPUTEVENT_SPC_MOUSEMAP_PORT0_RIGHT,
 	INPUTEVENT_SPC_MOUSEMAP_PORT1_LEFT, INPUTEVENT_SPC_MOUSEMAP_PORT1_RIGHT,
-	INPUTEVENT_SPC_MOUSE_SPEED_DOWN, INPUTEVENT_SPC_MOUSE_SPEED_UP, INPUTEVENT_SPC_SHUTDOWN,
+	INPUTEVENT_SPC_MOUSE_SPEED_DOWN, INPUTEVENT_SPC_MOUSE_SPEED_UP,
+#ifndef __APPLE__
+	// No host poweroff on macOS/iOS (see target_shutdown), so it is not offered there.
+	INPUTEVENT_SPC_SHUTDOWN,
+#endif
 	INPUTEVENT_SPC_WARP, INPUTEVENT_SPC_TOGGLE_JIT, INPUTEVENT_SPC_TOGGLE_JIT_FPU,
 	INPUTEVENT_SPC_AUTO_CROP_IMAGE, INPUTEVENT_SPC_OSK
 };
@@ -1668,6 +1677,19 @@ void fix_didata(struct didata* did)
 	fixthings(did);
 }
 
+void sync_controller_shortcuts(didata* did)
+{
+	if (did->mapping.is_retroarch)
+		return;
+	const auto button_index = [did](int logical) {
+		if (logical == SDL_GAMEPAD_BUTTON_INVALID || did->is_controller)
+			return logical;
+		return did->mapping.button_unmasked[logical];
+	};
+	did->mapping.menu_button = button_index(enter_gui_button);
+	did->mapping.vkbd_button = button_index(vkbd_button);
+}
+
 void setup_mapping(didata* did, const std::string& controllers, const int id)
 {
 	std::string retroarch_config_file;
@@ -1733,6 +1755,11 @@ void setup_mapping(didata* did, const std::string& controllers, const int id)
 		}
 	}
 
+	// Pristine copy for resolving configured buttons after the hotkey mask
+	// below invalidates shared entries.
+	did->mapping.button_unmasked = did->mapping.button;
+	sync_controller_shortcuts(did);
+
 	if (did->mapping.hotkey_button != SDL_GAMEPAD_BUTTON_INVALID)
 	{
 		for (auto& k : did->mapping.button)
@@ -1771,6 +1798,75 @@ int amiberry_get_joystick_index(const TCHAR* configname)
 	return static_cast<int>(index);
 }
 
+// A custom control's event as the configuration names it: "none" is no
+// event (-1, which keeps the control from its default), anything else
+// unknown or empty the default (0).
+int custom_event_of(const TCHAR* value)
+{
+	const int event_index = find_inputevent(value);
+	if (event_index > -1)
+		return remap_event_list[event_index];
+	return !_tcsicmp(value, _T("none")) ? -1 : 0;
+}
+
+// How the configuration names a custom control's event (see
+// custom_event_of): "none" for -1, empty for the default.
+const TCHAR* custom_event_name(const int event)
+{
+	if (event < 0)
+		return _T("none");
+	if (event > 0) {
+		for (int i = 0; i < remap_event_list_size; ++i) {
+			if (remap_event_list[i] == event)
+				return inputdevice_get_eventinfo(event)->name;
+		}
+	}
+	return _T("");
+}
+
+// Whether [option] is one of port [port]'s custom-control lines, spelled
+// as the configuration writes it.
+static bool is_custom_control_option(const std::string& option, const int port)
+{
+	const std::string prefix = "joyport" + std::to_string(port) + "_amiberry_custom_";
+	if (option.rfind(prefix, 0) != 0)
+		return false;
+	const std::string rest = option.substr(prefix.length());
+	for (const auto& mode : {"none_", "hotkey_"}) {
+		const size_t at = rest.find(mode);
+		if (at == 0)
+			return rest.length() > strlen(mode);
+	}
+	const std::string axis_prefix = "axis_";
+	if (rest.rfind(axis_prefix, 0) != 0)
+		return false;
+	const std::string axis_rest = rest.substr(axis_prefix.length());
+	for (const auto& mode : {"none_", "hotkey_"}) {
+		const size_t at = axis_rest.find(mode);
+		if (at == 0)
+			return axis_rest.length() > strlen(mode);
+	}
+	return false;
+}
+
+// The configuration name of the joystick a port names while the file
+// parses: its joyportname line's (configname), else the one its joyport
+// line's short id spells ("joy1" is JOY1), which a file without a
+// joyportname line (the Android launcher's) only has; empty for a port
+// with no joystick named.
+static std::string port_joystick_configname(const jport& jp)
+{
+	if (amiberry_get_joystick_index(jp.idc.configname) != -1)
+		return jp.idc.configname;
+	if (_tcsnicmp(jp.idc.shortid, _T("joy"), 3) == 0) {
+		std::string configname = "JOY";
+		configname += jp.idc.shortid + 3;
+		if (amiberry_get_joystick_index(configname.c_str()) != -1)
+			return configname;
+	}
+	return {};
+}
+
 bool load_custom_options(uae_prefs* p, const std::string& option, const TCHAR* value)
 {
 	// Only do this loop if the option starts with "joyport"
@@ -1782,13 +1878,23 @@ bool load_custom_options(uae_prefs* p, const std::string& option, const TCHAR* v
 		{
 			const jport *jp = &p->jports[i];
 
-			const int joy_index = amiberry_get_joystick_index(jp->idc.configname);
-			if (joy_index == -1)
+			const std::string configname = port_joystick_configname(*jp);
+			if (configname.empty()) {
+				// The port names no joystick: a custom-control line for it
+				// waits for the device the file does not name (the
+				// on-screen joystick, assigned later by
+				// on_screen_joystick_set_enabled), and is applied by
+				// amiberry_apply_pending_custom_options.
+				if (is_custom_control_option(option, i)) {
+					pending_config_custom_options[i].emplace_back(option, value);
+					return true;
+				}
 				continue;
+			}
 
 			controller_mapping mapping{};
 			amiberry_get_port_joystick_custom_mapping(
-				i, jp->idc.name, jp->idc.configname, mapping);
+				i, jp->idc.name, configname.c_str(), mapping);
 
 			for (int m = 0; m < 2; ++m)
 			{
@@ -1798,14 +1904,13 @@ bool load_custom_options(uae_prefs* p, const std::string& option, const TCHAR* v
 					buffer = "joyport" + std::to_string(i) + "_amiberry_custom_" + mode + "_" + SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(n));
 					if (buffer == option)
 					{
-						const int event_index = find_inputevent(value);
-						const auto b = event_index > -1 ? remap_event_list[event_index] : 0;
+						const int b = custom_event_of(value);
 						if (m == 0)
 							mapping.amiberry_custom_none[n] = b;
 						else
 							mapping.amiberry_custom_hotkey[n] = b;
 						amiberry_set_port_joystick_custom_mapping(
-							i, jp->idc.name, jp->idc.configname, mapping);
+							i, jp->idc.name, configname.c_str(), mapping);
 						return true;
 					}
 				}
@@ -1815,14 +1920,13 @@ bool load_custom_options(uae_prefs* p, const std::string& option, const TCHAR* v
 					buffer = "joyport" + std::to_string(i) + "_amiberry_custom_axis_" + mode + "_" + SDL_GetGamepadStringForAxis(static_cast<SDL_GamepadAxis>(n));
 					if (buffer == option)
 					{
-						const int event_index = find_inputevent(value);
-						const auto b = event_index > -1 ? remap_event_list[event_index] : 0;
+						const int b = custom_event_of(value);
 						if (m == 0)
 							mapping.amiberry_custom_axis_none[n] = b;
 						else
 							mapping.amiberry_custom_axis_hotkey[n] = b;
 						amiberry_set_port_joystick_custom_mapping(
-							i, jp->idc.name, jp->idc.configname, mapping);
+							i, jp->idc.name, configname.c_str(), mapping);
 						return true;
 					}
 				}
@@ -1831,6 +1935,34 @@ bool load_custom_options(uae_prefs* p, const std::string& option, const TCHAR* v
 	}
 
 	return false;
+}
+
+// Applies the custom-control lines a configuration carried for [portnum]
+// while the port had no joystick, now that its device is there (the
+// on-screen joystick's assignment): replayed through the file's own codec,
+// against the port's device as the configuration would have named it.
+void amiberry_apply_pending_custom_options(const int portnum)
+{
+	if (portnum < 0 || portnum >= MAX_JPORTS)
+		return;
+	auto& pending = pending_config_custom_options[portnum];
+	if (pending.empty())
+		return;
+	jport& jp = changed_prefs.jports[portnum];
+	const int joy = jp.id - JSEM_JOYS;
+	if (joy >= 0 && joy < num_joystick && !jp.idc.configname[0]) {
+		// The port's device was assigned by index; the codec reads the
+		// device by its configuration name (JOY<n>, as the joyport line
+		// would name it).
+		_tcsncpy(jp.idc.name, di_joystick[joy].name.c_str(), MAX_JPORT_NAME - 1);
+		_sntprintf(jp.idc.configname, MAX_JPORT_CONFIG, _T("JOY%d"), joy);
+		jp.idc.name[MAX_JPORT_NAME - 1] = 0;
+	}
+	for (const auto& [option, value] : pending) {
+		const TCHAR* text = value.c_str();
+		load_custom_options(&changed_prefs, option, text);
+	}
+	pending.clear();
 }
 
 static void close_joystick()
@@ -1870,6 +2002,7 @@ static void unacquire_joystick(const int num)
 	struct didata* did = &di_joystick[num];
 	did->acquired = 0;
 	did->hotkey_held = false;
+	did->hat_values.fill(0);
 }
 
 static const TCHAR* get_joystick_friendlyname(const int joy)
@@ -2008,6 +2141,31 @@ void ensure_onscreen_joystick_registered()
 	write_log("On-Screen Joystick registered as JOY%d\n", osj_device_index);
 }
 
+#ifdef LIBRETRO
+// The libretro frontend polls the left stick every frame and drives the
+// port 0 mouse itself (route_libretro_stick_mouse), so its left stick keeps
+// the joystick-direction mapping that also steers the on-screen keyboard.
+static int assigned_joyport(const int device_index)
+{
+	for (int port = 0; port < MAX_JPORTS; port++) {
+		if (jsem_isjoy(port, &currprefs) == device_index)
+			return port;
+	}
+	return -1;
+}
+
+// Mouse device the left stick of joystick device_index drives while its
+// joyport's analog mouse map is on, or -1 when the map is off for that port.
+int joystick_mousemap_mouse_device(const int device_index)
+{
+	const int port = assigned_joyport(device_index);
+	if (port < 0 || currprefs.jports[port].mousemap <= 0)
+		return -1;
+	const int mouse = jsem_ismouse(0, &currprefs);
+	return mouse >= 0 ? mouse : 0;
+}
+#endif
+
 static bool invert_axis(int axis, const didata* did)
 {
 	switch (axis)
@@ -2023,6 +2181,11 @@ static bool invert_axis(int axis, const didata* did)
 	default:
 		return false;
 	}
+}
+
+bool controller_axis_has_gameplay_input(const int id, const int axis, const int value)
+{
+	return inputdevice_is_joystick_axis_active(id, axis, value, analog_upper_bound);
 }
 
 void set_axis_state(const int id, const int axis, int value, const bool invert)
@@ -2041,6 +2204,7 @@ void set_axis_state(const int id, const int axis, int value, const bool invert)
 void read_controller_button(const int id, const int button, const int state)
 {
 	const didata* did = &di_joystick[id];
+	const inputdevice_osk_passthrough passthrough;
 
 	if (isfocus() || currprefs.inactive_input & 4)
 	{
@@ -2056,9 +2220,11 @@ void read_controller_button(const int id, const int button, const int state)
 			setjoybuttonstate(id, retroarch_offset + 2, state);
 		else if (button == did->mapping.reset_button)
 			setjoybuttonstate(id, retroarch_offset + 3, state);
-		else if (button == did->mapping.vkbd_button)
-			setjoybuttonstate(id, retroarch_offset + 4, state);
 
+		if (held_offset) {
+			auto& mask = di_joystick[id].remapped_press_mask;
+			mask = state ? mask | (1u << button) : mask & ~(1u << button);
+		}
 		setjoybuttonstate(id, button + held_offset, state);
 	}
 }
@@ -2066,25 +2232,16 @@ void read_controller_button(const int id, const int button, const int state)
 void read_controller_axis(const int id, const int axis, const int value)
 {
 	const didata* did = &di_joystick[id];
+	const inputdevice_osk_passthrough passthrough;
 
 	if (isfocus() || currprefs.inactive_input & 4)
-	{
-		// If analog mouse mapping is used, the Left stick acts as a mouse
-		if (axis <= SDL_GAMEPAD_AXIS_LEFTY && currprefs.jports[id].mousemap > 0)
-		{
-			if (value > joystick_dead_zone || value < -joystick_dead_zone)
-				setmousestate(id, axis, value / 10000, 0);
-		}
-		else
-		{
-			set_axis_state(id, axis, value, invert_axis(axis, did));
-		}
-	}
+		set_axis_state(id, axis, value, invert_axis(axis, did));
 }
 
 void read_joystick_button_single(const int id, const int button, const int state)
 {
 	const didata* did = &di_joystick[id];
+	const inputdevice_osk_passthrough passthrough(did->is_controller);
 
 	if (isfocus() || currprefs.inactive_input & 4)
 	{
@@ -2103,8 +2260,6 @@ void read_joystick_button_single(const int id, const int button, const int state
 				setjoybuttonstate(id, retroarch_offset + 2, state);
 			else if (button == did->mapping.reset_button)
 				setjoybuttonstate(id, retroarch_offset + 3, state);
-			else if (button == did->mapping.vkbd_button)
-				setjoybuttonstate(id, retroarch_offset + 4, state);
 		}
 
 		// Find which logical button this physical button maps to and dispatch directly
@@ -2115,6 +2270,10 @@ void read_joystick_button_single(const int id, const int button, const int state
 		{
 			if (did->mapping.button[did_button] == button)
 			{
+				if (held_offset) {
+					auto& mask = di_joystick[id].remapped_press_mask;
+					mask = state ? mask | (1u << did_button) : mask & ~(1u << did_button);
+				}
 				setjoybuttonstate(id, did_button + held_offset, state);
 				break;
 			}
@@ -2125,6 +2284,7 @@ void read_joystick_button_single(const int id, const int button, const int state
 void read_joystick_axis(const int id, const int axis, int value)
 {
 	const didata* did = &di_joystick[id];
+	const inputdevice_osk_passthrough passthrough(did->is_controller);
 
 	if (isfocus() || currprefs.inactive_input & 4)
 	{
@@ -2134,24 +2294,25 @@ void read_joystick_axis(const int id, const int axis, int value)
 		{
 			if (did->mapping.axis[did_axis] == axis)
 			{
-				// If analog mouse mapping is used, the Left stick acts as a mouse
-				if (did_axis <= SDL_GAMEPAD_AXIS_LEFTY && currprefs.jports[id].mousemap > 0)
-				{
-					if (value > joystick_dead_zone || value < -joystick_dead_zone)
-						setmousestate(id, did_axis, value / 1000, 0);
-				}
-				else
-				{
-					set_axis_state(id, did_axis, value, invert_axis(did_axis, did));
-				}
+				set_axis_state(id, did_axis, value, invert_axis(did_axis, did));
 				break;
 			}
 		}
 	}
 }
 
-void read_joystick_hat(const int id, int hat, const int value)
+void read_joystick_hat(const int id, const int hat, const int value)
 {
+	auto& did = di_joystick[id];
+	// Every hat drives the D-pad. Combine them so centering one hat does not
+	// release directions another hat still holds.
+	int combined = value;
+	if (hat >= 0 && hat < static_cast<int>(did.hat_values.size()))
+		did.hat_values[hat] = static_cast<Uint8>(value);
+	for (const Uint8 hat_value : did.hat_values)
+		combined |= hat_value;
+
+	const inputdevice_osk_passthrough passthrough(did.is_controller);
 	if (isfocus() || currprefs.inactive_input & 4)
 	{
 		for (int button = SDL_GAMEPAD_BUTTON_DPAD_UP; button <= SDL_GAMEPAD_BUTTON_DPAD_RIGHT; button++)
@@ -2159,16 +2320,16 @@ void read_joystick_hat(const int id, int hat, const int value)
 			int state = 0;
 			switch (button) {
 			case SDL_GAMEPAD_BUTTON_DPAD_UP:
-				state = value & SDL_HAT_UP;
+				state = combined & SDL_HAT_UP;
 				break;
 			case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
-				state = value & SDL_HAT_DOWN;
+				state = combined & SDL_HAT_DOWN;
 				break;
 			case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
-				state = value & SDL_HAT_LEFT;
+				state = combined & SDL_HAT_LEFT;
 				break;
 			case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
-				state = value & SDL_HAT_RIGHT;
+				state = combined & SDL_HAT_RIGHT;
 				break;
 			default: break;
 			}
@@ -2226,8 +2387,18 @@ int input_get_default_joystick(struct uae_input_device* uid, int i, int port, in
 			v = port ? INPUTEVENT_JOY2_VERT : INPUTEVENT_JOY1_VERT;
 		}
 	}
+	const bool mousemap = currprefs.jports[port].mousemap > 0;
+#ifdef LIBRETRO
 	setid(uid, i, ID_AXIS_OFFSET + SDL_GAMEPAD_AXIS_LEFTX, 0, port, h, gp);
 	setid(uid, i, ID_AXIS_OFFSET + SDL_GAMEPAD_AXIS_LEFTY, 0, port, v, gp);
+#else
+	// Mouse map: SDL reports stick changes, not a held position, so the left
+	// stick drives the port 0 Amiga mouse through the core analog joy-mouse
+	// path. "Analog joy-mouse speed" and the joy-mouse dead zone apply, and a
+	// held stick keeps the pointer moving.
+	setid(uid, i, ID_AXIS_OFFSET + SDL_GAMEPAD_AXIS_LEFTX, 0, port, mousemap ? INPUTEVENT_MOUSE1_HORIZ : h, gp);
+	setid(uid, i, ID_AXIS_OFFSET + SDL_GAMEPAD_AXIS_LEFTY, 0, port, mousemap ? INPUTEVENT_MOUSE1_VERT : v, gp);
+#endif
 
 	if (port >= 2) {
 		setid(uid, i, ID_BUTTON_OFFSET + SDL_GAMEPAD_BUTTON_SOUTH, 0, port, port == 3 ? INPUTEVENT_PAR_JOY2_FIRE_BUTTON : INPUTEVENT_PAR_JOY1_FIRE_BUTTON, af, gp);
@@ -2297,7 +2468,7 @@ int input_get_default_joystick(struct uae_input_device* uid, int i, int port, in
 
 	// If mouse map is enabled (we're emulating a mouse on Port 0 from this controller's Analog stick)
 	// we need to enable 2 mouse buttons for Port 0 as well. These are currently LShoulder / RShoulder respectively
-	if (currprefs.jports[port].mousemap > 0)
+	if (mousemap)
 	{
 		setid(uid, i, ID_BUTTON_OFFSET + SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0, port, INPUTEVENT_JOY1_FIRE_BUTTON, gp);
 		setid(uid, i, ID_BUTTON_OFFSET + SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0, port, INPUTEVENT_JOY1_2ND_BUTTON, gp);
@@ -2351,8 +2522,10 @@ int input_get_default_joystick(struct uae_input_device* uid, int i, int port, in
 		const auto function_offset = n * REMAP_BUTTONS;
 		for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; button++)
 		{
+			// -1 is "none": the control does nothing (no event, 0),
+			// rather than the default it would otherwise get.
 			if (button_map[n][button])
-				setid(uid, i, ID_BUTTON_OFFSET + button + function_offset, 0, port, button_map[n][button], af, gp);
+				setid(uid, i, ID_BUTTON_OFFSET + button + function_offset, 0, port, std::max(button_map[n][button], 0), af, gp);
 		}
 
 		// Axis mapping, skip the first 2 (Horizontal / Vertical on Left stick)
@@ -2360,7 +2533,7 @@ int input_get_default_joystick(struct uae_input_device* uid, int i, int port, in
 		for (int axis = 2; axis < SDL_GAMEPAD_AXIS_COUNT; axis++)
 		{
 			if (axis_map[n][axis])
-				setid(uid, i, ID_AXIS_OFFSET + axis + function_offset, 0, port, axis_map[n][axis], af, gp);
+				setid(uid, i, ID_AXIS_OFFSET + axis + function_offset, 0, port, std::max(axis_map[n][axis], 0), af, gp);
 		}
 	}
 

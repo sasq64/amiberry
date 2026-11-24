@@ -26,6 +26,14 @@ static inline int amiberry_input_clamp_native_axis(int value, int extent, bool* 
 	}
 	return value;
 }
+// Pointer-offset bases applied before converting guest pointer offsets to
+// host cursor hotspots. X keeps the classic one-pixel sprite bias. Y uses
+// none: RTG host cursors have no chipset sprite pipeline delay, and the
+// ZZ9000 firmware positions the sprite symmetrically (_update_hw_sprite_pos
+// applies base - offset + 1 on both axes). These must stay the single source
+// shared by the hotspot and residual computations.
+static constexpr int amiberry_mousehack_pointer_bias_x = 1;
+static constexpr int amiberry_mousehack_pointer_bias_y = 0;
 
 static inline int amiberry_input_mousehack_hotspot_axis(int pointer_offset, int extent, int bias)
 {
@@ -57,10 +65,12 @@ static inline void amiberry_input_mousehack_cursor_hotspot(int pointer_x_offset,
 	int cursor_width, int cursor_height, int* hotspot_x, int* hotspot_y)
 {
 	if (hotspot_x) {
-		*hotspot_x = amiberry_input_mousehack_hotspot_axis(pointer_x_offset, cursor_width, 1);
+		*hotspot_x = amiberry_input_mousehack_hotspot_axis(pointer_x_offset, cursor_width,
+			amiberry_mousehack_pointer_bias_x);
 	}
 	if (hotspot_y) {
-		*hotspot_y = amiberry_input_mousehack_hotspot_axis(pointer_y_offset, cursor_height, 0);
+		*hotspot_y = amiberry_input_mousehack_hotspot_axis(pointer_y_offset, cursor_height,
+			amiberry_mousehack_pointer_bias_y);
 	}
 }
 
@@ -86,6 +96,7 @@ static inline int amiberry_input_native_sprite_y(uae_u16 pos, uae_u16 ctl, bool 
 	return y << 1;
 }
 
+
 static inline int amiberry_input_native_cursor_height(int sprite_height,
 	bool double_scan_position_bit, bool sscan2_enabled)
 {
@@ -107,6 +118,21 @@ static inline int amiberry_input_native_mousehack_uncropped_lowres_x_compensatio
 	return !source_origin_valid && low_resolution ? -2 : 0;
 }
 
+// Amount removed from the host position for the Pointer.prefs default pointer
+// offset and the classic sprite bias before it is delivered to the guest.
+// An RTG host cursor takes its hotspot from the active pointer's own offset
+// (P96 BoardInfo, ZZ9000 firmware), so its hotspot already is the Amiga pointer
+// position. The default pointer's offset does not describe that pointer, e.g.
+// an application crosshair set with SetPointer.
+static inline int amiberry_input_mousehack_pointer_prefs_adjust(bool host_cursor_uses_hotspot,
+	bool native_position, int pointer_prefs_offset, int bias)
+{
+	if (host_cursor_uses_hotspot && !native_position) {
+		return 0;
+	}
+	return pointer_prefs_offset + bias;
+}
+
 static inline int amiberry_input_native_interlace_origin(
 	int source_origin, bool interlaced, bool long_field, int field_line_height)
 {
@@ -116,21 +142,29 @@ static inline int amiberry_input_native_interlace_origin(
 	return source_origin;
 }
 
+// Learns a cursor's hotspot from the pointer-to-sprite displacement. The
+// guest repositions its sprite a frame or more after it receives a new pointer
+// position, so while the pointer moves the displacement includes the distance
+// travelled during that lag. A steady slow movement keeps that biased value
+// constant (#2452). Only settled samples, where neither pointer nor sprite has
+// changed for the required number of distinct frames, are trusted.
 struct amiberry_input_cursor_hotspot_tracker
 {
 	bool have_sample = false;
 	bool learned = false;
 	bool confirmed_x = false;
 	bool confirmed_y = false;
-	bool candidate_x_moved = false;
-	bool candidate_y_moved = false;
+	bool have_settled = false;
 	int last_pointer_x = 0;
 	int last_pointer_y = 0;
 	int last_sprite_x = 0;
 	int last_sprite_y = 0;
-	int candidate_x = 0;
-	int candidate_y = 0;
-	int stable_samples = 0;
+	unsigned int last_frame = 0;
+	int unchanged_samples = 0;
+	int settled_pointer_x = 0;
+	int settled_pointer_y = 0;
+	int settled_candidate_x = 0;
+	int settled_candidate_y = 0;
 	int hotspot_x = 0;
 	int hotspot_y = 0;
 };
@@ -240,9 +274,9 @@ amiberry_input_cursor_hotspot_tracker_cache_acquire(
 }
 
 static inline bool amiberry_input_cursor_hotspot_tracker_sample(
-	amiberry_input_cursor_hotspot_tracker* tracker, bool position_valid,
+	amiberry_input_cursor_hotspot_tracker* tracker, bool position_valid, unsigned int frame,
 	int pointer_x, int pointer_y, int sprite_x, int sprite_y,
-	int cursor_width, int cursor_height, int required_stable_samples,
+	int cursor_width, int cursor_height, int required_settled_frames,
 	int* hotspot_x, int* hotspot_y)
 {
 	if (!tracker) {
@@ -267,49 +301,54 @@ static inline bool amiberry_input_cursor_hotspot_tracker_sample(
 		&& candidate_y >= 0 && candidate_y < cursor_height;
 
 	if (candidate_valid) {
-		const bool stable = tracker->have_sample
-			&& candidate_x == tracker->candidate_x && candidate_y == tracker->candidate_y;
-		const bool moved_x = stable
-			&& pointer_x != tracker->last_pointer_x && sprite_x != tracker->last_sprite_x;
-		const bool moved_y = stable
-			&& pointer_y != tracker->last_pointer_y && sprite_y != tracker->last_sprite_y;
+		const bool unchanged = tracker->have_sample
+			&& pointer_x == tracker->last_pointer_x && pointer_y == tracker->last_pointer_y
+			&& sprite_x == tracker->last_sprite_x && sprite_y == tracker->last_sprite_y;
 
-		tracker->stable_samples = stable ? tracker->stable_samples + 1 : 1;
-		tracker->candidate_x_moved = stable
-			? tracker->candidate_x_moved || moved_x : false;
-		tracker->candidate_y_moved = stable
-			? tracker->candidate_y_moved || moved_y : false;
+		// The cursor can be rebuilt several times within one frame. Those
+		// repeats give the guest no extra time to move its sprite.
+		if (!unchanged || frame != tracker->last_frame) {
+			tracker->unchanged_samples = unchanged ? tracker->unchanged_samples + 1 : 1;
+		}
 		tracker->have_sample = true;
+		tracker->last_frame = frame;
 		tracker->last_pointer_x = pointer_x;
 		tracker->last_pointer_y = pointer_y;
 		tracker->last_sprite_x = sprite_x;
 		tracker->last_sprite_y = sprite_y;
-		tracker->candidate_x = candidate_x;
-		tracker->candidate_y = candidate_y;
 
-		if (tracker->stable_samples >= required_stable_samples) {
+		// Evaluate each resting position once.
+		if (tracker->unchanged_samples == required_settled_frames) {
 			if (!tracker->learned) {
 				tracker->learned = true;
 				tracker->hotspot_x = candidate_x;
 				tracker->hotspot_y = candidate_y;
 			}
-			// Stationary samples provide a provisional hotspot, but only
-			// coordinated movement can replace and confirm an axis. A clamped
-			// sprite cannot follow pointer movement along that axis.
-			if (!tracker->confirmed_x && tracker->candidate_x_moved) {
-				tracker->hotspot_x = candidate_x;
-				tracker->confirmed_x = true;
+			// A single resting position gives a provisional hotspot. An axis is
+			// confirmed only when a second resting position along it yields the
+			// same displacement. A sprite clamped at a screen edge cannot follow
+			// the pointer along that axis, so its displacement changes instead.
+			if (tracker->have_settled) {
+				if (!tracker->confirmed_x && pointer_x != tracker->settled_pointer_x
+					&& candidate_x == tracker->settled_candidate_x) {
+					tracker->hotspot_x = candidate_x;
+					tracker->confirmed_x = true;
+				}
+				if (!tracker->confirmed_y && pointer_y != tracker->settled_pointer_y
+					&& candidate_y == tracker->settled_candidate_y) {
+					tracker->hotspot_y = candidate_y;
+					tracker->confirmed_y = true;
+				}
 			}
-			if (!tracker->confirmed_y && tracker->candidate_y_moved) {
-				tracker->hotspot_y = candidate_y;
-				tracker->confirmed_y = true;
-			}
+			tracker->have_settled = true;
+			tracker->settled_pointer_x = pointer_x;
+			tracker->settled_pointer_y = pointer_y;
+			tracker->settled_candidate_x = candidate_x;
+			tracker->settled_candidate_y = candidate_y;
 		}
 	} else {
 		tracker->have_sample = false;
-		tracker->stable_samples = 0;
-		tracker->candidate_x_moved = false;
-		tracker->candidate_y_moved = false;
+		tracker->unchanged_samples = 0;
 	}
 
 	if (tracker->learned) {

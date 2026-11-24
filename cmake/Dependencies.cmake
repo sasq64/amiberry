@@ -14,17 +14,9 @@ if (USE_GPIOD)
     endif ()
 endif ()
 
-if (USE_DBUS)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_DBUS)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(DBUS REQUIRED dbus-1)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${DBUS_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${DBUS_LIBRARIES})
-endif ()
-
 if (USE_IPC_SOCKET)
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_IPC_SOCKET)
-    message(STATUS "Unix socket IPC enabled")
+    message(STATUS "IPC control socket enabled")
 endif ()
 
 if (USE_OPENGL)
@@ -43,6 +35,17 @@ if (USE_OPENGL)
         else()
             find_package(OpenGL REQUIRED)
             target_link_libraries(${PROJECT_NAME} PRIVATE OpenGL::GL)
+            if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+                # ES fallback tier (context ladder modes 4/5 in gfx_window.cpp):
+                # last-resort GLES 3.0 context for hosts whose only hardware
+                # driver is GLES. No extra link-time dependency — SDL loads
+                # libGLESv2 via EGL and glvnd dispatches our direct GL entry
+                # calls to the current context. Linux/FreeBSD only: Windows/
+                # macOS have no GLES driver story (ANGLE breaks opengl32
+                # stub dispatch).
+                target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_GLES_FALLBACK)
+                message(STATUS "OpenGL ES fallback tier enabled (GLES 3.0 context retry on desktop GL failure)")
+            endif()
         endif()
     else()
         target_link_libraries(${PROJECT_NAME} PRIVATE GLESv3 EGL)
@@ -74,6 +77,75 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE USE_SDL3)
 message(STATUS "Using SDL3")
 
+if(USE_VIDEOGRAB)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VIDEOGRAB)
+    message(STATUS "Genlock video/camera input enabled")
+endif()
+
+if(USE_FFMPEG)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+            libavformat>=59.27
+            libavcodec>=59.37
+            libavutil>=57.28
+            libswscale>=6.7
+            libswresample>=4.7
+        )
+    endif()
+
+    if(TARGET PkgConfig::FFMPEG)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_WITH_FFMPEG)
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::FFMPEG)
+        set(AMIBERRY_WITH_FFMPEG ON)
+        message(STATUS "FFmpeg 5.1+ media decoding enabled")
+    else()
+        find_package(FFMPEG QUIET)
+        if(FFMPEG_FOUND
+            AND FFMPEG_libavformat_VERSION VERSION_GREATER_EQUAL "59.27"
+            AND FFMPEG_libavcodec_VERSION VERSION_GREATER_EQUAL "59.37"
+            AND FFMPEG_libavutil_VERSION VERSION_GREATER_EQUAL "57.28"
+            AND FFMPEG_libswscale_VERSION VERSION_GREATER_EQUAL "6.7"
+            AND FFMPEG_libswresample_VERSION VERSION_GREATER_EQUAL "4.7")
+            target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_WITH_FFMPEG)
+            target_include_directories(${PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIRS})
+            target_link_libraries(${PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARIES})
+            set(AMIBERRY_WITH_FFMPEG ON)
+            message(STATUS "FFmpeg 5.1+ media decoding enabled")
+        else()
+            message(STATUS "FFmpeg 5.1+ development libraries not found; FFmpeg media decoding disabled")
+        endif()
+    endif()
+else()
+    message(STATUS "FFmpeg media decoding disabled")
+endif()
+
+if(USE_WEBP)
+    find_package(WebP CONFIG QUIET)
+    if(TARGET WebP::webp AND TARGET WebP::webpdemux)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_WITH_WEBP)
+        target_link_libraries(${PROJECT_NAME} PRIVATE WebP::webp WebP::webpdemux)
+        set(AMIBERRY_WITH_WEBP ON)
+        message(STATUS "libwebp still and animated WebP decoding enabled")
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(WEBP QUIET IMPORTED_TARGET libwebp libwebpdemux)
+        endif()
+
+        if(TARGET PkgConfig::WEBP)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_WITH_WEBP)
+            target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::WEBP)
+            set(AMIBERRY_WITH_WEBP ON)
+            message(STATUS "libwebp still and animated WebP decoding enabled")
+        else()
+            message(STATUS "libwebp and libwebpdemux development libraries not found; WebP decoding disabled")
+        endif()
+    endif()
+else()
+    message(STATUS "WebP decoding disabled")
+endif()
+
 if(ANDROID)
     include(FetchContent)
 
@@ -94,12 +166,12 @@ if(ANDROID)
     FetchContent_Declare(
         sdl3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG        release-3.4.14
+        GIT_TAG        release-3.4.16
     )
     FetchContent_Declare(
         sdl3_image
         GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
-        GIT_TAG        release-3.4.4
+        GIT_TAG        release-3.4.6
     )
     set(SDLIMAGE_AVIF OFF CACHE BOOL "Disable AVIF support in Android vendored SDL_image" FORCE)
     set(SDLIMAGE_PNG_LIBPNG OFF CACHE BOOL "Use SDL's PNG helpers instead of SDL_image's vendored libpng on Android" FORCE)
@@ -440,14 +512,70 @@ if(ANDROID)
 
     # --- Existing dependencies ---
 elseif(IOS)
-    # iOS: SDL3 and SDL3_image must be pre-built and findable via CMAKE_FIND_ROOT_PATH.
-    # Most optional codecs and network libs are unavailable or unnecessary on iOS.
-    find_package(SDL3 CONFIG REQUIRED)
-    find_package(SDL3_image CONFIG REQUIRED)
+    # iOS: SDL3 and SDL3_image are built from source via FetchContent with the
+    # same pinned tags as the Android build, so a clean checkout configures for
+    # iOS with nothing but Xcode and the iOS SDK. Most optional codecs and
+    # network libs are unavailable or unnecessary on iOS.
+    include(FetchContent)
+    set(SDL_STATIC ON CACHE BOOL "Build SDL3 as a static library on iOS" FORCE)
+    set(SDL_SHARED OFF CACHE BOOL "Shared SDL3 is not usable in an iOS app bundle" FORCE)
+    # iOS permission strings (ITMS-90683): Amiberry drives game controllers
+    # through GameController (SDL_INIT_GAMEPAD) and uses neither the raw
+    # SDL_hid API nor SDL's sensor API. SDL3's iOS hidapi backend is a
+    # Steam-Controller-over-Bluetooth implementation (CoreBluetooth) and its
+    # sensor backend is CoreMotion; leaving them enabled would reference
+    # CBCentralManager and CMMotionManager, which App Store processing then
+    # flags as requiring NSBluetoothAlwaysUsageDescription and motion
+    # permission. The camera (SDL_INIT_CAMERA, the genlock capture source)
+    # and audio capture (the sampler, the sound cards' recording input)
+    # are real features: their usage strings are in iOSBundleInfo.plist.in.
+    set(SDL_HIDAPI OFF CACHE BOOL "No raw HID on iOS: controllers come via GameController" FORCE)
+    set(SDL_SENSOR OFF CACHE BOOL "No SDL sensor API use on iOS (CoreMotion)" FORCE)
+    FetchContent_Declare(
+        sdl3
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+        GIT_TAG        release-3.4.16
+    )
+    # SDL_image defines BUILD_SHARED_LIBS (default ON) via cmake_dependent_option,
+    # which would make it expect a shared SDL3 (SDL3::SDL3-shared) that iOS does
+    # not build. Pin it OFF up front; iOS bundles only link static libraries.
+    # (capsimage is unaffected: it builds SHARED explicitly.)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "iOS builds link static libraries" FORCE)
+    FetchContent_Declare(
+        sdl3_image
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
+        GIT_TAG        release-3.4.6
+    )
+    set(SDLIMAGE_AVIF OFF CACHE BOOL "Disable AVIF support in iOS vendored SDL_image" FORCE)
+    set(SDLIMAGE_PNG_LIBPNG OFF CACHE BOOL "Use SDL's PNG helpers instead of SDL_image's vendored libpng on iOS" FORCE)
+    FetchContent_MakeAvailable(sdl3 sdl3_image)
+    # SDL3_image's CONFIG package links SDL3 transitively; the FetchContent
+    # static targets may not, so link SDL3 explicitly.
+    if(TARGET SDL3::SDL3-static)
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3-static)
+    elseif(TARGET SDL3-static)
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL3-static)
+    endif()
     find_package(ZLIB REQUIRED)
-    find_package(PNG QUIET)
-    if(PNG_FOUND)
-        target_link_libraries(${PROJECT_NAME} PRIVATE PNG::PNG)
+    # libpng (same vendored build as Android): the genlock test card decodes
+    # its PNG in-process (src/specialmonitors.cpp), and iOS has no system
+    # libpng. Linked via the generic png_static target handling below.
+    set(PNG_SHARED OFF CACHE BOOL "Build shared lib" FORCE)
+    set(PNG_STATIC ON CACHE BOOL "Build static lib" FORCE)
+    set(PNG_TESTS OFF CACHE BOOL "Build tests" FORCE)
+    FetchContent_Declare(
+        libpng
+        GIT_REPOSITORY https://github.com/pnggroup/libpng.git
+        GIT_TAG        v1.6.43
+    )
+    FetchContent_MakeAvailable(libpng)
+    if(EXISTS "${libpng_SOURCE_DIR}")
+        target_include_directories(${PROJECT_NAME} PRIVATE "${libpng_SOURCE_DIR}")
+    endif()
+    # pnglibconf.h is generated into libpng's binary dir; include it so png.h
+    # can find it.
+    if(EXISTS "${libpng_BINARY_DIR}/pnglibconf.h")
+        target_include_directories(${PROJECT_NAME} PRIVATE "${libpng_BINARY_DIR}")
     endif()
 
     # nlohmann_json: header-only, fetch if not found
@@ -464,8 +592,23 @@ elseif(IOS)
     endif()
     target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
 
-    # No FLAC, mpg123, or CURL on iOS
-    # - FLAC/mpg123: audio codec libs not needed (no CD audio ripping on mobile)
+    # FLAC (same vendored build as Android): CHD compressed-disk images use
+    # libFLAC (src/blkdev_cdimage.cpp, src/archivers/chd).
+    set(BUILD_PROGRAMS OFF CACHE BOOL "Build and install programs" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "Build and install examples" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "Build and install tests" FORCE)
+    set(BUILD_DOCS OFF CACHE BOOL "Build and install doxygen documents" FORCE)
+    set(INSTALL_MANPAGES OFF CACHE BOOL "Install MAN pages" FORCE)
+    set(WITH_OGG OFF CACHE BOOL "ogg support" FORCE)
+    FetchContent_Declare(
+        flac
+        GIT_REPOSITORY https://github.com/xiph/flac.git
+        GIT_TAG        1.5.0
+    )
+    FetchContent_MakeAvailable(flac)
+
+    # No mpg123 or CURL on iOS
+    # - mpg123: audio codec lib not needed (no CD audio ripping on mobile)
     # - CURL: self-update is disabled on iOS
 else()
     find_package(SDL3 CONFIG REQUIRED)
@@ -511,13 +654,34 @@ endif ()
 # running FindHelper can inject a raw '-lserialport' link flag, which fails on the NDK.
 if (USE_LIBSERIALPORT AND NOT ANDROID)
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_LIBSERIALPORT)
-    find_helper(LIBSERIALPORT libserialport libserialport.h serialport)
-    if(TARGET serialport)
+    if(WIN32)
+        # vcpkg has no libserialport port, and upstream builds only with autotools
+        # or MSBuild. Its Windows backend is three C files; LIBSERIALPORT_MSBUILD
+        # selects the configuration that needs no generated config.h.
+        include(FetchContent)
+        FetchContent_Declare(
+            libserialport
+            GIT_REPOSITORY https://github.com/sigrokproject/libserialport
+            GIT_TAG        bc8f88ef3399b76da7992a99badebada419d0e19 # libserialport-0.1.2
+        )
+        FetchContent_MakeAvailable(libserialport)
+        add_library(serialport STATIC
+            ${libserialport_SOURCE_DIR}/serialport.c
+            ${libserialport_SOURCE_DIR}/timing.c
+            ${libserialport_SOURCE_DIR}/windows.c)
+        target_compile_definitions(serialport PRIVATE LIBSERIALPORT_MSBUILD)
+        target_include_directories(serialport PUBLIC ${libserialport_SOURCE_DIR})
+        target_link_libraries(serialport PRIVATE setupapi cfgmgr32)
         target_link_libraries(${PROJECT_NAME} PRIVATE serialport)
-    elseif(LIBSERIALPORT_FOUND AND LIBSERIALPORT_LIBRARIES)
-        target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBSERIALPORT_LIBRARIES})
     else()
-        message(STATUS "LibSerialPort enabled but library was not found")
+        find_helper(LIBSERIALPORT libserialport libserialport.h serialport)
+        if(TARGET serialport)
+            target_link_libraries(${PROJECT_NAME} PRIVATE serialport)
+        elseif(LIBSERIALPORT_FOUND AND LIBSERIALPORT_LIBRARIES)
+            target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBSERIALPORT_LIBRARIES})
+        else()
+            message(STATUS "LibSerialPort enabled but library was not found")
+        endif()
     endif()
 endif ()
 
@@ -551,15 +715,15 @@ if (USE_LIBENET)
     endif()
 endif ()
 
-if (USE_PCEM)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_PCEM)
+if (USE_86BOX)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_86BOX)
 endif ()
 
 if (USE_PPC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_PPC)
 endif()
 
-if (USE_PCEM OR USE_PPC)
+if (USE_86BOX OR USE_PPC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_QEMU_CPU)
 endif()
 
@@ -609,11 +773,19 @@ if(ANDROID AND DEFINED sdl3_image_SOURCE_DIR)
     target_include_directories(${PROJECT_NAME} PRIVATE "${sdl3_image_SOURCE_DIR}/include")
 endif()
 
-# ImGui is always enabled
-target_compile_definitions(${PROJECT_NAME} PRIVATE USE_IMGUI)
+# ImGui: everywhere but the native Apple apps and the Android app
+# (AMIBERRY_IMGUI).
+if(AMIBERRY_IMGUI)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_IMGUI)
+else()
+    # The ImGui overlay and on-screen keyboard calls become inert
+    # (imgui_overlay.h, imgui_osk.h).
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_NO_IMGUI)
+endif()
 
 set(libmt32emu_SHARED FALSE)
 add_subdirectory(external/mt32emu)
+add_subdirectory(external/lhasa)
 if(NOT IOS)
     add_subdirectory(external/floppybridge)
 endif()
@@ -640,9 +812,16 @@ else()
     set(_SDL_IMAGE_LIB SDL3_image)
 endif()
 
+# SDL3 itself, which also reached the link through ImGui's static library
+# (the native Apple apps build without it). iOS links its static SDL3 above.
+if(NOT ANDROID AND NOT IOS AND TARGET SDL3::SDL3)
+    target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3)
+endif()
+
 # Direct target linking preserves transitive includes and compile definitions.
 target_link_libraries(${PROJECT_NAME} PRIVATE
     mt32emu
+    lhasa
     ZLIB::ZLIB
     nlohmann_json::nlohmann_json
     ${CMAKE_DL_LIBS}
@@ -659,6 +838,25 @@ if(TARGET CURL::libcurl)
 elseif(CURL_FOUND)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${CURL_LIBRARIES})
     target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_HAS_CURL)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(NOT CURL_CONFIG_EXECUTABLE)
+        find_program(CURL_CONFIG_EXECUTABLE NAMES curl-config)
+    endif()
+    if(CURL_CONFIG_EXECUTABLE)
+        execute_process(
+            COMMAND "${CURL_CONFIG_EXECUTABLE}" --ca
+            RESULT_VARIABLE AMIBERRY_CURL_CONFIG_RESULT
+            OUTPUT_VARIABLE AMIBERRY_CURL_CA_BUNDLE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(AMIBERRY_CURL_CONFIG_RESULT EQUAL 0
+                AND IS_ABSOLUTE "${AMIBERRY_CURL_CA_BUNDLE}")
+            target_compile_definitions(${PROJECT_NAME} PRIVATE
+                    AMIBERRY_CURL_CA_BUNDLE="${AMIBERRY_CURL_CA_BUNDLE}")
+        endif()
+    endif()
 endif()
 
 if (NOT ANDROID AND NOT WIN32)
@@ -712,16 +910,16 @@ if(ANDROID)
     target_link_libraries(${PROJECT_NAME} PRIVATE log android)
 endif()
 
-# ImGui is always enabled
-if(USE_OPENGL)
-    set(IMGUI_USE_OPENGL ON CACHE BOOL "Build ImGui OpenGL3 backend" FORCE)
+if(AMIBERRY_IMGUI)
+    if(USE_OPENGL)
+        set(IMGUI_USE_OPENGL ON CACHE BOOL "Build ImGui OpenGL3 backend" FORCE)
+    endif()
+    if(USE_VULKAN)
+        set(IMGUI_USE_VULKAN ON CACHE BOOL "Build ImGui Vulkan backend" FORCE)
+    endif()
+    add_subdirectory(external/imgui)
+    target_link_libraries(${PROJECT_NAME} PRIVATE imgui)
 endif()
-if(USE_VULKAN)
-    set(IMGUI_USE_VULKAN ON CACHE BOOL "Build ImGui Vulkan backend" FORCE)
-endif()
-set(IMGUI_USE_SDL3 ON CACHE BOOL "Build ImGui SDL3 backend" FORCE)
-add_subdirectory(external/imgui)
-target_link_libraries(${PROJECT_NAME} PRIVATE imgui)
 
 # Native File Dialog Extended (NFD) — OS-native open/save/folder dialogs.
 # Excluded on Android (own Kotlin UI) and Haiku (unsupported by NFD).
@@ -782,9 +980,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     find_library(UTIL_LIBRARY util REQUIRED)
     # REQUIRED will make sure the build fails earlier if libutil isn't found
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${UTIL_LIBRARY} iconv)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${UTIL_LIBRARY})
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
-    target_link_libraries(${PROJECT_NAME} PRIVATE network iconv bsd)
+    target_link_libraries(${PROJECT_NAME} PRIVATE network bsd)
 endif()
 
 # Platform system libraries must come AFTER all other dependencies so that

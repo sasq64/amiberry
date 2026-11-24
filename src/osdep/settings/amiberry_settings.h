@@ -1,0 +1,653 @@
+/*
+ * Amiberry shared settings layer: the platform-neutral C API every settings
+ * UI uses: ImGui, native front ends on macOS, iOS, Windows, Linux and
+ * Android, and IPC.
+ *
+ * An option is identified by its .uae configuration key, and its values use
+ * the .uae spelling, so "cpu_model" = "68030" means exactly what the line
+ * cpu_model=68030 means in a configuration file.
+ *
+ * The API is plain C so any language with a C foreign-function interface can
+ * bind it (Swift, C++/WinRT, C# P/Invoke, Kotlin/JNI, GTK or Qt). Strings
+ * are NUL-terminated UTF-8; front ends that use UTF-16 convert at the
+ * boundary. Pointers returned by the API stay valid for the lifetime of the
+ * process unless a function says otherwise. bool is the C99 one-byte type
+ * (C# needs [MarshalAs(UnmanagedType.I1)]).
+ *
+ * Descriptors are static and may be read from any thread. Every other call
+ * must be made on the emulator's main thread: sessions read and write the
+ * pending configuration and run the core's configuration fixups. A front end
+ * with its own UI thread hands those calls to the emulator thread.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+
+/*
+ * The core links the layer statically by default. A build that ships it in
+ * a shared library for a separate front end defines AMIBERRY_SETTINGS_EXPORT
+ * while compiling the library, and the front end defines
+ * AMIBERRY_SETTINGS_IMPORT on Windows.
+ */
+#if defined(_WIN32)
+#if defined(AMIBERRY_SETTINGS_EXPORT)
+#define AMIBERRY_SETTINGS_API __declspec(dllexport)
+#elif defined(AMIBERRY_SETTINGS_IMPORT)
+#define AMIBERRY_SETTINGS_API __declspec(dllimport)
+#else
+#define AMIBERRY_SETTINGS_API
+#endif
+#elif defined(__GNUC__)
+#define AMIBERRY_SETTINGS_API __attribute__((visibility("default")))
+#else
+#define AMIBERRY_SETTINGS_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define AMIBERRY_SETTINGS_API_VERSION 12
+
+/* Large enough for every value a descriptor can produce, including the
+   terminating NUL. */
+#define AMIBERRY_SETTINGS_VALUE_MAX 64
+
+typedef enum amiberry_setting_type {
+	AMIBERRY_SETTING_BOOL,   /* "true" or "false" */
+	AMIBERRY_SETTING_INT,    /* decimal integer within [min, max] */
+	AMIBERRY_SETTING_REAL,   /* decimal number within [min, max] */
+	AMIBERRY_SETTING_CHOICE, /* one of the descriptor's choice values */
+	/* Free-form .uae token. PATH is a file system path a front end can
+	   attach a file picker to; STRING is any other literal value, for
+	   example a hexadecimal address. These values may be longer than
+	   AMIBERRY_SETTINGS_VALUE_MAX: read them with a larger buffer (the
+	   get call reports AMIBERRY_SETTINGS_BUFFER_TOO_SMALL until it fits)
+	   and never through amiberry_settings_adjustment, which truncates.
+	   A PATH longer than the host's path limit (PATH_MAX, 1024 bytes on
+	   macOS) is refused with AMIBERRY_SETTINGS_INVALID_VALUE.
+	   FILE is the same, for a single file rather than a folder, so a
+	   front end attaches a file picker instead of a folder one. */
+	AMIBERRY_SETTING_PATH,
+	AMIBERRY_SETTING_FILE,
+	AMIBERRY_SETTING_STRING,
+	/* A keyboard shortcut, read and written like a STRING: "" (none), a key
+	   with optional modifiers, a modifier key alone, or a controller
+	   button. The amiberry_settings_hotkey_* calls below spell and
+	   explain these values. */
+	AMIBERRY_SETTING_HOTKEY
+} amiberry_setting_type;
+
+typedef enum amiberry_apply_class {
+	AMIBERRY_APPLY_LIVE,     /* picked up by the running emulation */
+	AMIBERRY_APPLY_RESET,    /* takes effect at the next hard reset */
+	AMIBERRY_APPLY_RESTART   /* takes effect the next time emulation starts */
+} amiberry_apply_class;
+
+typedef struct amiberry_setting_choice {
+	const char *value;       /* .uae spelling */
+	const char *label;       /* display text */
+} amiberry_setting_choice;
+
+typedef struct amiberry_setting_descriptor {
+	const char *id;          /* .uae key, including any "amiberry." prefix */
+	const char *group;       /* stable group ID, for example "cpu" or "jit" */
+	const char *label;
+	const char *help;
+	amiberry_setting_type type;
+	amiberry_apply_class apply;
+	double min, max, step;   /* INT and REAL only; the current range can be narrower */
+	const char *default_value;
+	const amiberry_setting_choice *choices; /* CHOICE only */
+	size_t choice_count;
+	/* Why the emulator may change a value the user picked. Reported as the
+	   reason of an adjustment found by amiberry_settings_validate(). */
+	const char *constraint;
+	/* INT only: the value counts the other way from how people read it, as
+	   a volume stored as its attenuation (0 is full volume). A front end
+	   shows and takes min + max - value, and labels and help describe that
+	   shown number; get, set and ranges keep the .uae value. */
+	bool reversed;
+	/* INT and REAL only: NULL, or the unit of the shown number, written
+	   after it: "%", "KB", "ms", "s", "px" or "scanlines". The label does
+	   not repeat it. */
+	const char *unit;
+	/* INT and REAL only: 0 or 1 when the value is shown as it is stored.
+	   Otherwise people read value / scale, as a gamma stored in tenths
+	   (scale 10: 125 shows as 12.5). It applies after reversed: a front end
+	   shows (reversed ? min + max - value : value) / scale and stores the
+	   inverse; labels, help and units describe the shown number. */
+	double scale;
+	/* INT and REAL only: a level people set by feel (a volume, the
+	   brightness, a dead zone) rather than a number they look up, so a
+	   front end may offer a slider over the current range instead of a
+	   number field. */
+	bool level;
+	/* The platforms this setting is hidden on, because it does nothing
+	   there (the AMIBERRY_SETTINGS_HIDE_ON_* bits below): iOS has no
+	   serial backend or desktop window, Android never switches host
+	   display modes or traps its pointer, and the desktop bit marks the
+	   settings the built-in GUI alone has (the classic settings window's
+	   own). 0: shown everywhere. The desktop GUI itself shows every
+	   setting, so a front end only needs the bit for its own platform. */
+	unsigned int hidden_on;
+} amiberry_setting_descriptor;
+
+/* The native-UI platforms a setting can be hidden on (hidden_on bits).
+   DESKTOP is the desktop build's built-in GUI, which shows everything:
+   its bit marks a setting only that GUI has. */
+#define AMIBERRY_SETTINGS_HIDE_ON_DESKTOP 0x01u
+#define AMIBERRY_SETTINGS_HIDE_ON_MACOS   0x02u /* the native Mac app */
+#define AMIBERRY_SETTINGS_HIDE_ON_IOS     0x04u
+#define AMIBERRY_SETTINGS_HIDE_ON_ANDROID 0x08u
+#define AMIBERRY_SETTINGS_HIDE_ON_WINDOWS 0x10u /* the native Windows app */
+#define AMIBERRY_SETTINGS_HIDE_ON_ALL (0x01u | 0x02u | 0x04u | 0x08u | 0x10u)
+
+AMIBERRY_SETTINGS_API size_t amiberry_settings_count(void);
+/* NULL when index >= amiberry_settings_count(). */
+AMIBERRY_SETTINGS_API const amiberry_setting_descriptor *amiberry_settings_at(size_t index);
+
+/* NULL for an unknown ID. */
+AMIBERRY_SETTINGS_API const amiberry_setting_descriptor *amiberry_settings_find(const char *id);
+
+typedef enum amiberry_settings_status {
+	AMIBERRY_SETTINGS_OK,
+	AMIBERRY_SETTINGS_UNKNOWN_ID,
+	AMIBERRY_SETTINGS_INVALID_VALUE,  /* not parseable, out of range or not a choice */
+	AMIBERRY_SETTINGS_UNAVAILABLE,    /* the option or this choice is unavailable now */
+	AMIBERRY_SETTINGS_BUFFER_TOO_SMALL
+} amiberry_settings_status;
+
+/*
+ * An edit session works on a private copy of the pending configuration
+ * (the one the emulator applies next). Setting a value applies the same
+ * dependent changes the ImGui GUI makes, for example switching to a 68040
+ * selects its internal FPU. Nothing reaches the emulator until commit.
+ */
+typedef struct amiberry_settings_session amiberry_settings_session;
+
+/* NULL when memory is exhausted. */
+AMIBERRY_SETTINGS_API amiberry_settings_session *amiberry_settings_session_open(void);
+AMIBERRY_SETTINGS_API void amiberry_settings_session_close(amiberry_settings_session *session);
+
+/*
+ * Some CHOICE options enumerate devices connected to the host (audio
+ * devices, joysticks and mice) instead of a fixed list. For those,
+ * amiberry_settings_choices() returns the choices that can be selected
+ * now; a configuration may still hold a value outside the list (a device
+ * that is no longer connected), which amiberry_settings_get() reports
+ * as-is. The joyport device lists (joyport0 to joyport3) start with such a
+ * value, labelled for what it is ("Joystick 2 (not connected)"), so a
+ * front end shows the port as it is. Both calls, like every session call,
+ * run on the emulator's main thread; the returned pointer is valid until
+ * the next main-thread call of the layer.
+ * amiberry_settings_refresh_choices() re-reads the host
+ * device lists, for example when a device was connected.
+ */
+AMIBERRY_SETTINGS_API size_t amiberry_settings_choices(
+	const amiberry_settings_session *session, const char *id,
+	const amiberry_setting_choice **choices);
+AMIBERRY_SETTINGS_API void amiberry_settings_refresh_choices(void);
+
+/*
+ * The current value in .uae spelling. A CHOICE option can hold a value
+ * outside its choice list when a configuration file set one.
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_get(const amiberry_settings_session *session,
+	const char *id, char *buffer, size_t size);
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_set(amiberry_settings_session *session,
+	const char *id, const char *value);
+/*
+ * The value the running emulation uses now (the active configuration),
+ * which reaches the pending one's after amiberry_actions_apply_settings
+ * with the option's apply class. Same spelling and statuses as get.
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_get_active(const char *id,
+	char *buffer, size_t size);
+
+AMIBERRY_SETTINGS_API bool amiberry_settings_is_available(const amiberry_settings_session *session, const char *id);
+/* Whether a CHOICE or BOOL option accepts this value now ("true"/"false" for
+   BOOL): a front end greys out the values that return false. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_choice_is_available(const amiberry_settings_session *session,
+	const char *id, const char *value);
+/* The range an INT or REAL option accepts now; false for other types. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_get_range(const amiberry_settings_session *session, const char *id,
+	double *min, double *max);
+
+typedef struct amiberry_settings_adjustment {
+	const char *id;
+	char requested[AMIBERRY_SETTINGS_VALUE_MAX];
+	char adjusted[AMIBERRY_SETTINGS_VALUE_MAX];
+	const char *reason;
+} amiberry_settings_adjustment;
+
+/*
+ * Merges the session's changes into the current pending configuration
+ * (changes made elsewhere since the session last read it included), runs
+ * the core's configuration fixups on a copy of that and reports every
+ * option they would change. Writes at most capacity entries, zero-filled
+ * past each string, and returns the total number found; the session itself
+ * is not modified. Settings that do not have an option of their own yet
+ * are adjusted by commit but not reported.
+ */
+AMIBERRY_SETTINGS_API size_t amiberry_settings_validate(const amiberry_settings_session *session,
+	amiberry_settings_adjustment *adjustments, size_t capacity);
+
+/*
+ * Stores the session in the pending configuration exactly as validation
+ * resolved it: the session's changes, changes made elsewhere since, and
+ * every adjustment the fixups make for them. The session continues from
+ * the stored configuration. It does not signal a running emulation:
+ * amiberry_actions_apply_settings (amiberry_actions.h) with the class
+ * returned brings the emulation up to it.
+ * *changed tells whether the pending configuration changed; the result is
+ * the strongest apply class among the options that did (or, when only
+ * settings without a value of their own changed, among the options the
+ * caller set), AMIBERRY_APPLY_LIVE when nothing changed.
+ */
+AMIBERRY_SETTINGS_API amiberry_apply_class amiberry_settings_commit(amiberry_settings_session *session, bool *changed);
+
+
+/*
+ * Machine presets (the Quickstart models). A preset replaces most of the
+ * configuration exactly like the Quickstart panel does, so it must be
+ * followed by amiberry_settings_commit().
+ */
+typedef struct amiberry_settings_preset {
+	const char *id;          /* stable ID, for example "a500" */
+	const char *label;       /* display name */
+	int config_count;        /* number of configurations */
+	int compatibility_max;   /* highest compatibility level */
+} amiberry_settings_preset;
+
+AMIBERRY_SETTINGS_API size_t amiberry_settings_preset_count(void);
+/* NULL when index >= amiberry_settings_preset_count(). */
+AMIBERRY_SETTINGS_API const amiberry_settings_preset *amiberry_settings_preset_at(size_t index);
+/* NULL for an unknown ID. */
+AMIBERRY_SETTINGS_API const amiberry_settings_preset *amiberry_settings_preset_find(const char *id);
+/* NULL when config is out of range. */
+AMIBERRY_SETTINGS_API const char *amiberry_settings_preset_config_label(
+	const amiberry_settings_preset *preset, int config);
+/* NULL when level is out of range. */
+AMIBERRY_SETTINGS_API const char *amiberry_settings_preset_compatibility_label(int level);
+/* Whether every ROM the preset's configuration needs is present in the
+   scanned ROM list; never shows a dialog or modifies anything. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_preset_rom_installed(const char *id, int config);
+/* Applies the preset to the session the way Quickstart does: built-in model
+   defaults (including the defaults of a fresh configuration outside the
+   options) plus the Quickstart constraints. Validate and commit replay it on
+   the pending configuration, after the session's earlier changes and before
+   its later ones. UNKNOWN_ID for an unknown preset or a NULL session,
+   INVALID_VALUE for a configuration out of range, UNAVAILABLE for a
+   compatibility level out of range or when memory is exhausted. Commit
+   afterwards to store the result; a preset commits at least
+   AMIBERRY_APPLY_RESET. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_preset_apply(
+	amiberry_settings_session *session, const char *id, int config, int compatibility);
+
+/*
+ * Mounted drives: directories, hardfiles, CD and tape units, in the order a
+ * configuration file lists them (at most AMIBERRY_SETTINGS_MOUNT_MAX). An
+ * entry is spelled as the value of its uaehfN line, for example
+ * "dir,rw,DH0:Work:/home/amiga/work,0" or
+ * "hdf,rw,DH1:/disks/system.hdf,32,1,2,512,0,,uae0"; get returns that
+ * spelling and add and replace take it. The edits stay in the session like
+ * every other change; commit reports a changed list as
+ * AMIBERRY_APPLY_RESET, as drives attach when the emulation resets.
+ */
+#define AMIBERRY_SETTINGS_MOUNT_MAX 50
+
+AMIBERRY_SETTINGS_API size_t amiberry_settings_mount_count(const amiberry_settings_session *session);
+/* UNKNOWN_ID for an index past the list. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_get(
+	const amiberry_settings_session *session, size_t index, char *buffer, size_t size);
+/*
+ * Appends an entry, checked like the hard drive panel's: INVALID_VALUE for
+ * a value that is not an entry, a device name another entry uses, a
+ * controller without a free unit, a second CD with the same unit, or an
+ * entry too long for a configuration file line; UNAVAILABLE when the list
+ * is full.
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_add(
+	amiberry_settings_session *session, const char *value);
+/*
+ * Replaces entry index, checked as add checks a new entry against the
+ * others. What a uaehfN value does not carry (a directory's injected
+ * icons) stays with the entry. UNKNOWN_ID for an index past the list.
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_replace(
+	amiberry_settings_session *session, size_t index, const char *value);
+/* Removes entry index; the later entries move up. UNKNOWN_ID for an index
+   past the list. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_remove(
+	amiberry_settings_session *session, size_t index);
+
+/*
+ * Building and reading mount entries field by field, so a front end never
+ * spells a uaehfN value itself. Entry kinds: "dir" (a host folder or an
+ * archive mounted as a volume), "hdf" (a hardfile), "cd" (a CD drive on an
+ * IDE or SCSI controller, which plays the CD image setting's disc) and
+ * "tape" (a tape drive: a folder or an image file).
+ *
+ * Fields, by id, with the kinds that have them and the spelling of their
+ * values:
+ *   "kind"           all; "dir", "hdf", "cd" or "tape"; read only
+ *   "path"           dir, hdf, tape (and cd, where it is empty): host path,
+ *                    without a double quote; setting a hardfile's path to
+ *                    another image probes it as amiberry_settings_mount_default
+ *                    does (an RDB sets RDB mode; without one, RDB mode
+ *                    becomes 32/1/2/512 and a set geometry stays)
+ *   "device"         dir, hdf: AmigaDOS device name without the colon
+ *   "volume"         dir: volume label
+ *                    (device and volume names cannot hold ':', ',' or '"')
+ *   "read_only"      all; "true" or "false"
+ *   "boot_priority"  dir, hdf; -128 is not bootable, -129 not mounted
+ *                    automatically, otherwise -127..127
+ *   "sectors", "surfaces", "reserved", "block_size"
+ *                    hdf; decimal; sectors 0 is RDB mode (the disk's own
+ *                    partition table), with block_size the RDB's
+ *   "controller"     hdf, cd, tape: a controller id as
+ *                    amiberry_settings_mount_controller_get() lists it
+ *                    ("uae%d", "ide%d", "scsi%d_a2091-2")
+ *   "unit"           hdf, cd, tape: the unit on that controller, a value
+ *                    of amiberry_settings_mount_controller_unit_get()
+ * What a field list does not carry (physical geometry, feature levels, a
+ * filesystem handler, flags) is kept as the entry has it.
+ */
+
+/*
+ * A new entry of kind for path (empty for a CD drive), as the hard drive
+ * panel starts one: the first free DHn device name, a directory's volume
+ * label from the folder's or archive's name, a hardfile's geometry read
+ * from its RDB (RDB mode when it has one, 32 sectors, 1 surface and 2
+ * reserved blocks of 512 bytes when it has none), boot priority 0, and the
+ * first controller amiberry_settings_mount_controller_get() lists for the
+ * kind (for a CD drive SCSI when a SCSI board is configured, IDE
+ * otherwise), and a CD or tape drive the first emulated unit (cdN, tapeN)
+ * no entry of its kind uses. The result is not added; pass it to
+ * amiberry_settings_mount_add(). UNKNOWN_ID for an unknown kind,
+ * INVALID_VALUE for a path an entry cannot hold (a tape drive needs one),
+ * UNAVAILABLE when every emulated CD or tape unit is in use.
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_default(
+	const amiberry_settings_session *session, const char *kind, const char *path, char *buffer, size_t size);
+/* Field id of the entry spelled value. INVALID_VALUE for a value that is not
+   an entry, UNKNOWN_ID for a field its kind does not have. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_field_get(
+	const amiberry_settings_session *session, const char *value, const char *field, char *buffer, size_t size);
+/* The entry spelled value with field id set to field_value, into buffer.
+   INVALID_VALUE for a value that is not an entry or a field value out of
+   range, UNKNOWN_ID for "kind" or a field the entry's kind does not have.
+   Whether the entry fits the list (a device name in use, a taken unit) is
+   checked when it is added or replaced. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_field_set(
+	const amiberry_settings_session *session, const char *value, const char *field, const char *field_value,
+	char *buffer, size_t size);
+
+/*
+ * The controllers an entry of kind ("hdf", "cd", "tape") can attach to, in
+ * the hard drive panel's order: the UAE controller (not for CDs), IDE and
+ * SCSI with the machine's own controller picked automatically, then the
+ * controllers of the configured expansion and accelerator boards, each
+ * unit of a board that has several. The id is the controller field of a
+ * uaehfN value with "%d" where the unit goes.
+ */
+AMIBERRY_SETTINGS_API size_t amiberry_settings_mount_controller_count(
+	const amiberry_settings_session *session, const char *kind);
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_controller_get(
+	const amiberry_settings_session *session, const char *kind, size_t index,
+	char *id, size_t id_size, char *label, size_t label_size);
+/* The units of controller index: value is what the "unit" field takes,
+   label what the panel shows ("0", "XT", "ST-506 #1"). */
+AMIBERRY_SETTINGS_API size_t amiberry_settings_mount_controller_unit_count(
+	const amiberry_settings_session *session, const char *kind, size_t index);
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_mount_controller_unit_get(
+	const amiberry_settings_session *session, const char *kind, size_t index, size_t unit,
+	int *value, char *label, size_t label_size);
+
+/*
+ * Expansion boards: SCSI, IDE and network controllers, bridgeboards, sound
+ * and graphics cards and the machines' built-in controllers, which a
+ * configuration lists by board type and unit ("a2091", "a2091-2"). The
+ * accelerator board is not one of them (the cpuboard_* options).
+ *
+ * A board type lists the fields a unit of it has, as setting descriptors:
+ * "enabled" (BOOL) first, then as the type has them "subtype" (CHOICE of
+ * the board's variants), "rom_file" (PATH), "scsi_id" (CHOICE "0"-"7"),
+ * "autoboot_disabled", "inserted" (a PCMCIA card), "dma24bit" (BOOL), and
+ * the board's own settings, "setting:<name>" (BOOL switch, CHOICE
+ * selector, STRING text). Units are numbered from 0, below the type's
+ * unit count.
+ *
+ * A session reads and edits units like options: the edits stay in the
+ * session, and commit reports changed boards as AMIBERRY_APPLY_RESTART
+ * (boards are built when the emulation starts). A ROM board enabled
+ * without a ROM file gets the scanned ROM of its type, or none (":NOROM",
+ * which the configuration keeps; the ROM is then picked through
+ * "rom_file"). Enabling a built-in controller switches the chipset field
+ * the machine has it as: the IDE controller ("ide"), A3000 or A4000T SCSI
+ * (one of the two) and the CD32 FMV cartridge on any machine, PCMCIA and
+ * the CDTV controllers through their options ("pcmcia", "cdtvcd",
+ * "cdtv-cr"), which a custom chipset has (the CDTV DMAC or the CDTV-CR).
+ */
+#define AMIBERRY_BOARD_INTERNAL      0x0001u /* built into a machine */
+#define AMIBERRY_BOARD_SCSI          0x0002u
+#define AMIBERRY_BOARD_IDE           0x0004u
+#define AMIBERRY_BOARD_SASI          0x0008u
+#define AMIBERRY_BOARD_CUSTOM        0x0010u /* other and UAE boards */
+#define AMIBERRY_BOARD_PCI_BRIDGE    0x0020u
+#define AMIBERRY_BOARD_X86_BRIDGE    0x0040u
+#define AMIBERRY_BOARD_RTG           0x0080u
+#define AMIBERRY_BOARD_SOUND         0x0100u
+#define AMIBERRY_BOARD_NETWORK       0x0200u
+#define AMIBERRY_BOARD_FLOPPY        0x0400u
+#define AMIBERRY_BOARD_X86_EXPANSION 0x0800u /* cards for a bridgeboard */
+
+typedef struct amiberry_settings_board_type {
+	const char *id;           /* configuration name, for example "a2091" */
+	const char *label;        /* display name */
+	const char *manufacturer; /* NULL when unknown */
+	unsigned int categories;  /* AMIBERRY_BOARD_* bits */
+	int units;                /* how many of it a configuration can have */
+	size_t field_count;
+} amiberry_settings_board_type;
+
+AMIBERRY_SETTINGS_API size_t amiberry_settings_board_type_count(void);
+/* NULL when index >= amiberry_settings_board_type_count(). */
+AMIBERRY_SETTINGS_API const amiberry_settings_board_type *amiberry_settings_board_type_at(size_t index);
+/* NULL for an unknown ID. */
+AMIBERRY_SETTINGS_API const amiberry_settings_board_type *amiberry_settings_board_type_find(const char *id);
+/* NULL when index >= type->field_count. */
+AMIBERRY_SETTINGS_API const amiberry_setting_descriptor *amiberry_settings_board_field_at(
+	const amiberry_settings_board_type *type, size_t index);
+
+/* UNKNOWN_ID for an unknown type or field or a unit out of range,
+   BUFFER_TOO_SMALL when the value does not fit. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_board_get(
+	const amiberry_settings_session *session, const char *type, int unit, const char *field,
+	char *buffer, size_t size);
+/* UNKNOWN_ID as get, INVALID_VALUE for a value the field does not take,
+   UNAVAILABLE for a field the unit does not have now (a field of a board
+   that is not enabled, a PCMCIA field of another variant) or a board the
+   configuration has no room for (20 boards). */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_board_set(
+	amiberry_settings_session *session, const char *type, int unit, const char *field,
+	const char *value);
+AMIBERRY_SETTINGS_API bool amiberry_settings_board_field_available(
+	const amiberry_settings_session *session, const char *type, int unit, const char *field);
+/* Whether the session's expansion boards differ from the running
+   emulation's: they take effect when it restarts. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_boards_differ_from_active(const amiberry_settings_session *session);
+
+/*
+ * Where a board unit's "setting:<name>" field keeps its value in the
+ * board's settings word, as the configuration's _rom_options line packs
+ * it (cfgfile_read_rom_settings): a switch takes one bit, a selector the
+ * bits its positions need. A front end that writes configuration files
+ * without a session packs the field itself with this. OK only for a
+ * "setting:" field; UNKNOWN_ID for any other (they keep no bits).
+ */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_board_field_layout(
+	const amiberry_settings_board_type *type, const char *field, int *shift, int *bits, bool *invert);
+/* A built-in controller's chipset option ("pcmcia", "cdtvcd"): the option
+   a front end switches the board through, whose rules the layer owns.
+   NULL for a board that is not built into a machine. */
+AMIBERRY_SETTINGS_API const char *amiberry_settings_board_option(const amiberry_settings_board_type *type);
+/* Whether the board is a built-in controller a machine's chipset puts in
+   (the motherboard IDE, the A3000/A4000T SCSI, PCMCIA, the CDTV's DMAC and
+   clock), rather than an expansion a configuration adds. Not every board
+   of the internal category is one: the CDTV's SRAM card and SCSI
+   expansion, and the CD32 FMV cartridge, are optional. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_board_built_in(const amiberry_settings_board_type *type);
+/* The configuration line ("cd32fmv") that switches a board no option of
+   the layer does: a front end writing the file itself writes it for the
+   board and drops it with the board. NULL for any other board. */
+AMIBERRY_SETTINGS_API const char *amiberry_settings_board_flag(const amiberry_settings_board_type *type);
+
+/*
+ * Custom controls: the Amiga input event each button and axis of the
+ * joystick on a port (0-3) triggers, alone or with the device's hotkey
+ * button held (hotkey). A configuration keeps them per port, for the
+ * device the port has.
+ *
+ * A control's value is an input event's configuration name from
+ * amiberry_settings_input_event_at(), "none" (the control does nothing),
+ * or "" (unset: the control does what the port's mode gives it, such as
+ * the joystick's fire button or the CD32 pad's colour buttons). A
+ * session keeps its edits until commit, which applies them live (and
+ * drops the edits for a port that has another device by then). A control
+ * is not available while the port has no joystick, the device lacks it,
+ * or a hotkey function holds it (custom_control_use names the function:
+ * "hotkey", "quit", "menu", "reset" or "vkbd").
+ */
+typedef struct amiberry_settings_custom_control {
+	const char *id;    /* configuration name: "a", "dpup", "leftx" */
+	const char *label; /* display name */
+	bool axis;
+} amiberry_settings_custom_control;
+
+AMIBERRY_SETTINGS_API size_t amiberry_settings_custom_control_count(void);
+/* NULL when index >= amiberry_settings_custom_control_count(). */
+AMIBERRY_SETTINGS_API const amiberry_settings_custom_control *amiberry_settings_custom_control_at(size_t index);
+AMIBERRY_SETTINGS_API size_t amiberry_settings_input_event_count(void);
+/* NULL when index >= amiberry_settings_input_event_count(). */
+AMIBERRY_SETTINGS_API const amiberry_setting_choice *amiberry_settings_input_event_at(size_t index);
+
+/* UNKNOWN_ID for an unknown control or a port out of range, UNAVAILABLE
+   while the port has no joystick, BUFFER_TOO_SMALL when the value does
+   not fit. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_custom_control_get(
+	const amiberry_settings_session *session, int port, bool hotkey, const char *control,
+	char *buffer, size_t size);
+/* UNKNOWN_ID as get, INVALID_VALUE for an unknown event, UNAVAILABLE for a
+   control that is not available. */
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_settings_custom_control_set(
+	amiberry_settings_session *session, int port, bool hotkey, const char *control, const char *event);
+AMIBERRY_SETTINGS_API bool amiberry_settings_custom_control_available(
+	const amiberry_settings_session *session, int port, bool hotkey, const char *control);
+/* NULL when no hotkey function holds the control. */
+AMIBERRY_SETTINGS_API const char *amiberry_settings_custom_control_use(
+	const amiberry_settings_session *session, int port, bool hotkey, const char *control);
+
+/*
+ * Keyboard shortcuts: the values of AMIBERRY_SETTING_HOTKEY options and
+ * host settings. A value is "" (none), or
+ * [LCtrl+|RCtrl+][LShift+|RShift+][LAlt+|RAlt+][LGUI+|RGUI+]<key>, where
+ * <key> is SDL's name for the key's scancode ("F12", "Left", "Keypad 5",
+ * "Return"; values the ImGui GUI recorded may also use ImGui's names, such
+ * as "LeftArrow"), or one modifier token alone ("RCtrl", which binds that
+ * modifier key), or an SDL gamepad button name ("guide", "leftshoulder")
+ * for an option that takes controller buttons. A front end records a key
+ * press and lets the layer spell it, rather than spelling SDL's names
+ * itself. These calls use no session and may be made from any thread.
+ */
+#define AMIBERRY_HOTKEY_LCTRL  0x01u
+#define AMIBERRY_HOTKEY_RCTRL  0x02u
+#define AMIBERRY_HOTKEY_LSHIFT 0x04u
+#define AMIBERRY_HOTKEY_RSHIFT 0x08u
+#define AMIBERRY_HOTKEY_LALT   0x10u
+#define AMIBERRY_HOTKEY_RALT   0x20u
+#define AMIBERRY_HOTKEY_LGUI   0x40u /* Command on a Mac, Windows key on a PC */
+#define AMIBERRY_HOTKEY_RGUI   0x80u
+
+/*
+ * Spells a key press as a hotkey value. usage is the key's USB HID keyboard
+ * usage (page 7, which SDL's scancodes follow; iOS reports it as
+ * UIKey.keyCode) and modifiers the AMIBERRY_HOTKEY_* bits held with it;
+ * with both keys of one modifier held, the left one is written, as the
+ * GUI's capture does. A modifier key pressed alone is usage 0 with exactly
+ * that modifier's bit. False when the usage is itself a modifier, a key
+ * without a name, or a key the value cannot spell (Keypad +, whose name
+ * holds the separator), for unknown modifier bits, and when the value does
+ * not fit size (AMIBERRY_SETTINGS_VALUE_MAX always fits); buffer is then
+ * unchanged.
+ */
+AMIBERRY_SETTINGS_API bool amiberry_settings_hotkey_format(unsigned int usage, unsigned int modifiers,
+	char *buffer, size_t size);
+/* The controller buttons a hotkey can name: value the SDL gamepad button
+   name, label the button's display name. Static, like descriptors. */
+AMIBERRY_SETTINGS_API size_t amiberry_settings_hotkey_buttons(const amiberry_setting_choice **choices);
+/* Whether the emulator answers a controller button bound to this hotkey
+   option or host setting; false for the Amiga key options, which only map
+   a key, and for an ID that is not a hotkey. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_hotkey_takes_buttons(const char *id);
+/* Whether a modifier held with the key is part of this hotkey's binding;
+   false for the Amiga key options, which the emulator matches by key
+   alone, so a front end records those without modifiers. */
+AMIBERRY_SETTINGS_API bool amiberry_settings_hotkey_takes_modifiers(const char *id);
+
+/*
+ * Host settings: the Global Settings panel (amiberry.conf), not a
+ * configuration. They are process-wide, so there is no session: set
+ * changes the live value, and save writes amiberry.conf. An ID is the
+ * amiberry.conf key. A bool is "true" or "false"; a choice's value is the
+ * integer the file stores, or for the default devices, the on-screen
+ * keyboard layout, the shaders and the bezel the token it stores. A GUI
+ * scale outside 50-200 is clamped, as the file parser clamps it; the
+ * legacy full-screen mode 1 is full-window.
+ */
+AMIBERRY_SETTINGS_API size_t amiberry_host_settings_count(void);
+/* NULL when index >= amiberry_host_settings_count(). */
+AMIBERRY_SETTINGS_API const amiberry_setting_descriptor *amiberry_host_settings_at(size_t index);
+/* NULL for an unknown ID. */
+AMIBERRY_SETTINGS_API const amiberry_setting_descriptor *amiberry_host_settings_find(const char *id);
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_host_settings_get(
+	const char *id, char *buffer, size_t size);
+AMIBERRY_SETTINGS_API amiberry_settings_status amiberry_host_settings_set(
+	const char *id, const char *value);
+/* Writes amiberry.conf. False when the file could not be written. */
+AMIBERRY_SETTINGS_API bool amiberry_host_settings_save(void);
+
+/*
+ * The choices of a host CHOICE setting: its descriptor's list, or for the
+ * settings that pick what the host has (the default controllers and mice,
+ * the audio device, the shaders and the custom bezel, whose descriptors
+ * list none) the entries the configuration options offer now, the same
+ * the editor lists. A default device's list starts with "", the fallback
+ * the emulator uses when none is set (no device for the parallel ports
+ * default_controller3 and 4, whose lists hold one entry for no device:
+ * "none" while that is the stored value, "" otherwise); the audio
+ * device's with "0", the system default; a shader's and the bezel's with
+ * "none". These settings keep a value the host does not offer now (a
+ * device that is not connected, a shader no longer in its folder): set
+ * takes it, and the list then starts with it, labelled for what it is
+ * ("Joystick 2 (not connected)", "crt.glslp (not found)"), so a front
+ * end shows the list as it is. Set refuses a value no device, index or
+ * file name can be. Setting custom_bezel turns use_custom_bezel on, and
+ * use_bezel off, for an image, and use_custom_bezel off for "none", as
+ * the Global Settings panel does.
+ * Returns the count and points *choices at the entries (NULL and 0 for an
+ * unknown ID or a setting that is no CHOICE). Main thread only; the
+ * pointer is valid until the next main-thread call of the layer.
+ */
+AMIBERRY_SETTINGS_API size_t amiberry_host_settings_choices(const char *id,
+	const amiberry_setting_choice **choices);
+/* Re-reads the host device lists the choices enumerate, for example when
+   a device was connected; the same as amiberry_settings_refresh_choices().
+   Main thread only. */
+AMIBERRY_SETTINGS_API void amiberry_host_settings_refresh_choices(void);
+
+#ifdef __cplusplus
+}
+#endif

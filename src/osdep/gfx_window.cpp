@@ -13,10 +13,8 @@
 #include <unistd.h>
 #endif
 #include <cstdio>
-#include <cmath>
 #include "sysdeps.h"
 #include "options.h"
-#include "uae.h"
 #include "custom.h"
 #include "xwin.h"
 #include "drawing.h"
@@ -31,15 +29,15 @@
 #include "amiberry_input.h"
 #include "target.h"
 
-#include "threaddep/thread.h"
 #include "imgui_overlay.h"
 #ifdef USE_VULKAN
 #include "imgui_impl_vulkan.h"
 #endif
 #include "imgui_osk.h"
 #include "on_screen_joystick.h"
-#include "fsdb_host.h"
 #include "uae/types.h"
+#include "gl_context_ladder.h"
+#include "native_ui_host.h"
 
 #ifdef USE_OPENGL
 #include "gl_platform.h"
@@ -53,6 +51,8 @@
 #include "renderer_factory.h"
 #ifdef USE_OPENGL
 #include "opengl_renderer.h"
+// create_sdl_renderer() (renderer_factory.h) supplies the runtime
+// GL-to-SDL demotion target used below in doInit.
 #endif
 #ifdef USE_VULKAN
 #include "vulkan_renderer.h"
@@ -277,15 +277,40 @@ void update_gfxparams(struct AmigaMonitor* mon)
 
 }
 
+static void format_window_title(const AmigaMonitor* mon, TCHAR* title, const size_t size)
+{
+	if (mon->monitor_id > 0)
+		_sntprintf(title, size, _T("Amiberry [%d]"), mon->monitor_id + 1);
+	else if (last_active_config[0])
+		_sntprintf(title, size, _T("Amiberry - [%s]"), last_active_config);
+	else
+		_sntprintf(title, size, _T("Amiberry"));
+	title[size - 1] = 0;
+}
+
+// The window title is fixed at creation, but a window survives config switches
+// whose display settings don't require recreating it (#2406).
+void refreshtitle()
+{
+	for (int i = 0; i < MAX_AMIGAMONITORS; i++) {
+		const AmigaMonitor* mon = &AMonitors[i];
+		if (!mon->amiga_window)
+			continue;
+		TCHAR wintitle[256];
+		format_window_title(mon, wintitle, sizeof wintitle / sizeof(TCHAR));
+		gfx_platform_set_window_title(mon->amiga_window, wintitle);
+	}
+}
+
 int open_windows(AmigaMonitor* mon, bool mousecapture, bool started)
 {
-	// Skip window creation entirely if headless mode
+	// Headless: no window, but doInit still sets up the frame surface and
+	// buffers the chipset renderer draws into.
 	if (currprefs.headless) {
 		write_log("Headless mode: Skipping window creation for monitor %d.\n", mon->monitor_id);
-		mon->screen_is_initialized = 1;
 		mon->amiga_window = nullptr;
 		mon->amiga_renderer = nullptr;
-		return 1;
+		return doInit(mon);
 	}
 
 	bool recapture = false;
@@ -451,41 +476,40 @@ int reopen(struct AmigaMonitor* mon, int full, bool unacquire)
 	return 0;
 }
 
-void close_windows(struct AmigaMonitor* mon, const bool force_destroy_fullwindow)
+// Clear the drawbuffer's references into the frame surface before destroying
+// it (see doInit for the full explanation), then free the soft buffers.
+static void release_frame_buffers(struct AmigaMonitor* mon)
 {
-	if (currprefs.headless) {
-		write_log("Headless mode: Skipping SDL resource cleanup for monitor %d.\n", mon->monitor_id);
-		if (amiga_surface) {
-			SDL_DestroySurface(amiga_surface);
-			amiga_surface = nullptr;
-		}
-		return;
-	}
-
 	vidbuf_description* avidinfo = &adisplays[mon->monitor_id].gfxvidinfo;
 
-	if (mon->monitor_id == 0)
-		reset_sound();
-
-#ifdef AMIBERRY
-	// Reset drawbuffer state that may point into the surface pixel buffer
-	// before destroying the surface (see doInit for the full explanation).
 	avidinfo->drawbuffer.bufmem = nullptr;
 	avidinfo->drawbuffer.width_allocated = 0;
 	avidinfo->drawbuffer.height_allocated = 0;
 	avidinfo->drawbuffer.rowbytes = 0;
 	avidinfo->drawbuffer.locked = false;
 
-	if (mon->monitor_id == 0) {
-		SDL_DestroySurface(amiga_surface);
-		amiga_surface = nullptr;
-	} else {
-		if (mon->amiga_surface) {
-			SDL_DestroySurface(mon->amiga_surface);
-			mon->amiga_surface = nullptr;
-		}
+	SDL_Surface*& surface_ref = (mon->monitor_id > 0) ? mon->amiga_surface : amiga_surface;
+	if (surface_ref) {
+		SDL_DestroySurface(surface_ref);
+		surface_ref = nullptr;
 	}
-#endif
+
+	freevidbuffer(mon->monitor_id, &avidinfo->drawbuffer);
+	freevidbuffer(mon->monitor_id, &avidinfo->tempbuffer);
+}
+
+void close_windows(struct AmigaMonitor* mon, const bool force_destroy_fullwindow)
+{
+	if (currprefs.headless) {
+		write_log("Headless mode: Skipping SDL resource cleanup for monitor %d.\n", mon->monitor_id);
+		release_frame_buffers(mon);
+		return;
+	}
+
+	if (mon->monitor_id == 0)
+		reset_sound();
+
+	release_frame_buffers(mon);
 	if (mon->statusline_surface) {
 		SDL_DestroySurface(mon->statusline_surface);
 		mon->statusline_surface = nullptr;
@@ -495,8 +519,6 @@ void close_windows(struct AmigaMonitor* mon, const bool force_destroy_fullwindow
 		mon->statusline_texture = nullptr;
 	}
 
-	freevidbuffer(mon->monitor_id, &avidinfo->drawbuffer);
-	freevidbuffer(mon->monitor_id, &avidinfo->tempbuffer);
 	close_hwnds(mon, force_destroy_fullwindow);
 	mon->active = false;
 }
@@ -674,6 +696,13 @@ static int create_windows(struct AmigaMonitor* mon)
 			sdl_mode = *desktop_mode;
 		}
 	}
+
+#ifdef __ANDROID__
+	// Android windows have no non-client area. Keeping desktop frame deltas
+	// across a rotation makes the resized surface look smaller than zero.
+	mon->window_extra_width = 0;
+	mon->window_extra_height = 0;
+#endif
 
 	if (mon->amiga_window) {
 		SDL_Rect r;
@@ -897,12 +926,7 @@ static int create_windows(struct AmigaMonitor* mon)
 		flags |= renderer_to_use->get_window_flags();
 	}
 	TCHAR wintitle[256];
-	if (mon->monitor_id > 0)
-		_sntprintf(wintitle, sizeof wintitle / sizeof(TCHAR), _T("Amiberry [%d]"), mon->monitor_id + 1);
-	else if (last_active_config[0])
-		_sntprintf(wintitle, sizeof wintitle / sizeof(TCHAR), _T("Amiberry - [%s]"), last_active_config);
-	else
-		_tcscpy(wintitle, _T("Amiberry"));
+	format_window_title(mon, wintitle, sizeof wintitle / sizeof(TCHAR));
 	mon->amiga_window = SDL_CreateWindow(wintitle,
 		rc.w, rc.h,
 		flags);
@@ -922,13 +946,23 @@ static int create_windows(struct AmigaMonitor* mon)
 		SDL_SetWindowFullscreen(mon->amiga_window, true);
 		SDL_SyncWindow(mon->amiga_window);
 	}
+#ifdef AMIBERRY_NATIVE_HOST
+	native_host_emulation_window_created(mon->amiga_window);
+#endif
 
+#ifdef __ANDROID__
+	// The Android activity surface is the client area; do not derive frame
+	// insets from transient rotation dimensions.
+	mon->window_extra_width = 0;
+	mon->window_extra_height = 0;
+#else
 	SDL_Rect rc2;
 	GetWindowRect(mon->amiga_window, &rc2);
-	int expected_client_width = mon->currentmode.current_width;
-	int expected_client_height = mon->currentmode.current_height;
+	const int expected_client_width = mon->currentmode.current_width;
+	const int expected_client_height = mon->currentmode.current_height;
 	mon->window_extra_width = rc2.w - expected_client_width;
 	mon->window_extra_height = rc2.h - expected_client_height;
+#endif
 
 	w = mon->currentmode.native_width;
 	h = mon->currentmode.native_height;
@@ -1064,10 +1098,11 @@ bool doInit(AmigaMonitor* mon)
 		avidinfo->outbuffer = &avidinfo->drawbuffer;
 		avidinfo->inbuffer = &avidinfo->tempbuffer;
 
-		// Create internal surface if needed
-		if (amiga_surface == nullptr) {
-			amiga_surface = SDL_CreateSurface(display_width, display_height, pixel_format);
-			if (!amiga_surface) {
+		// Create the frame surface lockscr() hands to the chipset renderer
+		SDL_Surface*& surface_ref = (mon->monitor_id > 0) ? mon->amiga_surface : amiga_surface;
+		if (surface_ref == nullptr) {
+			surface_ref = SDL_CreateSurface(display_width, display_height, pixel_format);
+			if (!surface_ref) {
 				write_log("Failed to create amiga_surface: %s\n", SDL_GetError());
 				return false;
 			}
@@ -1114,14 +1149,12 @@ bool doInit(AmigaMonitor* mon)
 				int ctx_attempts = 0;
 				bool ctx_success = false;
 
-				/* Modes 0..3:
-				 *   0 = preferred  : GL 3.3 Core, RGBA8, no depth/stencil
-				 *   1 = legacy     : GL 2.1 Compat, RGBA8, no depth/stencil
-				 *   2 = minimal-3.3: GL 3.3 Core, only DOUBLEBUFFER set
-				 *   3 = minimal-2.1: GL 2.1 Compat, only DOUBLEBUFFER set
-				 * Modes 2/3 exist for drivers with a narrow pixel-format set
-				 * (e.g. Mesa3D d3d12 on Windows ARM64 VMs). */
-				constexpr int max_ctx_modes = 4;
+				/* Modes 0..5 — see the ladder comment in
+				 * set_opengl_attributes() for the full mapping:
+				 *   0/1 = preferred/alternative API with RGBA8 hints
+				 *   2/3 = minimal-attribute retries of modes 0/1
+				 *   4/5 = GLES 3.0 fallback tier (AMIBERRY_GLES_FALLBACK) */
+				constexpr int max_ctx_modes = 6;
 				while (ctx_attempts < max_ctx_modes && !ctx_success) {
 					/* Refresh the renderer pointer at the top of every
 					 * iteration.  A previous failed create_windows() may
@@ -1189,7 +1222,7 @@ bool doInit(AmigaMonitor* mon)
 				}
 
 				if (!ctx_success) {
-					write_log("All renderer context attempts failed for monitor %d. Aborting doInit.\n", mon->monitor_id);
+					write_log("All renderer context attempts failed for monitor %d.\n", mon->monitor_id);
 #if defined(_WIN32)
 					write_log("HINT: If running inside a VM (VMware/Parallels/Hyper-V) without an OpenGL ICD,\n");
 					write_log("HINT: try the Mesa3D 'llvmpipe' build (mesa-llvmpipe-arm64 from\n");
@@ -1198,7 +1231,44 @@ bool doInit(AmigaMonitor* mon)
 					write_log("HINT: standard pixel-format set that SDL accepts; mesa-d3d12 trades that\n");
 					write_log("HINT: for hardware acceleration but exposes a much narrower format set.\n");
 #endif
-					return false;
+#ifdef USE_OPENGL
+					/* Last resort: swap in the SDL software renderer so hosts
+					 * without any usable GL driver (e.g. VMs stuck on the GDI
+					 * Generic GL 1.1 implementation) still run, degrading to
+					 * the scaler path instead of aborting. The window is
+					 * recreated without SDL_WINDOW_OPENGL; the GUI follows
+					 * automatically because it probes the renderer type via
+					 * dynamic_cast (emu_has_opengl in main_window.cpp). */
+					write_log("Demoting monitor %d to the SDL software renderer after GL context failure.\n",
+						mon->monitor_id);
+					/* Force-destroy the window: it still carries the
+					 * SDL_WINDOW_OPENGL flag and create_windows() would take
+					 * its window-reuse early return, never calling
+					 * create_platform_renderer — leaving the demoted
+					 * SDLRenderer without an SDL_Renderer (black screen). */
+					gl_renderer_demoted = true;
+					close_windows(mon, true);
+					if (mon->monitor_id > 0) {
+						mon->renderer = create_sdl_renderer();
+					} else {
+						g_renderer = create_sdl_renderer();
+					}
+					if (create_windows(mon)) {
+						renderer = get_renderer(mon->monitor_id);
+						/* The window-reuse path (e.g. start-minimized) can
+						 * still skip platform renderer creation — create it
+						 * explicitly and treat a missing SDL_Renderer as
+						 * failure instead of a silent black screen. */
+						if (renderer && !mon->amiga_renderer) {
+							renderer->create_platform_renderer(mon);
+						}
+						ctx_success = renderer != nullptr && mon->amiga_renderer != nullptr;
+					}
+#endif
+					if (!ctx_success) {
+						write_log("Aborting doInit for monitor %d.\n", mon->monitor_id);
+						return false;
+					}
 				}
 			}
 		} else {
@@ -1278,7 +1348,9 @@ bool doInit(AmigaMonitor* mon)
 			SDL_DestroySurface(surface_ref);
 			surface_ref = nullptr;
 		}
-		surface_ref = SDL_CreateSurface(display_width, display_height, pixel_format);
+		surface_ref = mon->screen_is_picasso
+			? SDL_CreateSurface(display_width, display_height, pixel_format)
+			: create_native_surface(display_width, display_height);
 		if (!surface_ref) {
 			write_log("Failed to create amiga_surface for monitor %d: %s\n", mon->monitor_id, SDL_GetError());
 			return false;
@@ -1378,38 +1450,63 @@ bool doInit(AmigaMonitor* mon)
 	const char* drv = SDL_GetCurrentVideoDriver();
 	write_log(_T("SDL video driver: %hs\n"), drv ? drv : "unknown");
 
-	// Detect GLES-only drivers (e.g., KMSDRM on Raspberry Pi)
-#ifdef __ANDROID__
-	const bool likely_gles_only = true;
+	// Detect the ladder profile: Android, iOS and USE_GLES3 builds are
+	// GLES-only by platform (desktop requests can never succeed there).
+	// KMSDRM (Raspberry Pi and other SBCs on console Linux) prefers GLES
+	// but keeps the desktop tiers as fall-through. SDL3 reports the driver
+	// name in lowercase ("kmsdrm"), so the comparison must be
+	// case-insensitive like every other KMSDRM check — the old
+	// case-sensitive strcmp never matched on SDL3 and silently turned
+	// KMSDRM into the plain desktop ladder.
+#if defined(__ANDROID__) || defined(AMIBERRY_IOS) || defined(USE_GLES3)
+	const GlLadderProfile ladder_profile = GlLadderProfile::GlesOnly;
 #else
-	const bool likely_gles_only = (drv && (strcmp(drv, "KMSDRM") == 0));
+	const GlLadderProfile ladder_profile = (drv && (strcmpi(drv, "KMSDRM") == 0))
+		? GlLadderProfile::GlesPreferred
+		: GlLadderProfile::Desktop;
 #endif
 
-	/* Mode 0 / 1 -> request a GL 3.3 Core context with sensible RGBA8
-	 * pixel-format hints.  Mode 2 / 3 -> retry with the bare minimum
-	 * (just the GL version + DOUBLEBUFFER), so a driver with a narrow
-	 * pixel-format set (e.g. Mesa3D d3d12 on Windows ARM64 VMs, which
-	 * does not expose a format with the 16-bit depth / RGBA8 / alpha
-	 * combination SDL would otherwise enforce) still has a chance. */
-	const bool minimal_attrs = (mode >= 2);
-	const bool legacy_profile = (mode == 1) || (mode == 3);
+	/* Context request ladder, selected by `mode` (see gl_context_ladder.cpp):
+	 *   desktop: 0 = GL 3.3 Core, 1 = GL 2.1 Compat, 2/3 = minimal-attribute
+	 *            retries of modes 0/1, 4/5 = GLES 3.0 fallback tier
+	 *            (AMIBERRY_GLES_FALLBACK builds only — X11/Wayland hosts
+	 *            whose only hardware driver is GLES; SDL loads libGLESv2
+	 *            via EGL at runtime, so no link-time dependency).
+	 *   KMSDRM:  0/1 = GLES 3.0 full/minimal (preferred), 2..5 = desktop
+	 *            Core/Legacy tiers so drivers without ES 3.0 (RPi3 vc4)
+	 *            keep hardware GL 2.1 instead of demoting to software.
+	 * Modes 2/3 exist for drivers with a narrow pixel-format set (e.g.
+	 * Mesa3D d3d12 on Windows ARM64 VMs). Unsupported modes return false
+	 * and the caller advances to the next attempt. */
+#ifdef AMIBERRY_GLES_FALLBACK
+	constexpr bool es_fallback_tier = true;
+#else
+	constexpr bool es_fallback_tier = false;
+#endif
+	const GlLadderStep ladder_step =
+		select_gl_ladder_step(ladder_profile, es_fallback_tier, mode);
+	if (!ladder_step.valid) {
+		return false;
+	}
+	const GlLadderApi api = ladder_step.api;
+	const bool minimal_attrs = ladder_step.minimal_attrs;
 
-	if (legacy_profile) {
+	if (api == GlLadderApi::Es3) {
+		// GLES-only systems (e.g. Raspberry Pi with KMSDRM): GLES 3.0
+		write_log(_T("Requesting OpenGL ES 3.0 context (mode=%d, minimal=%d)...\n"),
+			mode, minimal_attrs ? 1 : 0);
+		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+	} else if (api == GlLadderApi::Legacy) {
 		write_log(_T("Requesting OpenGL 2.1 Compatibility context (mode=%d, minimal=%d)...\n"),
 			mode, minimal_attrs ? 1 : 0);
 		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
 		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
 		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
 		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-	} else if (likely_gles_only) {
-		// GLES-only systems (e.g., Raspberry Pi with KMSDRM): Try GLES 3.0
-		write_log(_T("Requesting OpenGL ES 3.0 context (GLES-only driver detected, mode=%d, minimal=%d)...\n"),
-			mode, minimal_attrs ? 1 : 0);
-		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 	} else {
-		// Desktop OpenGL (x86, x86_64, ARM desktops, macOS): Try Core Profile 3.3
+		// Desktop OpenGL (x86, x86_64, ARM desktops, macOS): Core Profile 3.3
 		write_log(_T("Requesting OpenGL 3.3 Core context (mode=%d, minimal=%d)...\n"),
 			mode, minimal_attrs ? 1 : 0);
 		success &= SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);

@@ -14,6 +14,15 @@
 extern void real_main (int, TCHAR **);
 extern void usage (void);
 extern void print_version();
+#ifdef AMIBERRY
+extern int dump_config_and_exit (int, TCHAR **);
+// --settings-schema[=<file>]: the shared settings layer as JSON on stdout;
+// with a file, only the options it lists (one ID per line).
+extern int settings_schema_and_exit (const char *option_list);
+// True while --dump-config resolves; gates console logging and other
+// side effects that must not run in dump mode.
+extern bool amiberry_dump_config_mode;
+#endif
 extern void sleep_micros (int ms);
 extern int sleep_millis (int ms);
 extern int sleep_millis_main(int ms);
@@ -30,6 +39,12 @@ extern void uae_reset (int, int);
 extern void uae_quit (void);
 extern void target_shutdown(void);
 extern void uae_restart(struct uae_prefs*, int, const TCHAR*);
+// Restarts the emulation with the pending configuration (changed_prefs),
+// without the GUI: a plain restart starts from the active one.
+extern void uae_restart_with_pending_prefs(void);
+// Whether a restart is scheduled, and cancelling it (a quit after it).
+extern bool uae_restart_pending(void);
+extern void uae_cancel_restart(void);
 extern bool target_execute(const char* command);
 extern void target_reset (void);
 extern void target_addtorecent (const TCHAR*, int);
@@ -48,6 +63,7 @@ extern int target_sleep_nanos(int);
 void target_setdefaultstatefilename(const TCHAR*);
 extern bool get_plugin_path (TCHAR *out, int size, const TCHAR *path);
 extern void strip_slashes (TCHAR *p);
+extern void stripslashes (TCHAR *p);
 extern void fix_trailing (TCHAR *p);
 extern std::string fix_trailing(std::string& input);
 extern void fullpath(TCHAR *path, int size);
@@ -56,6 +72,9 @@ extern void getpathpart (TCHAR *outpath, int size, const TCHAR *inpath);
 extern void getfilepart (TCHAR *out, int size, const TCHAR *path);
 extern bool samepath(const TCHAR *p1, const TCHAR *p2);
 extern bool target_isrelativemode(void);
+extern bool target_resolve_relative_path(TCHAR *path, int size);
+extern bool target_make_relative_path(TCHAR *path, int size);
+extern bool target_set_cmdline_path_mode(bool enable);
 extern uae_u32 getlocaltime (void);
 extern bool isguiactive(void);
 extern bool is_mainthread(void);
@@ -92,7 +111,7 @@ extern std::string get_ini_file_path();
 extern void get_saveimage_path(char* out, int size, int dir);
 extern std::string get_configuration_path();
 extern void get_nvram_path(TCHAR* out, int size);
-extern std::string get_plugins_path();
+extern std::vector<std::string> get_plugin_search_paths();
 extern void fetch_luapath (TCHAR *out, int size);
 extern std::string get_screenshot_path();
 extern void fetch_ripperpath (TCHAR *out, int size);

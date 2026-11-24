@@ -1,8 +1,8 @@
 # IPC controller interface
 
-Amiberry exposes a line-oriented Unix-domain socket when it is built with
-`USE_IPC_SOCKET=ON`. The interface is available on Linux and macOS. It is used
-by controller software such as the
+Amiberry exposes a line-oriented local control socket when it is built with
+`USE_IPC_SOCKET=ON`. On Linux and macOS it is a Unix-domain socket; on Windows
+it is a named pipe. It is used by controller software such as the
 [Amiberry MCP server](https://github.com/BlitterStudio/amiberry-mcp-server),
 which presents stable, action-level MCP tools and HTTP endpoints.
 
@@ -14,9 +14,23 @@ public automation API.
 
 ## Transport
 
-The first instance listens on `$XDG_RUNTIME_DIR/amiberry.sock`, or
-`/tmp/amiberry.sock` when `XDG_RUNTIME_DIR` is not set. Further instances use
-`amiberry_1.sock` through `amiberry_9.sock` in the same directory.
+On Linux and macOS the first instance listens on
+`$XDG_RUNTIME_DIR/amiberry.sock`, or `/tmp/amiberry.sock` when
+`XDG_RUNTIME_DIR` is not set. Further instances use `amiberry_1.sock` through
+`amiberry_9.sock` in the same directory.
+
+On Windows the first instance listens on the named pipe `\\.\pipe\amiberry`,
+and further instances use `\\.\pipe\amiberry_1` through `\\.\pipe\amiberry_9`.
+The pipe is byte-mode and only the account Amiberry runs as can open it, from
+the local machine. Open it like a file, for example with
+`System.IO.Pipes.NamedPipeClientStream` in .NET or `CreateFile` in C. Amiberry
+keeps one pipe instance waiting for the next client and creates a new one
+within a frame of each connection, so a client that gets `ERROR_PIPE_BUSY`
+(231) should retry for a short time. Python's `open()` reports that error as
+`EINVAL`; `tools/ipc_client.py` calls `_winapi.CreateFile` to see it. A pipe
+cannot be half-closed: read the replies before closing
+the handle. `tools/ipc_client.py` and the Amiberry MCP server work on both
+transports.
 
 Each request and response is one newline-terminated record. Request fields are
 separated by tabs:
@@ -28,6 +42,118 @@ COMMAND<TAB>ARGUMENT<TAB>ARGUMENT<NEWLINE>
 A response starts with `OK` or `ERROR`; any following tab-separated fields are
 command-specific. The `HELP` command lists all commands supported by the
 running build.
+
+A connection stays open until the client closes it. A controller can send many
+requests over one connection or open a new connection per request, and up to
+16 controllers can be connected at once. Requests on one connection are
+answered in order. Amiberry closes a connection whose request grows past
+64 KiB without a newline.
+
+Commands run on the emulation thread between frames. Amiberry answers waiting
+requests for a few milliseconds per frame, at least one per connection, and
+keeps listening briefly so a controller that sends its next request as soon as
+it reads the reply is not limited to one request per frame. Requests beyond
+that budget wait for the next frame. Several requests can therefore take effect
+in the same emulated frame. A controller that needs the Amiga to observe a
+state, such as a key or mouse button being held down, must wait between the
+press and the release instead of relying on one request per frame.
+
+When the CPU runs on a thread of its own (the default for a 68020 or later at
+the fastest CPU speed, on hosts with more than one CPU core), `READ_MEM`, `WRITE_MEM`, `GET_CPU_REGS` and `DISASSEMBLE`
+temporarily park the CPU worker for each request. Use `PAUSE` when several
+requests must observe the same stopped state. Savestate creation also parks
+the worker while capturing CPU state and RAM. See
+[Multi-threaded CPU](cpu-threading.md) for limitations and diagnostics.
+
+## Joystick and CD32 input
+
+```text
+SEND_JOYSTICK <port> <directions> <buttons>
+```
+
+Send exactly three tab-separated **unsigned decimal integers** (no signs,
+hexadecimal notation, whitespace, or trailing fields). Success is `OK`;
+invalid arguments return `ERROR` with a diagnostic and leave input unchanged.
+
+`port` is an **Amiga port**, not an SDL/host device index:
+
+| Port | Destination |
+| --- | --- |
+| 0 | First Amiga connector, normally the mouse; JOY0DAT, CIA-A fire bit 6 |
+| 1 | Second Amiga connector, normally the joystick; JOY1DAT, CIA-A fire bit 7 |
+| 2 | Parallel joystick adapter, first joystick |
+| 3 | Parallel joystick adapter, second joystick |
+
+`directions` is a complete bitmask: **1=left, 2=right, 4=up, 8=down**.
+Zero is centered; diagonals are sums, for example 5=up-left. Values outside
+0–15 and opposite pairs (left+right or up+down) are errors.
+
+`buttons` is a complete pressed-button bitmask:
+
+| Value | Standard joystick | CD32 pad |
+| --- | --- | --- |
+| 1 | Primary fire | Red |
+| 2 | Secondary fire | Blue |
+| 4 | Not supported | Green |
+| 8 | Not supported | Yellow |
+| 16 | Not supported | Reverse / rewind |
+| 32 | Not supported | Forward |
+| 64 | Not supported | Play / pause |
+
+Zero releases all buttons. Values outside 0–127 are errors. Values above 3
+require an active CD32 pad on port 0 or 1; parallel ports do not support CD32.
+The adapter's secondary fire uses its existing shared spare input line.
+
+The command drives the core's normal joystick direction counters and button
+state. CD32 buttons pass through the existing CIA clock/POT serial shifter;
+they are not substituted into guest register reads. Red and blue also work
+as fire buttons in CD32 two-button mode. Configure the destination with
+`SET_JOYPORT_MODE <port> 3` (joystick), `4` (gamepad), or `7` (CD32); wait for
+`GET_JOYPORT_MODE` to report the new mode before injecting. An explicit mode
+works even with `joyportN=none`; no host controller or keyboard layout is
+required. The command itself does not change modes, device assignments,
+custom mappings, or autofire settings.
+
+Each connection owns an independent state for each port. A request replaces
+that connection's entire state on that port only. Keep the connection open
+while holding input: closing it (including a send-side shutdown once replies
+are drained) releases its injected state. Send
+`SEND_JOYSTICK <port> 0 0` for an explicit release. Emulator resets and input
+configuration reinitialization discard injected holds, including their
+ownership, so later disconnections cannot restore stale presses.
+Rewind/input-recorder snapshots retain legacy physical input state but exclude
+connection-owned holds; restoring one cannot convert injected buttons into
+permanently held physical buttons.
+
+Physical/keyboard-mapped input and other connections are combined with
+injected input, not replaced: releasing one source cannot clear another
+source's hold. Across sources, opposing directions follow the core's normal
+right/down priority. A controller needing an otherwise released port should
+disable physical/keyboard mappings for that port. Commands can run in the
+same emulated frame, so wait between press and release for guest observation.
+
+Example on one persistent connection (fields below are shown with spaces;
+send tabs on the wire):
+
+```text
+SET_JOYPORT_MODE 1 7
+GET_JOYPORT_MODE 1
+# Wait for OK 7 cd32_pad before proceeding.
+SEND_JOYSTICK 1 4 1
+# Wait for the guest to observe up + red.
+SEND_JOYSTICK 1 0 0
+```
+
+Regression checks: `sh tests/test_ipc_joystick.sh` exercises the production
+parser, all masks/ports, CD32 bit mapping, physical-source merging, reset,
+release ownership, and extracted production recorder save/restore paths
+(including negative mutations) without an emulator build. Set `AMIBERRY_BIN` to a
+newly built executable to additionally exercise real JOYDAT, CIA, POT and
+CD32 serial reads over IPC:
+
+```sh
+AMIBERRY_BIN="$PWD/build/amiberry" sh tests/test_ipc_joystick.sh
+```
 
 ## Screenshot-driven GUI automation
 
@@ -172,11 +298,241 @@ Amiberry MCP controller currently uses 50 ms between press/move/release
 phases), but that timing and the raw button-mask sequence are private
 implementation details rather than public API parameters.
 
+## Settings edit session
+
+The `SETTINGS_*` commands expose one edit session of the shared settings
+layer (`src/osdep/settings/amiberry_settings.h`), so a controller can edit
+the pending configuration end to end with validation and commit semantics
+instead of the handful of `SET_CONFIG` options. Like every command they run
+on the emulation thread. The session belongs to the IPC server as a whole
+and is shared by every connected controller: one controller's COMMIT
+commits every controller's staged edits, and one's RESET_SESSION discards
+them all. Coordinate controllers accordingly.
+
+- `SETTINGS_GET <id>` replies `OK <id>=<value>` with the value in `.uae`
+  spelling. Unknown option IDs reply `ERROR Unknown option: <id>`.
+- `SETTINGS_SET <id> <value>` stores a checked value in the session and
+  applies the dependent changes the GUI applies. Invalid or unavailable
+  values reply `ERROR` with the reason.
+- `SETTINGS_VALIDATE` runs the core's configuration fixups as a preview and
+  replies `OK` with one field per adjustment they would make
+  (`<id>=<requested>-><adjusted> (<reason>)`), or `OK none`. The session is
+  not modified and nothing is logged.
+- `SETTINGS_COMMIT` stores the session into the pending configuration and
+  replies `OK changed=<true|false> apply=<live|reset|restart>`, the
+  strongest apply class among the changed options. When something changed it
+  also signals the running emulation like `SET_CONFIG` does, so live options
+  take effect at once. The session is closed afterwards.
+- `SETTINGS_APPLY <live|reset|restart>` brings the running emulation up to
+  the pending configuration the way the class `SETTINGS_COMMIT` reported
+  needs: `live` signals it (as COMMIT already does), `reset` also attaches
+  the committed mount list and hard-resets as the GUI's Reboot does, and
+  `restart` restarts the emulation with the pending configuration, without
+  the GUI. Replies `OK` once done (at once while no emulation runs).
+- `SETTINGS_GET_ACTIVE <id>` replies `OK <id>=<value>` with the value the
+  running emulation uses now, which equals the committed one once applied.
+- `SETTINGS_LIST` replies `OK` with every option ID.
+- `SETTINGS_DESCRIBE <id>` replies `OK` with `type=`, `apply=`, `group=`,
+  `default=` and `available=` (now, in the session) fields; `min=`, `max=`
+  and `step=` for numbers, plus `reversed=true` for a number a front end
+  shows as min + max - value (a volume the file stores as attenuation, so
+  `sound_volume=0` is full volume), `unit=<unit>` for the unit of the shown
+  number (`%`, `KB`, `ms`, `s`, `px`, `scanlines`), `scale=<n>` for a number
+  shown as value / n (`gfx_gamma=125` with `scale=10` shows as 12.5, after
+  any reversal) and `level=true` for a level set by feel (a volume, the
+  brightness), which a front end may show as a slider over the range; and
+  one `choice=<value>` field per selectable choice
+  (`unavailable_choice=<value>` for one the session refuses now).
+- `SETTINGS_RESET_SESSION` discards the session's uncommitted edits.
+- `SETTINGS_MOUNTS` replies `OK` with one field per mounted drive
+  (directory, hardfile, CD or tape unit) in the order a `.uae` file lists
+  them, each spelled as the value of its `uaehfN` line, for example
+  `dir,rw,DH0:Work:/home/amiga/work,0`; `OK none` when there are none.
+- `SETTINGS_MOUNT_ADD <value>` appends a drive given in that spelling. It is
+  checked like the hard drive panel's additions: a malformed entry, a device
+  name in use, a controller without a free unit or an entry too long for a
+  configuration line replies `ERROR Invalid mount entry: <value>`, a full
+  list (50 drives) `ERROR The mount list is full`.
+- `SETTINGS_MOUNT_REPLACE <index> <value>` replaces drive `index` (from 0),
+  checked the same way; the drive keeps its place in the list.
+- `SETTINGS_MOUNT_REMOVE <index>` removes drive `index`; later drives move up.
+
+Mount edits are staged in the session like `SETTINGS_SET` edits.
+`SETTINGS_COMMIT` stores the whole list and reports `apply=reset` when it
+changed: drives attach when the emulation resets.
+
+Expansion boards (SCSI, IDE and network controllers, bridgeboards, sound and
+graphics cards, and the machines' built-in controllers; the accelerator
+board is the `cpuboard_*` options) are edited by board type, unit and field:
+
+- `SETTINGS_BOARDS` replies `OK` with one field per board type, its
+  configuration name (`a2091`, `ide_mb`).
+- `SETTINGS_BOARD_DESCRIBE <type>` replies `label=`, `manufacturer=`,
+  `units=` (how many of it a configuration can have; units count from 0),
+  `categories=` (a hexadecimal mask of the `AMIBERRY_BOARD_*` bits in
+  `amiberry_settings.h`) and one `field=<id>` per field of a unit:
+  `enabled` first, then as the board has them `subtype`, `rom_file`,
+  `scsi_id`, `autoboot_disabled`, `inserted`, `dma24bit` and its own
+  settings, `setting:<name>`.
+- `SETTINGS_BOARD_DESCRIBE <type> <field>` replies the field's `type=`,
+  `apply=`, `label=`, `default=` and one `choice=<value>` per choice.
+- `SETTINGS_BOARD_GET <type> <unit> <field>` replies `<field>=<value>` and
+  `available=true|false` (a field of a unit that is not enabled, or one only
+  some variants have, is unavailable).
+- `SETTINGS_BOARD_SET <type> <unit> <field> <value>` stages a change.
+  Enabling a ROM board without a ROM file gives it the scanned ROM of its
+  type, or `:NOROM` (the board without its ROM, until one is set through
+  `rom_file`), so the configuration keeps it; an empty `rom_file` is a
+  board without its ROM. Enabling a built-in controller switches the
+  chipset field the machine has it as: the IDE controller, A3000 or A4000T
+  SCSI (one of the two) and the CD32 FMV cartridge on any machine, PCMCIA
+  and the CDTV controllers through their chipset options (`pcmcia`,
+  `cdtvcd`, `cdtv-cr`), which a custom chipset has.
+
+`SETTINGS_COMMIT` reports `apply=restart` when a board changed: boards are
+built when the emulation starts.
+
+Custom controls set the Amiga input event each button and axis of the
+joystick on a port (0 to 3) triggers, alone (`none`) or with the device's
+hotkey button held (`hotkey`):
+
+- `SETTINGS_CUSTOM_CONTROLS` replies one `<control>=button|axis` per
+  control, by its configuration name (`a`, `dpup`, `leftx`).
+- `SETTINGS_INPUT_EVENTS` replies one field per event a control can
+  trigger, by the name configurations use (`Joy2 Fire/Mouse2 Left Button`,
+  `Space`).
+- `SETTINGS_CUSTOM_CONTROL_GET <port> <none|hotkey> <control>` replies
+  `<control>=<event>`, `available=true|false` and `use=` (the hotkey
+  function that holds the control: `hotkey`, `quit`, `menu`, `reset`,
+  `vkbd`, or empty). The event is `none` for a control set to do nothing,
+  and empty for one left to what the port's mode gives it. It fails while
+  the port has no joystick.
+- `SETTINGS_CUSTOM_CONTROL_SET <port> <none|hotkey> <control> <event>`
+  stages a change (an empty event resets the control); an unavailable
+  control (the device lacks it, or a hotkey function holds it) is refused.
+  `SETTINGS_COMMIT` applies the edits live, for the joystick each port has
+  then.
+
+Host settings are the Global Settings panel (`amiberry.conf`), process-wide
+rather than part of a configuration. The list depends on the build: the
+ImGui GUI's own settings (`Quickstart`, `gui_layout_scale`, `gui_theme`, …)
+are absent from builds without ImGui (the native Apple apps, and Android,
+whose IPC socket is off anyway), `use_adpf`
+exists only on Android, and the update settings are absent from iOS and Mac
+App Store builds:
+
+- `HOST_SETTINGS_LIST` replies one field per setting, its `amiberry.conf` key.
+- `HOST_SETTINGS_GET <id>` replies `<id>=<value>`. A bool is `true` or
+  `false`; a choice's value is the integer the file stores or, for the
+  default devices, the shaders, the custom bezel and the on-screen keyboard
+  layout, the token it stores. A hotkey setting takes the hotkey spelling
+  (`F12`, `LCtrl+F11`, a controller button such as `guide`).
+- `HOST_SETTINGS_SET <id> <value>` changes the live value. A GUI scale
+  outside 50-200 is clamped; the legacy full-screen mode `1` is full-window.
+  Setting `custom_bezel` to an image also turns `use_custom_bezel` on and
+  `use_bezel` off; setting it to `none` turns `use_custom_bezel` off.
+- `HOST_SETTINGS_SAVE` writes `amiberry.conf`.
+
+Configuration files: `LOAD_CONFIG <path>` makes a `.uae` (or `.rp9`) file the
+pending configuration, inserting the floppies it names at once (the rest
+takes effect with `SETTINGS_APPLY restart`, or when the emulation next
+starts); a file that is missing or not a configuration fails and leaves the
+pending configuration as it was. `SAVE_CONFIG <path>` writes the pending
+configuration (`SETTINGS_COMMIT` first to include a session's edits). The
+options `config_description` and `config_category` describe it.
+
+A session that holds no uncommitted edits is reopened from
+the current pending configuration at the next `SETTINGS_*` command, so a
+configuration loaded or changed any other way (`LOAD_CONFIG`, `SET_CONFIG`,
+the GUI) is what subsequent `SETTINGS_GET` and `SETTINGS_SET` see. Staged
+edits are never dropped behind the controller's back: while any uncommitted
+`SETTINGS_SET` or mount edit exists, the session stays open and isolated.
+
+Option IDs and values are exactly the `.uae` keys and spellings the layer
+defines; `amiberry_settings_count()`/`amiberry_settings_at()` list them.
+
+## Debugger monitor
+
+`MONITOR <text>` runs the same command text as GDB `monitor <text>`. The
+command list and argument syntax are in `docs/gdb-debugging.md`. IPC joins the
+tab-separated arguments with spaces. A path or name that contains spaces must
+be sent as one argument. The reply is `OK` and one field per result line.
+JSON replies are a single field. `disasm` returns one field per instruction
+line. A tab inside a result line is replaced with a space so the field count
+matches the line count. Failure is `ERROR` and a message.
+
+The handler runs on the emulation thread, either between frames or while the
+native debugger is stopped. Read-only commands do not require a stopped CPU.
+When the CPU runs on the main thread, the 68k core is not executing between
+frames, so a guest memory read is stable for the duration of the call. When
+the CPU runs on a thread of its own, the commands that read guest memory or
+change state park the CPU thread for the duration of the call.
+
+These commands change debugger tables or remap memory banks, and require
+`PAUSE` or a stopped native debugger:
+
+- `watch add`, `watch range`, `watch remove`, `watch clear-events`
+- `dma-watch add`, `dma-watch remove`
+- `condition add`, `condition remove`
+- `exception-mask`
+- `history on`, `history off`
+- `guest-output on`, `guest-output off`, `guest-output clear`
+- `process-break name`, `process-break address`, `process-break clear`
+
+`memwatch_setup()` remaps the watched banks. `map_banks` flushes the JIT
+cache as part of that remap. The console debugger installs watches only while
+the CPU is stopped; IPC uses the same rule. Host pause is a stop between
+frames, so it is also accepted when the CPU is not threaded.
+
+`step-over` is refused. It completes inside the GDB stop loop. Use
+`DEBUG_STEP_OVER`, which requires the native debugger to be stopped.
+`checkpoint save` and `checkpoint restore` are refused for the same reason.
+Use `SAVESTATE` and `LOADSTATE`. Note that `SAVESTATE` and `QUICKSAVE` are
+refused while the CPU is stopped by the debugger (native or GDB); resume
+execution or `PAUSE` first so the snapshot is taken at a clean frame boundary.
+`input sequence` is refused. Its steps advance from the frame hook only while
+a GDB client is connected. Use `input event`.
+
+A watch hit, exception-mask hit, condition, or process-break entry with no GDB
+client stops in the native debugger. `DEBUG_STATUS` reports `stopped=1` and
+`reason=` set to the stop text when one was produced. A read/write watch is
+`T05awatch:`, a write watch is `T05watch:`, and a read watch is `T05rwatch:`.
+Exception stops use `Tnnwinuae-exception:...`, process-break stops use
+`T05winuae-entry:...`, and conditions use `T05breakpoint:N;`. `reason=` is
+empty unless `stopped=1`, however the debugger was left. `execution-status`
+reports the GDB halt flag, not this native stop.
+
+`SET_BREAKPOINT`, `CLEAR_BREAKPOINT`, and `LIST_BREAKPOINTS` manage standard PC
+breakpoints and leave monitor condition slots (`MONITOR condition add`) alone:
+auto-allocation skips slots that hold conditions, requesting an explicit slot
+that holds a condition is refused, and `CLEAR_BREAKPOINT ALL` clears only
+standard breakpoints. Conditions must be removed through `MONITOR condition remove`.
+
+IPC and a connected GDB client share one monitor object. IPC keeps answering
+while GDB has the CPU stopped, but state-changing `MONITOR` commands,
+`input event` and `input release` are refused while a GDB client is
+connected. A GDB detach clears everything in that object, so a new
+GDB connection is refused while IPC holds any of it: watches, DMA watches,
+conditions, an exception mask, a
+process-break, history recording, guest-output capture or captured records,
+captured watch events, or input held by `input event`. Clear it before
+attaching GDB with `watch remove`, `dma-watch remove`, `condition remove`,
+`exception-mask 0`, `process-break clear`, `history off`, `guest-output off`
+followed by `guest-output clear`, `watch clear-events`, and `input release`.
+The last captured exception (`exception`) does not block GDB; it is dropped
+when that GDB client detaches.
+
 ## Validation status
 
 The geometry mapping and controller primitives have automated coverage in
 `tests/test_gfx_geometry.sh` and `tests/test_ipc_gui_automation.sh`, including
 HiDPI conversion, revision invalidation, stale-guard rejection, button masks,
-and unconditional release. Live end-to-end validation with packaged Amiberry
-builds on Linux and macOS is a separate release check and is not implied by
-those automated tests.
+and unconditional release. Both scripts also compile and pass on Windows with
+the llvm-mingw toolchain. The Windows named-pipe transport and the
+screenshot-driven automation commands have had a live end-to-end pass against
+an installed release build: actionable capture, the guarded configuration
+compare-and-set, guarded clicks and drags with held buttons read back from
+the emulated CIA registers, focus gating, and stale-guard rejection after a
+window resize and after a restart. Live end-to-end validation with packaged
+Amiberry builds on Linux and macOS remains a separate release check and is
+not implied by those automated tests.

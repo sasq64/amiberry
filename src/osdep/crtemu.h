@@ -40,6 +40,16 @@ void crtemu_frame( crtemu_t* crtemu, CRTEMU_U32* frame_abgr, int frame_width, in
 void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pixels_xbgr, int width, int height, int pitch,
                      CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr, unsigned int pixel_format, unsigned int pixel_type, int bpp );
 
+// Present from an existing GL texture laid out like an uploaded frame (first
+// row at t=0) instead of uploading CPU pixels. The texture is sampled once
+// into the pipeline backbuffer, or drawn directly for CRTEMU_TYPE_NONE.
+void crtemu_present_texture( crtemu_t* crtemu, CRTEMU_U64 time_us, unsigned int texture, int width, int height,
+                             CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr );
+
+// Tell crtemu a texture passed to crtemu_present_texture() was deleted, so a
+// later texture reusing its GL name gets its filter parameters set again.
+void crtemu_texture_deleted( crtemu_t* crtemu, unsigned int texture );
+
 void crtemu_coordinates_window_to_bitmap( crtemu_t* crtemu, int width, int height, int* x, int* y );
 
 /*
@@ -180,24 +190,13 @@ typedef GLbitfield CRTEMU_GLbitfield;
 #define CRTEMU_GL_TEXTURE_WRAP_S GL_TEXTURE_WRAP_S
 #define CRTEMU_GL_TEXTURE_WRAP_T GL_TEXTURE_WRAP_T
 #define CRTEMU_GL_CLAMP_TO_EDGE GL_CLAMP_TO_EDGE
-#ifndef CRTEMU_WEBGL
-    #if defined(GL_CLAMP_TO_BORDER) && !defined(__ANDROID__)
-        #define CRTEMU_GL_CLAMP_TO_BORDER GL_CLAMP_TO_BORDER
-        #define CRTEMU_GL_TEXTURE_BORDER_COLOR GL_TEXTURE_BORDER_COLOR
-    #else
-        // Fallback for Android/GLES where CLAMP_TO_BORDER might be missing
-        #define CRTEMU_GL_CLAMP_TO_BORDER GL_CLAMP_TO_EDGE
-        #ifndef GL_TEXTURE_BORDER_COLOR
-             #define CRTEMU_GL_TEXTURE_BORDER_COLOR 0x1004 // Define if missing, though likely unused if CLAMP_TO_BORDER is replaced
-        #else
-             #define CRTEMU_GL_TEXTURE_BORDER_COLOR GL_TEXTURE_BORDER_COLOR
-        #endif
-    #endif
-#else
-// WebGL does not support GL_CLAMP_TO_BORDER, we have to emulate
-          // this behavior with code in the fragment shader
-          #define CRTEMU_GL_CLAMP_TO_BORDER GL_CLAMP_TO_EDGE
-#endif
+// Border clamping is core on desktop GL; on GLES it needs ES 3.2 or
+// EXT/OES_texture_border_clamp, whose suffixed enums share these values.
+// GLES headers lack the unsuffixed names, so use the raw values and decide
+// at runtime (crtemu_t::clamp_to_border) whether the context accepts them.
+// WebGL never enables it and emulates the border in the fragment shader.
+#define CRTEMU_GL_CLAMP_TO_BORDER 0x812D
+#define CRTEMU_GL_TEXTURE_BORDER_COLOR 0x1004
 #endif
 
 
@@ -211,6 +210,7 @@ struct crtemu_t {
 	CRTEMU_GLuint vertexbuffer_static;
 	CRTEMU_GLuint backbuffer;
 	CRTEMU_GLuint fbo_backbuffer;
+	CRTEMU_GLuint default_framebuffer; // Framebuffer receiving the final pass. 0 on desktop GL; iOS EAGL has no framebuffer 0, so the host sets SDL's UIKit view FBO here each frame
 
 	CRTEMU_GLuint accumulatetexture_a;
 	CRTEMU_GLuint accumulatetexture_b;
@@ -238,7 +238,11 @@ struct crtemu_t {
 	unsigned int last_present_format;
 	unsigned int last_present_type;
 	CRTEMU_GLint texture_filter; // GL_NEAREST or GL_LINEAR for NONE mode
-	bool is_mobile_gpu; // True for GLES/VideoCore - enables mobile optimizations
+	bool is_mobile_gpu; // True on low-power GPUs (per the GL_RENDERER allowlist or force_mobile) - selects simplified shader variants
+	bool clamp_to_border; // Context accepts GL_CLAMP_TO_BORDER and GL_TEXTURE_BORDER_COLOR; otherwise clamp to edge
+	bool fbo_backbuffer_attached; // fbo_backbuffer has backbuffer bound as its colour attachment
+	CRTEMU_GLuint param_texture; // caller-owned texture whose filters were last set (CRTEMU_TYPE_NONE)
+	CRTEMU_GLint param_filter; // filter applied to param_texture
 
 	CRTEMU_GLint loc_blur_blur;
 	CRTEMU_GLint loc_blur_texture;
@@ -348,6 +352,8 @@ struct crtemu_t {
 #endif
 
 
+#include "crt_gpu_allowlist.h"
+
 static CRTEMU_GLuint crtemu_internal_build_shader( crtemu_t* crtemu, char const* vs_source_in, char const* fs_source_in ) {
 #ifdef CRTEMU_REPORT_SHADER_ERRORS
 	char error_message[ 1024 ];
@@ -357,11 +363,6 @@ static CRTEMU_GLuint crtemu_internal_build_shader( crtemu_t* crtemu, char const*
     const char* gl_ver_str = (const char*)glGetString(GL_VERSION);
     bool is_gles = gl_ver_str && (strstr(gl_ver_str, "OpenGL ES") || strstr(gl_ver_str, "OpenGL ES-CM"));
 
-    // Detect mobile GPU (GLES indicates mobile/embedded GPU like VideoCore on RPI)
-    // This enables performance optimizations like mediump precision and reduced blur
-    if (is_gles && !crtemu->is_mobile_gpu) {
-        crtemu->is_mobile_gpu = true;
-    }
 
     // Check for Core Profile (Desktop GL >= 3.2 usually implied by Core)
     // We can also check specific version numbers if needed.
@@ -1837,10 +1838,25 @@ crtemu_t* crtemu_create( crtemu_type_t type, void* memctx, bool force_mobile ) {
 	crtemu->last_present_height = 0;
 	crtemu->texture_filter = CRTEMU_GL_LINEAR; // Default to linear filtering for NONE mode
 
-	// Detect mobile GPU (GLES) BEFORE shader compilation so mobile variants are selected
-	// force_mobile allows UI override for testing or when auto-detection fails
+	// Detect low-power GPU BEFORE shader compilation so the simplified
+	// variants are selected. force_mobile allows a UI override for testing
+	// or when auto-detection fails. ES contexts use the GL_RENDERER
+	// capability allowlist so capable hardware (RPi5, modern Adreno /
+	// Mali-G / Apple) gets the full-quality shaders.
 	const char* gl_ver = (const char*)glGetString(GL_VERSION);
-	crtemu->is_mobile_gpu = force_mobile || (gl_ver && strstr(gl_ver, "OpenGL ES") != nullptr);
+	const bool is_gles_context = gl_ver && strstr(gl_ver, "OpenGL ES") != nullptr;
+	if (force_mobile) {
+		crtemu->is_mobile_gpu = true;
+	} else if (is_gles_context) {
+		const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
+		crtemu->is_mobile_gpu = !crt_gpu_supports_full_crt(gl_renderer);
+	} else {
+		crtemu->is_mobile_gpu = false;
+	}
+
+#ifndef CRTEMU_WEBGL
+	crtemu->clamp_to_border = get_gl_capabilities().clamp_to_border;
+#endif
 
 #ifndef CRTEMU_SDL
 
@@ -2083,7 +2099,9 @@ crtemu_t* crtemu_create( crtemu_type_t type, void* memctx, bool force_mobile ) {
 	crtemu->GenTextures( 1, &crtemu->blurtexture_b );
 	crtemu->GenFramebuffers( 1, &crtemu->blurbuffer_b );
 
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	// No BindFramebuffer(0) reset here: GenFramebuffers above does not change
+	// the binding, and re-binding 0 would detach iOS hosts from SDL's UIKit
+	// view framebuffer that must stay current for the caller's next draw.
 
 	crtemu->GenTextures( 1, &crtemu->frametexture );
 #ifndef CRTEMU_WEBGL
@@ -2235,7 +2253,7 @@ static void crtemu_internal_blur( crtemu_t* crtemu, CRTEMU_GLuint source, CRTEMU
 	crtemu->DrawArrays( CRTEMU_GL_TRIANGLE_FAN, 0, 4 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, blurbuffer_a );
 	crtemu->UseProgram( crtemu->blur_shader );
@@ -2248,12 +2266,31 @@ static void crtemu_internal_blur( crtemu_t* crtemu, CRTEMU_GLuint source, CRTEMU
 	crtemu->DrawArrays( CRTEMU_GL_TRIANGLE_FAN, 0, 4 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
+}
+
+// Applies the CRT pass wrap mode to the texture bound on the active unit:
+// transparent black outside the image where the context supports border
+// clamping, edge clamping otherwise.
+static void crtemu_internal_set_border_wrap( crtemu_t* crtemu ) {
+	if( crtemu->clamp_to_border ) {
+		static const CRTEMU_GLfloat color[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_S, CRTEMU_GL_CLAMP_TO_BORDER );
+		crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_T, CRTEMU_GL_CLAMP_TO_BORDER );
+		crtemu->TexParameterfv( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_BORDER_COLOR, color );
+	} else {
+		crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_S, CRTEMU_GL_CLAMP_TO_EDGE );
+		crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_T, CRTEMU_GL_CLAMP_TO_EDGE );
+	}
 }
 
 
-void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pixels_xbgr, int width, int height, int pitch,
-                     CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr, unsigned int pixel_format, unsigned int pixel_type, int bpp ) {
+// pixels_xbgr uploads a CPU frame; otherwise a non-zero texture is sampled as
+// the frame. With neither, the texture bound to unit 0 is used (legacy path).
+static void crtemu_internal_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pixels_xbgr,
+                                     CRTEMU_GLuint texture, int width, int height, int pitch,
+                                     CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr, unsigned int pixel_format,
+                                     unsigned int pixel_type, int bpp ) {
 
 	int viewport[ 4 ];
 	crtemu->GetIntegerv( CRTEMU_GL_VIEWPORT, viewport );
@@ -2289,16 +2326,28 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 			crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
 		}
 
-		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 		crtemu->Viewport( viewport[ 0 ], viewport[ 1 ], viewport[ 2 ], viewport[ 3 ] );
 		crtemu->UseProgram( crtemu->copy_shader );
 		crtemu->Uniform1i( crtemu->loc_copy_tex0, 0 );
 
 		crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
-		crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, crtemu->backbuffer );
+		crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, texture ? texture : crtemu->backbuffer );
 
-		// Only set texture filter parameters when texture was recreated
-		if (size_or_format_changed) {
+		if (texture) {
+			// Caller-owned texture: set filters only when the texture or the
+			// requested filter changed since they were last applied.
+			if (texture != crtemu->param_texture || crtemu->texture_filter != crtemu->param_filter) {
+				crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MIN_FILTER, crtemu->texture_filter );
+				crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MAG_FILTER, crtemu->texture_filter );
+				crtemu->param_texture = texture;
+				crtemu->param_filter = crtemu->texture_filter;
+			}
+			// backbuffer was not refreshed: the next pixel upload must respecify it.
+			crtemu->last_present_width = 0;
+			crtemu->last_present_height = 0;
+		} else if (size_or_format_changed) {
+			// Only set texture filter parameters when the backbuffer was recreated
 			crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MIN_FILTER, crtemu->texture_filter );
 			crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MAG_FILTER, crtemu->texture_filter );
 		}
@@ -2333,13 +2382,21 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 		crtemu->PixelStorei(CRTEMU_GL_UNPACK_ROW_LENGTH, 0);
 		crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
 	} else {
-		if( size_changed ) {
+		if (texture) {
+			crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
+			crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, texture );
+			// backbuffer now holds a sampled copy: the next pixel upload must respecify it.
+			crtemu->last_present_format = 0;
+		}
+		if( size_changed || !crtemu->fbo_backbuffer_attached ) {
 			crtemu->ActiveTexture( CRTEMU_GL_TEXTURE1 );
 			crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, crtemu->backbuffer );
 			crtemu->TexImage2D( CRTEMU_GL_TEXTURE_2D, 0, CRTEMU_GL_RGB, width, height, 0, CRTEMU_GL_RGB, CRTEMU_GL_UNSIGNED_BYTE, 0 );
 			crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, crtemu->backbuffer );
 			crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->fbo_backbuffer );
 			crtemu->FramebufferTexture2D( CRTEMU_GL_FRAMEBUFFER, CRTEMU_GL_COLOR_ATTACHMENT0, CRTEMU_GL_TEXTURE_2D, crtemu->backbuffer, 0 );
+			crtemu->fbo_backbuffer_attached = true;
+			crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 		}
 		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->fbo_backbuffer );
 		crtemu->Viewport( 0, 0, width, height );
@@ -2350,7 +2407,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 		crtemu->DrawArrays( CRTEMU_GL_TRIANGLE_FAN, 0, 4 );
 		crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 		crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 		crtemu->Viewport( viewport[ 0 ], viewport[ 1 ], viewport[ 2 ], viewport[ 3 ] );
 	}
 
@@ -2379,7 +2436,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->blurbuffer_b );
 		crtemu->FramebufferTexture2D( CRTEMU_GL_FRAMEBUFFER, CRTEMU_GL_COLOR_ATTACHMENT0, CRTEMU_GL_TEXTURE_2D, crtemu->blurtexture_b, 0 );
 
-		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 		// Seed accumulation buffers with current backbuffer content instead of leaving
 		// them black. This prevents black frames when resolution changes rapidly (e.g.
@@ -2404,7 +2461,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 
 		crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 		crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+		crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 	}
 
 	// Update cached dimensions (only needs to be done once, not duplicated)
@@ -2439,7 +2496,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE1 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 
 	// Store a copy of the accumulation buffer
@@ -2453,7 +2510,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 	crtemu->DrawArrays( CRTEMU_GL_TRIANGLE_FAN, 0, 4 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 	// Blend accumulation and backbuffer
 	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->accumulatebuffer_a );
@@ -2470,7 +2527,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE1 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 
 	// Add slight blur to backbuffer (skip on mobile for performance - this is a subtle effect)
@@ -2487,7 +2544,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 
 
 	// Present to screen with CRT shader
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
 
 	crtemu->Viewport( viewport[ 0 ], viewport[ 1 ], viewport[ 2 ], viewport[ 3 ] );
 
@@ -2570,28 +2627,18 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 	float mod_b = ( ( mod_xbgr >> 16 ) & 0xff ) / 255.0f;
 	crtemu->Uniform3f( crtemu->loc_crt_modulate, mod_r, mod_g, mod_b );
 
-	float color[] = { 0.0f, 0.0f, 0.0f, 0.0f };
-
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, crtemu->accumulatetexture_a );
 	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MIN_FILTER, CRTEMU_GL_LINEAR );
 	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MAG_FILTER, CRTEMU_GL_LINEAR );
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_S, CRTEMU_GL_CLAMP_TO_BORDER );
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_T, CRTEMU_GL_CLAMP_TO_BORDER );
-#if !defined(CRTEMU_WEBGL) && !defined(__ANDROID__)
-	crtemu->TexParameterfv( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_BORDER_COLOR, color );
-#endif
+	crtemu_internal_set_border_wrap( crtemu );
 
 
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE1 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, crtemu->blurtexture_a );
 	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MIN_FILTER, CRTEMU_GL_LINEAR );
 	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MAG_FILTER, CRTEMU_GL_LINEAR );
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_S, CRTEMU_GL_CLAMP_TO_BORDER );
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_T, CRTEMU_GL_CLAMP_TO_BORDER );
-#if !defined(CRTEMU_WEBGL) && !defined(__ANDROID__)
-	crtemu->TexParameterfv( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_BORDER_COLOR, color );
-#endif
+	crtemu_internal_set_border_wrap( crtemu );
 
 
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE2 );
@@ -2605,11 +2652,7 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 		crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_MAG_FILTER, CRTEMU_GL_LINEAR );
 	}
 
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_S, CRTEMU_GL_CLAMP_TO_BORDER );
-	crtemu->TexParameteri( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_WRAP_T, CRTEMU_GL_CLAMP_TO_BORDER );
-#if !defined(CRTEMU_WEBGL) && !defined(__ANDROID__)
-	crtemu->TexParameterfv( CRTEMU_GL_TEXTURE_2D, CRTEMU_GL_TEXTURE_BORDER_COLOR, color );
-#endif
+	crtemu_internal_set_border_wrap( crtemu );
 
 
 	crtemu->DrawArrays( CRTEMU_GL_TRIANGLE_FAN, 0, 4 );
@@ -2623,7 +2666,28 @@ void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pix
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE2 );
 	crtemu->BindTexture( CRTEMU_GL_TEXTURE_2D, 0 );
 	crtemu->ActiveTexture( CRTEMU_GL_TEXTURE0 );
-	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, 0 );
+	crtemu->BindFramebuffer( CRTEMU_GL_FRAMEBUFFER, crtemu->default_framebuffer );
+}
+
+
+void crtemu_present( crtemu_t* crtemu, CRTEMU_U64 time_us, CRTEMU_U32 const* pixels_xbgr, int width, int height, int pitch,
+                     CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr, unsigned int pixel_format, unsigned int pixel_type, int bpp ) {
+	crtemu_internal_present( crtemu, time_us, pixels_xbgr, 0, width, height, pitch, mod_xbgr, border_xbgr,
+		pixel_format, pixel_type, bpp );
+}
+
+
+void crtemu_present_texture( crtemu_t* crtemu, CRTEMU_U64 time_us, unsigned int texture, int width, int height,
+                             CRTEMU_U32 mod_xbgr, CRTEMU_U32 border_xbgr ) {
+	crtemu_internal_present( crtemu, time_us, nullptr, (CRTEMU_GLuint) texture, width, height, 0, mod_xbgr, border_xbgr,
+		0, 0, 4 );
+}
+
+
+void crtemu_texture_deleted( crtemu_t* crtemu, unsigned int texture ) {
+	if( crtemu && texture && crtemu->param_texture == (CRTEMU_GLuint) texture ) {
+		crtemu->param_texture = 0;
+	}
 }
 
 

@@ -18,10 +18,11 @@
 #define FPSR_INEX1      0x00000100
 
 extern void fp_init_native(void);
-#ifdef MSVC_LONG_DOUBLE
-extern bool fp_init_native_80(void);
-#endif
 extern void fp_init_softfloat(int);
+// softfloat with the fast double-double exponential functions (the exact FPU core)
+extern void fp_init_softfloat_exact(int);
+// the softfloat cores' fast path for the common arithmetic instructions (fpp_softfloat.cpp)
+extern bool fp_exact_fast_arith(fpdata *dst, const fpdata *src, uae_u16 extra);
 extern void fpsr_set_exception(uae_u32 exception);
 extern void fpu_modechange(void);
 extern void fpu_clearstatus(void);
@@ -33,11 +34,8 @@ extern uae_u32 fpp_get_fpsr(void);
 extern uae_u32 fpp_get_fpcr(void);
 extern uae_u32 fpp_get_fpiar(void);
 
-#if defined(CPU_i386) || defined(CPU_x86_64)
+#if defined(CPU_x86_64)
 extern void init_fpucw_x87(void);
-#ifdef MSVC_LONG_DOUBLE
-extern void init_fpucw_x87_80(void);
-#endif
 #endif
 extern void fpu_reset(void);
 
@@ -56,6 +54,9 @@ typedef void (*FPP_A)(fpdata*);
 typedef void (*FPP_ABC)(fpdata*, fpdata*, fpdata*);
 
 typedef bool (*FPP_IS)(fpdata*);
+// FPSR condition code byte of a value, shifted down by 24: 8 N, 4 Z, 2 I, 1 NAN
+// (NAN excludes Z and I, Z excludes I): one call instead of four fpp_is_*()
+typedef uae_u32 (*FPP_GET_CC)(fpdata*);
 typedef void (*FPP_SET_MODE)(uae_u32);
 typedef void (*FPP_GET_STATUS)(uae_u32*);
 typedef void (*FPP_CLEAR_STATUS)(void);
@@ -94,6 +95,8 @@ extern FPP_IS fpp_is_zero;
 extern FPP_IS fpp_is_neg;
 extern FPP_IS fpp_is_denormal;
 extern FPP_IS fpp_is_unnormal;
+extern FPP_IS fpp_is_denormal_or_unnormal;
+extern FPP_GET_CC fpp_get_cc;
 extern FPP_A fpp_fix_infinity;
 
 extern FPP_GET_STATUS fpp_get_status;

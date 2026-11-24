@@ -4,7 +4,6 @@
 #include "sysdeps.h"
 #include "sdl_compat.h"
 #include "imgui_overlay.h"
-#include "imgui_osk.h"
 #include "on_screen_joystick.h"
 #include "xwin.h"
 
@@ -16,8 +15,9 @@ void flush_macos_synthetic_mouse_releases() {}
 // The libretro build doesn't include amiberry_gui.cpp, so provide the definition here.
 std::vector<std::string> serial_ports;
 
-// get_json_timestamp / get_xml_timestamp are defined in main_window.cpp (standalone GUI).
-// The libretro build doesn't include main_window.cpp, so provide stubs here.
+// get_json_timestamp / get_xml_timestamp are defined in gui/gui_shared.cpp
+// (the standalone builds). The libretro build doesn't include it, so provide
+// stubs here.
 std::string get_json_timestamp(const std::string& json_filename)
 {
 	(void)json_filename;
@@ -58,27 +58,6 @@ ImDrawData* imgui_overlay_get_draw_data() { return nullptr; }
 void imgui_overlay_restore_context() {}
 bool imgui_overlay_is_vulkan() { return false; }
 
-// ImGui on-screen keyboard stubs
-void imgui_osk_init() {}
-void imgui_osk_shutdown() {}
-void imgui_osk_toggle() {}
-bool imgui_osk_is_active() { return false; }
-bool imgui_osk_should_render() { return false; }
-void imgui_osk_render() {}
-bool imgui_osk_process(int state, int* keycode, int* pressed)
-{
-	(void)state;
-	if (keycode) *keycode = 0;
-	if (pressed) *pressed = 0;
-	return false;
-}
-bool imgui_osk_handle_finger_down(float x, float y, int id) { (void)x; (void)y; (void)id; return false; }
-bool imgui_osk_handle_finger_up(float x, float y, int id) { (void)x; (void)y; (void)id; return false; }
-bool imgui_osk_handle_finger_motion(float x, float y, int id) { (void)x; (void)y; (void)id; return false; }
-bool imgui_osk_hit_test(float x, float y) { (void)x; (void)y; return false; }
-void imgui_osk_set_transparency(float alpha) { (void)alpha; }
-void imgui_osk_set_language(const char* lang) { (void)lang; }
-void imgui_osk_set_numpad(bool enabled) { (void)enabled; }
 
 // On-screen joystick stubs (not used in libretro builds)
 void on_screen_joystick_init(SDL_Renderer* renderer) { (void)renderer; }

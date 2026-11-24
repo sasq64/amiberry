@@ -19,21 +19,16 @@
 
 #include "sysdeps.h"
 #include "options.h"
-#include "events.h"
 #include "uae.h"
 #include "memory.h"
 #include "custom.h"
 #include "autoconf.h"
-#include "newcpu.h"
-#include "traps.h"
 #include "picasso96.h"
 #include "threaddep/thread.h"
 #include "serial.h"
 #include "parser.h"
-#include "ioport.h"
 #include "parallel.h"
 #include "cia.h"
-#include "savestate.h"
 #include "xwin.h"
 #include "drawing.h"
 #include "vpar.h"
@@ -816,29 +811,6 @@ int enumserialports (void)
 	cnt++;
 	write_log(_T("Port enumeration end\n"));
 	return cnt;
-#elif defined(_WIN32)
-	int cnt = 0;
-	serial_ports.clear();
-	write_log(_T("Serial port enumeration (Windows)..\n"));
-	TCHAR devname[MAX_DPATH];
-	for (int i = 0; i < 32; i++) {
-		TCHAR comname[16];
-		_sntprintf(comname, sizeof comname / sizeof(TCHAR), _T("COM%d"), i);
-		if (QueryDosDevice(comname, devname, sizeof(devname) / sizeof(TCHAR))) {
-			serial_ports.emplace_back(comname);
-			cnt++;
-		}
-	}
-	serial_ports.emplace_back(SERIAL_INTERNAL);
-	cnt++;
-	serial_ports.emplace_back(SERIAL_LOOPBACK);
-	cnt++;
-	serial_ports.emplace_back("TCP://0.0.0.0:1234");
-	cnt++;
-	serial_ports.emplace_back("TCP://0.0.0.0:1234/wait");
-	cnt++;
-	write_log(_T("Port enumeration end\n"));
-	return cnt;
 #else
 	return 0;
 #endif
@@ -847,6 +819,10 @@ int enumserialports (void)
 int enummidiports (void)
 {
 	int total = 0;
+	// The lists are rebuilt, as enumserialports() does (it runs again when a
+	// front end refreshes the host's devices).
+	midi_in_ports.clear();
+	midi_out_ports.clear();
 
 #ifdef WITH_MIDI
 #ifdef LIBRETRO

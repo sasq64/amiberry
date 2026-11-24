@@ -26,6 +26,9 @@
 #include "execio.h"
 #include "savestate.h"
 
+#ifdef SCSIEMU
+
+
 #define CDDEV_COMMANDS
 
 #define UAEDEV_SCSI _T("uaescsi.device")
@@ -41,6 +44,7 @@
 #define ASYNC_REQUEST_CHANGEINT 10
 #define ASYNC_REQUEST_FRAMEINT 11
 
+namespace {
 struct devstruct {
 	int unitnum, aunit;
 	int opencnt;
@@ -67,6 +71,7 @@ struct devstruct {
 	TCHAR *tape_directory;
 	bool readonly;
 };
+}
 
 struct priv_devstruct {
 	int inuse;
@@ -1626,3 +1631,41 @@ uae_u8 *restore_scsidev (uae_u8 *src)
 	}
 	return src;
 }
+
+#else
+
+int scsi_do_disk_change(int unitnum, int insert, int *pollmode)
+{
+	if (pollmode) {
+		*pollmode = 0;
+	}
+	return 0;
+}
+
+uae_u32 scsi_get_cd_drive_mask(void)
+{
+	return 0;
+}
+
+uae_u32 scsi_get_cd_drive_media_mask(void)
+{
+	return 0;
+}
+
+int scsi_add_tape(struct uaedev_config_info *uci)
+{
+	return -1;
+}
+
+uae_u8 *save_scsidev(int num, size_t *len, uae_u8 *dstptr)
+{
+	*len = 0;
+	return dstptr;
+}
+
+uae_u8 *restore_scsidev(uae_u8 *src)
+{
+	return src;
+}
+
+#endif /* SCSIEMU */

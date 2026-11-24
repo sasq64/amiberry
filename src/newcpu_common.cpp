@@ -936,9 +936,11 @@ void setdivuflags(uae_u32 dividend, uae_u16 divisor)
 		SET_VFLG(1);
 		SET_CFLG(0);
 	} else if (currprefs.cpu_model >= 68020) {
+		// 68020/030: V=1, C=0, Z=0, N = dividend negative (table above)
 		SET_VFLG(1);
-		if ((uae_s32)dividend < 0)
-			SET_NFLG(1);
+		SET_CFLG(0);
+		SET_ZFLG(0);
+		SET_NFLG((uae_s32)dividend < 0);
 	} else if (currprefs.cpu_model == 68010) {
 		SET_VFLG(1);
 		if ((uae_s32)dividend < 0 && (uae_s16)divisor < 0) {
@@ -1077,6 +1079,18 @@ void setchkundefinedflags(uae_s32 src, uae_s32 dst, int size)
 
 // This is the complex one.
 // Someone else can attempt to simplify this..
+
+/* The 68020/030 CHK2/CMP2 N/V probes below test the sign of a subtraction
+ * that can overflow. As signed int that is undefined behavior: gcc/clang
+ * optimize the overflow-only comparisons away (observed with gcc -O2;
+ * breaks CPUTESTER CHK2.* on GCC-built hosts), while MSVC keeps the
+ * two's-complement wrap that the real-hardware-derived tables expect.
+ * Emulate the wrap explicitly so every compiler produces the same flags. */
+static uae_u32 chk2_sub_wrap(uae_s32 a, uae_s32 b)
+{
+	return (uae_u32)a - (uae_u32)b;
+}
+
 void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 {
 	if (currprefs.cpu_model == 68060) {
@@ -1100,7 +1114,7 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val >= 0 && val < upper) {
 			SET_NFLG(1);
 		}
-		if (val >= 0 && lower - val >= 0) {
+		if (val >= 0 && (chk2_sub_wrap(lower, val) & 0x80000000u) == 0) {
 			SET_VFLG(1);
 			SET_NFLG(0);
 			if (val > upper) {
@@ -1114,7 +1128,7 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val > upper) {
 			SET_NFLG(1);
 		}
-		if (val > lower && upper - val >= 0) {
+		if (val > lower && (chk2_sub_wrap(upper, val) & 0x80000000u) == 0) {
 			SET_VFLG(1);
 			SET_NFLG(0);
 		}
@@ -1122,10 +1136,10 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val > upper && val < lower) {
 			SET_NFLG(1);
 		}
-		if (val < 0 && lower - val < 0) {
+		if (val < 0 && (chk2_sub_wrap(lower, val) & 0x80000000u) != 0) {
 			SET_VFLG(1);
 		}
-		if (val < 0 && lower - val >= 0) {
+		if (val < 0 && (chk2_sub_wrap(lower, val) & 0x80000000u) == 0) {
 			SET_NFLG(1);
 		}
 	} else if (lower >= 0 && upper >= 0 && lower <= upper) {
@@ -1135,7 +1149,7 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val > upper) {
 			SET_NFLG(1);
 		}
-		if (val < 0 && upper - val < 0) {
+		if (val < 0 && (chk2_sub_wrap(upper, val) & 0x80000000u) != 0) {
 			SET_VFLG(1);
 			SET_NFLG(1);
 		}
@@ -1146,7 +1160,7 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val > upper && val < lower) {
 			SET_NFLG(1);
 		}
-		if (val >= 0 && val - lower < 0) {
+		if (val >= 0 && (chk2_sub_wrap(val, lower) & 0x80000000u) != 0) {
 			SET_NFLG(0);
 			SET_VFLG(1);
 		}
@@ -1157,7 +1171,7 @@ void setchk2undefinedflags(uae_s32 lower, uae_s32 upper, uae_s32 val, int size)
 		if (val < 0 && val > upper) {
 			SET_NFLG(1);
 		}
-		if (val >= 0 && val - lower < 0) {
+		if (val >= 0 && (chk2_sub_wrap(val, lower) & 0x80000000u) != 0) {
 			SET_NFLG(1);
 			SET_VFLG(1);
 		}
@@ -1535,9 +1549,11 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// version & internal information (We store index here)
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), (mmu030_idx & 0xf) | ((mmu030_idx_done & 0xf) << 4) | (regs.wb2_status << 8));
+		regs.wb2_status = 0;
 		// 3* internal registers
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), mmu030_state[2] | (regs.wb3_status << 8));
+		regs.wb3_status = 0;
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), regs.wb2_address); // = mmu030_state[1]
 		m68k_areg(regs, 7) -= 2;
@@ -1629,7 +1645,9 @@ void Exception_build_stack_frame_common(uae_u32 oldpc, uae_u32 currpc, uae_u32 s
 				Exception_build_stack_frame(oldpc, regs.instruction_pc, 0, vector_nr, 0x0);
 			}
 		} else { /* post-instruction */
-			if (currprefs.cpu_model == 68060 && nr == 55 && regs.fp_unimp_pend == 2) { // packed decimal real
+			if (currprefs.cpu_model == 68020 || currprefs.cpu_model == 68030) {
+				Exception_build_stack_frame(regs.instruction_pc, currpc, 0, vector_nr, 0x9);
+			} else if (currprefs.cpu_model == 68060 && nr == 55 && regs.fp_unimp_pend == 2) { // packed decimal real
 				Exception_build_stack_frame(regs.fp_ea, currpc, 0, vector_nr, 0x2);
 			} else {
 				Exception_build_stack_frame(oldpc, currpc, 0, vector_nr, 0x3);

@@ -25,6 +25,7 @@
 #include "imgui_overlay.h"
 #include "imgui_osk.h"
 #include "on_screen_joystick.h"
+#include "amiberry_input.h"
 
 #ifdef WITH_MIDIEMU
 #include "midiemu.h"
@@ -33,6 +34,7 @@
 #include "target.h"
 #include "gfx_colors.h"
 #include "gfx_prefs_check.h"
+#include "service_transport.h"
 
 static int display_change_requested;
 
@@ -55,6 +57,23 @@ void gfx_DisplayChangeRequested(const int mode)
 	display_change_requested = mode;
 }
 
+// A change reaches this check for two vsyncs (set_config_changed(), then
+// config_check_vsync()), but the blocks below apply their part and return
+// early, so a commit that spans several blocks needs a pass for each. A block
+// that returned early asks for another pass; bounded, so a block whose
+// condition never settles cannot keep re-running, and reset once a pass
+// finds nothing left.
+static int extra_passes = 0;
+
+static int applied_part()
+{
+	if (extra_passes < 8) {
+		extra_passes++;
+		set_config_changed();
+	}
+	return 1;
+}
+
 int check_prefs_changed_gfx()
 {
 	int c = 0;
@@ -63,13 +82,57 @@ int check_prefs_changed_gfx()
 
 	const bool native_code_changed = currprefs.native_code != changed_prefs.native_code;
 	if (native_code_changed) {
-		if (currprefs.native_code && !changed_prefs.native_code)
+		const bool disabled = currprefs.native_code && !changed_prefs.native_code;
+		if (disabled)
 			uaelib_host_cleanup();
 		currprefs.native_code = changed_prefs.native_code;
+		// After the flag flips no new plugin dispatch can start; one already in
+		// flight is dropped by the transport's reset generation.
+		if (disabled)
+			service_transport_reset();
 	}
 
-	if (!config_changed && !display_change_requested)
+#ifdef AMIBERRY
+	// Keyboard shortcuts: the running emulation listens for the new keys.
+	// Checked on every frame, as native_code is, rather than in the
+	// config_changed passes below: blocks there return early, and a change
+	// left for a later pass can run out of passes.
+	{
+		bool hotkeys_changed = false;
+		const auto copy_hotkey = [&hotkeys_changed](TCHAR* current, const TCHAR* changed, const size_t size) {
+			if (_tcscmp(current, changed)) {
+				_tcsncpy(current, changed, size - 1);
+				current[size - 1] = 0;
+				hotkeys_changed = true;
+			}
+		};
+#define COPY_HOTKEY(field) copy_hotkey(currprefs.field, changed_prefs.field, sizeof currprefs.field / sizeof(TCHAR))
+		COPY_HOTKEY(open_gui);
+		COPY_HOTKEY(quit_amiberry);
+		COPY_HOTKEY(action_replay);
+		COPY_HOTKEY(fullscreen_toggle);
+		COPY_HOTKEY(minimize);
+		COPY_HOTKEY(left_amiga);
+		COPY_HOTKEY(right_amiga);
+		COPY_HOTKEY(screenshot);
+		COPY_HOTKEY(debugger_trigger);
+#undef COPY_HOTKEY
+		if (hotkeys_changed)
+			target_hotkeys_changed(&currprefs);
+	}
+#endif
+	if (currprefs.multithreaded_denise != changed_prefs.multithreaded_denise) {
+		set_multithreaded_denise(changed_prefs.multithreaded_denise);
+		currprefs.multithreaded_denise = changed_prefs.multithreaded_denise;
+	}
+
+	if (!config_changed && !display_change_requested) {
+		extra_passes = 0;
 		return 0;
+	}
+
+	// Runtime config loads (IPC, D-Bus) change the active config name.
+	refreshtitle();
 
 	c |= config_changed_flags;
 	config_changed_flags = 0;
@@ -224,6 +287,7 @@ int check_prefs_changed_gfx()
 	c |= currprefs.gfx_threebitcolors != changed_prefs.gfx_threebitcolors ? (256) : 0;
 	c |= currprefs.gfx_grayscale != changed_prefs.gfx_grayscale ? (512) : 0;
 	c |= currprefs.gfx_ntscpixels != changed_prefs.gfx_ntscpixels ? (512) : 0;
+	c |= currprefs.gfx_ntscpixelspal != changed_prefs.gfx_ntscpixelspal ? (512) : 0;
 	c |= currprefs.gfx_monitorblankdelay != changed_prefs.gfx_monitorblankdelay ? (512) : 0;
 
 	c |= currprefs.gfx_display_sections != changed_prefs.gfx_display_sections ? (512) : 0;
@@ -367,6 +431,7 @@ int check_prefs_changed_gfx()
 		currprefs.gfx_threebitcolors = changed_prefs.gfx_threebitcolors;
 		currprefs.gfx_grayscale = changed_prefs.gfx_grayscale;
 		currprefs.gfx_ntscpixels = changed_prefs.gfx_ntscpixels;
+		currprefs.gfx_ntscpixelspal = changed_prefs.gfx_ntscpixelspal;
 		currprefs.gfx_monitorblankdelay = changed_prefs.gfx_monitorblankdelay;
 
 		currprefs.gfx_display_sections = changed_prefs.gfx_display_sections;
@@ -425,12 +490,15 @@ int check_prefs_changed_gfx()
 				}
 			}
 			if (c & 1024) {
+				reset_drawing();
 				target_graphics_buffer_update(mon->monitor_id, true);
 			}
 			if (c & 512) {
+				reset_drawing();
 				reopen_gfx(mon);
 			}
 			if ((c & 16) || ((c & 8) && keepfsmode)) {
+				reset_drawing();
 				if (reopen(mon, c & 2, unacquired == false)) {
 					c |= 2;
 				} else {
@@ -442,6 +510,7 @@ int check_prefs_changed_gfx()
 					inputdevice_unacquire();
 					unacquired = true;
 				}
+				reset_drawing();
 				close_windows(mon, false);
 				if (currprefs.gfx_api != changed_prefs.gfx_api || currprefs.gfx_api_options != changed_prefs.gfx_api_options) {
 					currprefs.gfx_api = changed_prefs.gfx_api;
@@ -469,13 +538,14 @@ int check_prefs_changed_gfx()
 		if (setpause)
 			setpaused(1);
 
-		return 1;
+		return applied_part();
 	}
 
 	bool changed = false;
 	for (int i = 0; i < MAX_CHIPSET_REFRESH_TOTAL; i++) {
-		if (currprefs.cr[i].rate != changed_prefs.cr[i].rate ||
-			currprefs.cr[i].locked != changed_prefs.cr[i].locked) {
+		// Every field of an entry (lace, vsync, resolution, commands...)
+		// can change, not only the rate and lock the panel edits.
+		if (std::memcmp(&currprefs.cr[i], &changed_prefs.cr[i], sizeof(struct chipset_refresh)) != 0) {
 			memcpy(&currprefs.cr[i], &changed_prefs.cr[i], sizeof(struct chipset_refresh));
 			changed = true;
 		}
@@ -486,7 +556,7 @@ int check_prefs_changed_gfx()
 	if (currprefs.chipset_refreshrate != changed_prefs.chipset_refreshrate) {
 		currprefs.chipset_refreshrate = changed_prefs.chipset_refreshrate;
 		init_hz();
-		return 1;
+		return applied_part();
 	}
 
 	if (
@@ -511,12 +581,15 @@ int check_prefs_changed_gfx()
 		get_custom_limits(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 		fixup_prefs_dimensions(&changed_prefs);
 
-		return 1;
+		return applied_part();
 	}
 
 	//currprefs.win32_norecyclebin = changed_prefs.win32_norecyclebin;
 	currprefs.filesys_limit = changed_prefs.filesys_limit;
 	currprefs.harddrive_read_only = changed_prefs.harddrive_read_only;
+	// Every .uaem read/write checks this flag per call, so it is safe to apply live.
+	// filesys_no_uaefsdb is not copied: it changes name translation for mounted volumes.
+	currprefs.filesys_custom_uaefsdb = changed_prefs.filesys_custom_uaefsdb;
 
 	//if (currprefs.win32_logfile != changed_prefs.win32_logfile) {
 	//	currprefs.win32_logfile = changed_prefs.win32_logfile;
@@ -606,7 +679,7 @@ int check_prefs_changed_gfx()
 #ifndef	_DEBUG
 		setpriority(currprefs.active_capture_priority);
 #endif
-		return 1;
+		return applied_part();
 	}
 
 	if (currprefs.samplersoundcard != changed_prefs.samplersoundcard ||
@@ -629,14 +702,19 @@ int check_prefs_changed_gfx()
 		currprefs.parallel_postscript_detection = changed_prefs.parallel_postscript_detection;
 		_tcscpy(currprefs.ghostscript_parameters, changed_prefs.ghostscript_parameters);
 #ifdef PARALLEL_PORT
-		//closeprinter();
+		// What the reset would do: close the old printer (or print file)
+		// and open the new one, so a printer picked while running prints.
+		initparallel();
 #endif
 	}
 	if (_tcscmp(currprefs.sername, changed_prefs.sername) ||
+		currprefs.use_serial != changed_prefs.use_serial ||
 		currprefs.serial_hwctsrts != changed_prefs.serial_hwctsrts ||
 		currprefs.serial_direct != changed_prefs.serial_direct ||
 		currprefs.serial_demand != changed_prefs.serial_demand) {
 		_tcscpy(currprefs.sername, changed_prefs.sername);
+		// Serial is on with a port: a port picked while running opens it.
+		currprefs.use_serial = changed_prefs.use_serial;
 		currprefs.serial_hwctsrts = changed_prefs.serial_hwctsrts;
 		currprefs.serial_demand = changed_prefs.serial_demand;
 		currprefs.serial_direct = changed_prefs.serial_direct;
@@ -669,12 +747,14 @@ int check_prefs_changed_gfx()
 #ifdef AMIBERRY
 	// On-screen keyboard
 	if (currprefs.vkbd_enabled != changed_prefs.vkbd_enabled ||
+		currprefs.vkbd_touch_button != changed_prefs.vkbd_touch_button ||
 		currprefs.vkbd_numpad != changed_prefs.vkbd_numpad ||
 		currprefs.vkbd_transparency != changed_prefs.vkbd_transparency ||
 		_tcscmp(currprefs.vkbd_language, changed_prefs.vkbd_language) ||
 		_tcscmp(currprefs.vkbd_toggle, changed_prefs.vkbd_toggle))
 	{
 		currprefs.vkbd_enabled = changed_prefs.vkbd_enabled;
+		currprefs.vkbd_touch_button = changed_prefs.vkbd_touch_button;
 		currprefs.vkbd_numpad = changed_prefs.vkbd_numpad;
 		currprefs.vkbd_transparency = changed_prefs.vkbd_transparency;
 		_tcscpy(currprefs.vkbd_language, changed_prefs.vkbd_language);
@@ -689,7 +769,7 @@ int check_prefs_changed_gfx()
 			imgui_osk_set_language(currprefs.vkbd_language);
 			imgui_osk_set_numpad(currprefs.vkbd_numpad);
 			vkbd_key = get_hotkey_from_config(string(currprefs.vkbd_toggle));
-			vkbd_button = SDL_GetGamepadButtonFromString(currprefs.vkbd_toggle);
+			vkbd_button = gamepad_button_from_config(currprefs.vkbd_toggle);
 			imgui_osk_init();
 		}
 		else
@@ -698,6 +778,16 @@ int check_prefs_changed_gfx()
 			vkbd_button = SDL_GAMEPAD_BUTTON_INVALID;
 			imgui_osk_shutdown();
 		}
+
+#ifdef __ANDROID__
+		// Start remains a menu fallback unless explicitly bound to the OSK.
+		enter_gui_button = gamepad_button_from_config(currprefs.open_gui);
+		if (enter_gui_button == SDL_GAMEPAD_BUTTON_INVALID
+			&& vkbd_button != SDL_GAMEPAD_BUTTON_START)
+			enter_gui_button = SDL_GAMEPAD_BUTTON_START;
+#endif
+		for (auto& did : di_joystick)
+			sync_controller_shortcuts(&did);
 	}
 
 	// On-screen joystick
@@ -714,10 +804,13 @@ int check_prefs_changed_gfx()
 		{
 			AmigaMonitor* mon = &AMonitors[0];
 			on_screen_joystick_init(mon->amiga_renderer);
-			int sw = 0, sh = 0;
-			if (g_renderer)
+			// Without a renderer (none could be created) there is nothing to
+			// lay the controls out on yet.
+			if (g_renderer) {
+				int sw = 0, sh = 0;
 				g_renderer->get_drawable_size(mon->amiga_window, &sw, &sh);
-			on_screen_joystick_update_layout(sw, sh, g_renderer->render_quad);
+				on_screen_joystick_update_layout(sw, sh, g_renderer->render_quad);
+			}
 			on_screen_joystick_set_enabled(true);
 		}
 		else
@@ -733,6 +826,7 @@ int check_prefs_changed_gfx()
 		return 1;
 	}
 
+	extra_passes = 0;
 	return 0;
 }
 

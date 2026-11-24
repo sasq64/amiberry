@@ -15,53 +15,45 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#if defined(__unix__) && !defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
 #include <cstdio>
 #include <cmath>
 #include <iostream>
 #include <random>
 
 #include "sysdeps.h"
+#include "osdep/minigl_display.h"
 #include "options.h"
 #include "uae.h"
 #include "custom.h"
-#include "events.h"
 #include "xwin.h"
-#include "keyboard.h"
 #include "drawing.h"
 #include "picasso96.h"
-#include "gui.h"
 #include "amiberry_gfx.h"
 #include "perf_monitor.h"
-#include "sounddep/sound.h"
 #include "inputdevice.h"
 #ifdef WITH_MIDI
 #include "midi.h"
 #endif
-#include "serial.h"
-#include "parallel.h"
-#include "sampler.h"
 #include "gfxboard.h"
 #include "statusline.h"
 #include "devices.h"
 
 #include "threaddep/thread.h"
 // imgui_osk.h included for vkbd_allowed() - no old vkbd dependency
-#include "on_screen_joystick.h"
-#include "fsdb_host.h"
-#include "savestate.h"
 #include "uae/types.h"
 
 #ifdef WITH_MIDIEMU
 #include "midiemu.h"
 #endif
 
-#include "dpi_handler.hpp"
 #include "registry.h"
 #include "target.h"
 #include "gfx_window.h"
 #include "gl_overlays.h"
 #include "gfx_colors.h"
-#include "gfx_prefs_check.h"
 #include "display_modes.h"
 #include "renderer_factory.h"
 #include "amiberry_input_helpers.h"
@@ -76,6 +68,7 @@
 #include "external_shader.h"
 #include "shader_preset.h"
 #include "opengl_renderer.h"
+#include "dmabuf_surface.h"
 #include <SDL3_image/SDL_image.h>
 
 #ifdef LIBRETRO
@@ -129,6 +122,25 @@ constexpr int auto_crop_wide_aspect_h = 9;
 constexpr int auto_crop_shrink_stable_frames = 6;
 constexpr int auto_crop_min_outside_pixels = 16;
 constexpr int auto_crop_horizontal_jitter_tolerance = 2;
+// After a trigger-initiated scan that does not move the crop rect, pause
+// trigger checks for this many frames so animated outside content (copper
+// borders) cannot force a full scan every frame. New content is picked up on
+// the first check after the pause; the periodic scan interval bounds any
+// delay regardless.
+constexpr int auto_crop_trigger_backoff = 8;
+
+// Frames a smaller scan result must persist (with an unchanged register base
+// and surface) before the presented crop shrinks to it. Absorbs rect
+// alternation from software that strobes full-surface effect frames between
+// smaller pictures; growth and base changes are never delayed. Kept short:
+// a delayed settle is visible for the whole hold, while a wrong shrink
+// during effect strobing is masked by the strobing itself.
+constexpr int auto_crop_shrink_hold_frames = 6;
+// Content-scan duty cycle for auto-crop. The DIW/DDF register window is the
+// crop base; the scan only expands beyond it for border effects, so it runs
+// when the base changes or every Nth frame. Odd so that successive periodic
+// scans on interlaced content alternate field parity.
+constexpr int auto_crop_scan_interval = 25;
 
 struct AutoCropVisibleState {
 	const SDL_Surface* surface = nullptr;
@@ -585,8 +597,73 @@ void apply_auto_crop_policy(const SDL_Surface* surface, SDL_Rect& rect,
 
 static int dx = 0, dy = 0;
 const char* sdl_video_driver;
+bool gl_renderer_demoted = false;
 bool kmsdrm_detected = false;
 bool no_wm_detected = false;
+
+#if defined(__unix__) && !defined(__ANDROID__)
+namespace {
+// Leading fields of Xlib's XErrorEvent; declared here so the probe below
+// needs no X11 headers at build time.
+struct XErrorEventHead {
+	int type;
+	void* display;
+	unsigned long resourceid;
+	unsigned long serial;
+	unsigned char error_code;
+	unsigned char request_code;
+	unsigned char minor_code;
+};
+
+int x11_wm_probe_error = 0;
+
+int x11_wm_probe_error_handler(void*, XErrorEventHead* event)
+{
+	x11_wm_probe_error = event->error_code;
+	return 0;
+}
+
+// Returns 1 when a window manager runs on $DISPLAY, 0 when none does, and
+// -1 when the probe can't tell (libX11 or the display unavailable).
+// A window manager is the client holding SubstructureRedirect on the root
+// window, and the X server grants that selection to one client only, so
+// asking for it fails with BadAccess whenever any WM is active (EWMH or
+// not, including XWayland's). The probe uses its own connection; closing
+// it drops the selection again when no WM was running. libX11 is resolved
+// at runtime because SDL's x11 driver has already loaded it.
+int probe_x11_window_manager()
+{
+	void* lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_NOLOAD);
+	if (!lib) lib = dlopen("libX11.so.6", RTLD_LAZY);
+	if (!lib) return -1;
+
+	using ErrorHandler = int (*)(void*, XErrorEventHead*);
+	const auto open_display = reinterpret_cast<void* (*)(const char*)>(dlsym(lib, "XOpenDisplay"));
+	const auto close_display = reinterpret_cast<int (*)(void*)>(dlsym(lib, "XCloseDisplay"));
+	const auto default_root_window = reinterpret_cast<unsigned long (*)(void*)>(dlsym(lib, "XDefaultRootWindow"));
+	const auto select_input = reinterpret_cast<int (*)(void*, unsigned long, long)>(dlsym(lib, "XSelectInput"));
+	const auto sync = reinterpret_cast<int (*)(void*, int)>(dlsym(lib, "XSync"));
+	const auto set_error_handler = reinterpret_cast<ErrorHandler (*)(ErrorHandler)>(dlsym(lib, "XSetErrorHandler"));
+	if (!open_display || !close_display || !default_root_window || !select_input || !sync || !set_error_handler)
+		return -1;
+
+	void* display = open_display(nullptr);
+	if (!display) return -1;
+
+	constexpr long substructure_redirect_mask = 1L << 20;
+	constexpr int bad_access = 10;
+	x11_wm_probe_error = 0;
+	const ErrorHandler previous_handler = set_error_handler(x11_wm_probe_error_handler);
+	select_input(display, default_root_window(display), substructure_redirect_mask);
+	sync(display, 0);
+	set_error_handler(previous_handler);
+	close_display(display);
+
+	if (x11_wm_probe_error == 0) return 0;
+	return x11_wm_probe_error == bad_access ? 1 : -1;
+}
+}
+#endif
 
 // Detect when we're running without a window manager. This covers two cases:
 //   1. KMSDRM — inherently WM-less (console framebuffer / direct-to-display)
@@ -644,16 +721,27 @@ void detect_no_wm()
 		}
 	}
 
-	// Auto-detection: x11 driver without any desktop-session env vars set.
-	// Naturally skips on macOS/Windows/Wayland — only bare x11 reaches the
-	// heuristic. Note: this is a heuristic, not a definitive WM probe; users
-	// on minimalist x11 setups (xinit + twm/fvwm/xmonad without any session
-	// vars exported) can be misclassified — they should set AMIBERRY_NO_WM=0
-	// to opt out. A more rigorous _NET_SUPPORTING_WM_CHECK probe via X11
-	// interop could replace this if the heuristic proves troublesome.
+	// Auto-detection only applies to the x11 driver; macOS, Windows and
+	// Wayland always have a window manager.
 	if (strcmpi(driver, "x11") != 0)
 		return;
 
+#if defined(__unix__) && !defined(__ANDROID__)
+	// Ask the X server whether a window manager is running. Session env
+	// vars are not reliable for this: startx/xinit sessions with a plain WM
+	// (Openbox, twm, ...) often export none of them (#2621).
+	const int wm_probe = probe_x11_window_manager();
+	if (wm_probe >= 0) {
+		no_wm_detected = wm_probe == 0;
+		if (no_wm_detected)
+			write_log("x11 without window manager detected (driver=%s) — using shared-window mode for GUI (set AMIBERRY_NO_WM=0 to disable)\n", driver);
+		return;
+	}
+	write_log("x11 window manager probe unavailable — falling back to desktop session env vars\n");
+#endif
+
+	// Fallback heuristic when the X server can't be queried: assume no WM
+	// unless a desktop-session env var is set.
 	auto env_set = [](const char* name) {
 		const char* v = getenv(name);
 		return v && *v;
@@ -703,6 +791,17 @@ bool get_kmsdrm_drawable_size(SDL_Window* window, int* width, int* height)
 }
 
 SDL_PixelFormat pixel_format = SDL_PIXELFORMAT_ABGR8888;
+
+SDL_Surface* create_native_surface(const int width, const int height)
+{
+#ifdef USE_OPENGL
+	if (get_opengl_renderer()) {
+		if (SDL_Surface* surface = dmabuf_surface_create(width, height, pixel_format))
+			return surface;
+	}
+#endif
+	return SDL_CreateSurface(width, height, pixel_format);
+}
 
 static frame_time_t last_synctime;
 
@@ -848,6 +947,8 @@ bool vkbd_allowed(const int monid)
 	return currprefs.vkbd_enabled;
 }
 
+static bool zero_copy_saw_overlay[MAX_AMIGAMONITORS];
+
 static bool amiberry_renderframe(const int monid, int mode, int immediate)
 {
 	// Skip all rendering if in headless mode
@@ -864,10 +965,19 @@ static bool amiberry_renderframe(const int monid, int mode, int immediate)
 	{
 		update_leds(monid);
 	}
+	// A feature overlay starts and stops without a mode change. Rebind the
+	// surface so zero-copy gives way to the copy path while it is shown.
+	if (AMonitors[monid].screen_is_picasso && p96_is_zero_copy_enabled(monid)) {
+		const bool overlay = p96_overlay_active();
+		if (overlay != zero_copy_saw_overlay[monid]) {
+			zero_copy_saw_overlay[monid] = overlay;
+			const_cast<amigadisplay*>(ad)->picasso_zero_copy_update_needed = true;
+		}
+	}
 	// Consume the zero-copy refresh request. The flag is set by picasso96
-	// state changes (SetDisplay, SetPanning) and forces the host surface
-	// binding to follow the current Amiga VRAM address. This is orthogonal
-	// to WITH_THREADED_CPU so must not be wrapped by that define.
+	// state changes (SetGC, SetDisplay, SetPanning, SetSplitPosition) and by
+	// the overlay check above, and forces the host surface binding to follow
+	// the current Amiga VRAM address. This is orthogonal to the threaded CPU.
 	if (ad->picasso_zero_copy_update_needed) {
 		const_cast<amigadisplay*>(ad)->picasso_zero_copy_update_needed = false;
 		if (p96_is_zero_copy_enabled(monid)) {
@@ -900,23 +1010,22 @@ void getgfxoffset(const int monid, float* dxp, float* dyp, float* mxp, float* my
 	float src_w = 0, src_h = 0;
 	float src_x = 0, src_y = 0;
 
-#ifdef AMIBERRY
 	IRenderer* renderer = get_renderer(monid);
-	if (currprefs.gfx_auto_crop && !ad->picasso_on && renderer) {
-		src_w = static_cast<float>(renderer->crop_rect.w);
-		src_h = static_cast<float>(renderer->crop_rect.h);
-		src_x = static_cast<float>(renderer->crop_rect.x);
-		src_y = static_cast<float>(renderer->crop_rect.y);
-	}
-#endif
-	if (src_w <= 0) {
-		SDL_Surface* surface = get_amiga_surface(monid);
-		if (surface) {
-			src_w = static_cast<float>(surface->w);
-			src_h = static_cast<float>(surface->h);
-			src_x = 0;
-			src_y = 0;
+	SDL_Surface* surface = get_amiga_surface(monid);
+	if (surface) {
+		AmiberryGfxRect source{0, 0, surface->w, surface->h};
+		if (!ad->picasso_on && renderer) {
+			// Map against the region actually presented. Manual crop and the
+			// full-window nominal crop sample a sub-rect just like auto-crop;
+			// using the whole surface there skews pointer scale and origin.
+			const SDL_Rect& cr = renderer->crop_rect;
+			source = amiberry_gfx_presented_source_rect({cr.x, cr.y, cr.w, cr.h},
+				surface->w, surface->h);
 		}
+		src_x = static_cast<float>(source.x);
+		src_y = static_cast<float>(source.y);
+		src_w = static_cast<float>(source.w);
+		src_h = static_cast<float>(source.h);
 	}
 
 	if (renderer)
@@ -926,6 +1035,37 @@ void getgfxoffset(const int monid, float* dxp, float* dyp, float* mxp, float* my
 	*dyp = dy;
 	*mxp = 1.0f / mx;
 	*myp = 1.0f / my;
+}
+
+bool getgfxwindowscale(const int monid, float* sxp, float* syp)
+{
+	*sxp = 1.0f;
+	*syp = 1.0f;
+	float dx, dy, mx, my;
+	getgfxoffset(monid, &dx, &dy, &mx, &my);
+	if (!(mx > 0.0f) || !(my > 0.0f))
+		return false;
+	// getgfxoffset() yields source pixels per presentation unit; pointer input
+	// reaches presentation units the same way as below.
+	float sx = 1.0f / mx;
+	float sy = 1.0f / my;
+	const AmigaMonitor* mon = &AMonitors[monid];
+	if (mon->amiga_renderer) {
+		float x0, y0, x1, y1;
+		if (!SDL_RenderCoordinatesToWindow(mon->amiga_renderer, 0.0f, 0.0f, &x0, &y0)
+			|| !SDL_RenderCoordinatesToWindow(mon->amiga_renderer, 1.0f, 1.0f, &x1, &y1))
+			return false;
+		sx *= x1 - x0;
+		sy *= y1 - y0;
+	} else {
+		sx /= mon->hidpi_scale_x;
+		sy /= mon->hidpi_scale_y;
+	}
+	if (!(sx > 0.0f) || !(sy > 0.0f))
+		return false;
+	*sxp = sx;
+	*syp = sy;
+	return true;
 }
 
 bool getgfxsourceorigin(const int monid, int* xp, int* yp)
@@ -1112,11 +1252,19 @@ int lockscr(struct vidbuffer* vb, bool fullupdate, bool skip)
 
 	SDL_Surface* surface = get_amiga_surface(vb->monitor_id);
 
-	if ((gfx_platform_requires_window() && !mon->amiga_window) || !surface)
+	// Headless mode has no window but still draws into the frame surface.
+	if ((gfx_platform_requires_window() && !mon->amiga_window && !currprefs.headless) || !surface)
 		return ret;
 
 	// Ensure blanking limits are open and synchronized at the start of frame locking
-	set_custom_limits(-1, -1, -1, -1, false);
+	set_custom_limits(-1, -1, -1, -1);
+
+	// A zero-copy RTG surface's pixels are the guest's VRAM. Handing that to the
+	// chipset renderer would draw native frames into the RTG screen's bitmap
+	// (issue #2392), so refuse the lock until the surface has been rebuilt for
+	// native output.
+	if (vb->vram_buffer && p96_is_vram_pointer(surface->pixels))
+		return ret;
 
 	if (vb->vram_buffer) {
 		// Benchmarks have shown that Locking and Unlocking the Texture is slower than just calling UpdateTexture
@@ -1129,6 +1277,7 @@ int lockscr(struct vidbuffer* vb, bool fullupdate, bool skip)
 		vb->width_allocated = surface->w;
 		vb->height_allocated = surface->h;
 		if (vb->bufmem) {
+			vb->bufmemend = vb->bufmem + static_cast<size_t>(vb->rowbytes) * vb->height_allocated;
 			ret = 1;
 		}
 	} else {
@@ -1173,6 +1322,7 @@ void unlockscr(struct vidbuffer* vb, int y_start, int y_end)
 	vb->locked = false;
 	if (vb->vram_buffer) {
 		vb->bufmem = nullptr;
+		vb->bufmemend = nullptr;
 		// Not using SDL_UnlockTexture due to performance reasons, see lockscr for details
 		//SDL_UnlockTexture(amiga_texture);
 
@@ -1599,7 +1749,7 @@ void updatepicasso96(struct AmigaMonitor* mon)
 	vidinfo->height = mon->currentmode.current_height;
 	vidinfo->width = mon->currentmode.current_width;
 	vidinfo->offset = 0;
-	vidinfo->splitypos = -1;
+	vidinfo->splitypos = mon->screen_is_picasso ? picasso_get_splitypos(mon->monitor_id) : -1;
 }
 
 void gfx_set_picasso_modeinfo(const int monid, const RGBFTYPE rgbfmt)
@@ -1661,20 +1811,13 @@ int graphics_init(bool mousecapture)
 		g_renderer = create_renderer();
 	}
 
-	// Skip all graphics initialization if running in headless mode
+	// Headless: no window or renderer setup, but open_windows still creates
+	// the frame surface and buffers so the chipset renderer can lock them.
 	if (currprefs.headless) {
 		write_log("Headless mode: Skipping graphics initialization.\n");
 		g_renderer->vsync_state().wait_vblank_timestamp = read_processor_time();
 		update_pixel_format(0);
-		if (amiga_surface == nullptr) {
-			amiga_surface = SDL_CreateSurface(1920, 1080, pixel_format);
-			if (!amiga_surface) {
-				write_log("Failed to create amiga_surface: %s\n", SDL_GetError());
-				return false;
-			}
-			update_system_pixel_format();
-		}
-		return amiga_surface != nullptr;
+		return open_windows(&AMonitors[0], mousecapture, false);
 	}
 
 	g_renderer->vsync_state().wait_vblank_timestamp = read_processor_time();
@@ -1782,28 +1925,44 @@ static void configure_render_rects(const int monid, const int w, const int h, co
 		renderer->crop_aspect = 0.0f;
 		// WinUAE parity (od-win32/win32_scaler.cpp, AUTOSCALE_STATIC_NOMINAL):
 		// in full-window mode scale from the nominal visible area instead of
-		// the full overscan frame, presented at 4:3.
+		// the full overscan frame, presented at 4:3. WinUAE applies these
+		// insets to a fixed nominal drawbuffer; the Amiberry output buffer is
+		// the dynamic visible frame, whose size also changes with doubled
+		// modes (e.g. AmigaOS DBLPAL/DBLNTSC doublescan screens) and overscan.
+		// Scale the insets by the ratio between the actual frame and the
+		// nominal PAL/NTSC frame so the crop stays on the nominal visible
+		// area instead of swallowing the extra doubled/border lines.
 		if (isfullscreen() < 0 && currprefs.gfx_overscanmode < OVERSCANMODE_ULTRA) {
 			const int hs = currprefs.gfx_resolution;
 			const int vs = currprefs.gfx_vresolution;
-			int cx = 28 << hs;
-			int cy = 10 << vs;
-			int cw = w - (40 << hs);
-			int ch = h - (20 << vs);
-			if (currprefs.gfx_overscanmode == OVERSCANMODE_BROADCAST) {
-				cx -= 4 << hs;
-				cy -= 2 << vs;
-				cw += 8 << hs;
-				ch += 4 << vs;
-			} else if (currprefs.gfx_overscanmode == OVERSCANMODE_EXTREME) {
-				cx -= 7 << hs;
-				cy -= 10 << vs;
-				cw += 14 << hs;
-				ch += 20 << vs;
-			}
-			if (cx >= 0 && cy >= 0 && cw > 0 && ch > 0 && cx + cw <= w && cy + ch <= h) {
-				cr = { cx, cy, cw, ch };
-				renderer->crop_aspect = 4.0f / 3.0f;
+			const bool ntsc = vblank_hz > 55.0f;
+			const int nominal_w = AMIGA_WIDTH_MAX << hs;
+			const int nominal_h = (ntsc ? AMIGA_HEIGHT_MAX_NTSC : AMIGA_HEIGHT_MAX_PAL) << vs;
+			if (nominal_w > 0 && nominal_h > 0 && w > 0 && h > 0) {
+				const float sx = static_cast<float>(w) / static_cast<float>(nominal_w);
+				const float sy = static_cast<float>(h) / static_cast<float>(nominal_h);
+				auto inset = [](const int base, const float scale) {
+					return static_cast<int>(base * scale + 0.5f);
+				};
+				int cx = inset(28 << hs, sx);
+				int cy = inset(10 << vs, sy);
+				int cw = w - inset(40 << hs, sx);
+				int ch = h - inset(20 << vs, sy);
+				if (currprefs.gfx_overscanmode == OVERSCANMODE_BROADCAST) {
+					cx -= inset(4 << hs, sx);
+					cy -= inset(2 << vs, sy);
+					cw += inset(8 << hs, sx);
+					ch += inset(4 << vs, sy);
+				} else if (currprefs.gfx_overscanmode == OVERSCANMODE_EXTREME) {
+					cx -= inset(7 << hs, sx);
+					cy -= inset(10 << vs, sy);
+					cw += inset(14 << hs, sx);
+					ch += inset(20 << vs, sy);
+				}
+				if (cx >= 0 && cy >= 0 && cw > 0 && ch > 0 && cx + cw <= w && cy + ch <= h) {
+					cr = { cx, cy, cw, ch };
+					renderer->crop_aspect = 4.0f / 3.0f;
+				}
 			}
 		}
 	}
@@ -1891,7 +2050,15 @@ bool target_graphics_buffer_update(const int monid, const bool force)
 		int host_bpp = SDL_BYTESPERPIXEL(pixel_format);
 
 		if (rtg_render_ptr != nullptr && p96_bpp == host_bpp &&
-			p96_rgbformat_matches_host_pixel_format(state->RGBFormat, pixel_format)) {
+			p96_rgbformat_matches_host_pixel_format(state->RGBFormat, pixel_format) &&
+			p96_screen_fits_board_memory(mon->monitor_id) &&
+			picasso_vidinfo[mon->monitor_id].splitypos < 0 &&
+			!p96_overlay_active()) {
+			// A wrapped (SetPanning past the end of VRAM) or split screen
+			// must go through the copying path: a zero-copy surface is the
+			// board memory itself and cannot wrap or compose rows. Neither
+			// can it show the feature overlay, which is composited into the
+			// copied frame.
 			is_zero_copy_eligible = true;
 		}
 	}
@@ -1918,6 +2085,9 @@ bool target_graphics_buffer_update(const int monid, const bool force)
 	}
 	if (surface_ref && !is_zero_copy_eligible && oldtex_zero_copy[monid]) {
 		recreate_surface = true;
+		// The fresh copying surface starts empty; force the repaint that
+		// fills it (wrapping rows past the end of the board memory).
+		picasso_vidinfo[mon->monitor_id].full_refresh = 1;
 	}
 
 	if (recreate_surface) {
@@ -1928,9 +2098,11 @@ bool target_graphics_buffer_update(const int monid, const bool force)
 		if (is_zero_copy_eligible) {
 			// Zero-Copy: Create surface from existing memory (rtg_render_ptr guaranteed non-null)
 			surface_ref = SDL_CreateSurfaceFrom(w, h, pixel_format, rtg_render_ptr, state->BytesPerRow);
-		} else {
+		} else if (mon->screen_is_picasso) {
 			// Normal copy: Create fresh surface
 			surface_ref = SDL_CreateSurface(w, h, pixel_format);
+		} else {
+			surface_ref = create_native_surface(w, h);
 		}
 
 		if (surface_ref) {
@@ -2002,7 +2174,7 @@ static void updatedisplayarea2(const int monid)
 
 void updatedisplayarea(const int monid)
 {
-	set_custom_limits(-1, -1, -1, -1, false);
+	set_custom_limits(-1, -1, -1, -1);
 	if (monid >= 0) {
 		updatedisplayarea2(monid);
 	} else {
@@ -2194,6 +2366,7 @@ void auto_crop_image()
 {
 	const AmigaMonitor* mon = &AMonitors[0];
 	static bool last_autocrop;
+	static unsigned scan_count;
 
 	if (currprefs.gfx_auto_crop)
 	{
@@ -2257,32 +2430,228 @@ void auto_crop_image()
 			crop_rect = { mapped.x, mapped.y, mapped.w, mapped.h };
 			clamp_auto_crop_rect(surface, crop_rect);
 		} else {
-			const int sprite_horizontal_edges = get_autoscale_sprite_horizontal_edges();
-			int sprite_zero_left = 0;
-			int sprite_zero_right = 0;
-			const int sprite_zero_edges = get_autoscale_sprite_zero_horizontal_edges(
-				&sprite_zero_left, &sprite_zero_right);
-			const AmiberryAutoCropHorizontalEvidence sprite_zero = {
-				sprite_zero_left,
-				sprite_zero_right,
-				(sprite_zero_edges & AUTOSCALE_SPRITE_EDGE_LEFT) != 0,
-				(sprite_zero_edges & AUTOSCALE_SPRITE_EDGE_RIGHT) != 0
-			};
-			clamp_auto_crop_rect(surface, crop_rect);
-			const SDL_Rect source_crop_rect = crop_rect;
-			// DIW/bitplane limits can exclude visible sprites or raster content.
-			// Preserve real pixels outside those limits without restoring the
-			// conservative minimum frame that keeps intentional black borders.
-			// Only a line-doubled interlaced buffer weaves two fields together.
-			const bool interlaced = interlace_seen > 0 && vres > VRES_NONDOUBLE;
-			expand_auto_crop_rect_to_visible_content(surface, crop_rect, interlaced,
-				scan_state);
-			preserve_auto_crop_visible_content(surface, source_crop_rect, crop_rect,
-				hres, vres, scan_state.border,
-				(sprite_horizontal_edges & AUTOSCALE_SPRITE_EDGE_LEFT) != 0,
-				(sprite_horizontal_edges & AUTOSCALE_SPRITE_EDGE_RIGHT) != 0, sprite_zero,
-				visible_state,
-				force_auto_crop || last_autocrop != currprefs.gfx_auto_crop);
+			// The DIW/DDF register window from get_custom_limits() is the
+			// deterministic crop base; the register union already tracks sprite
+			// extents. The content scan's only remaining job is to expand beyond
+			// that base for visible pixels OUTSIDE the display window (raster or
+			// copper border effects the register union cannot see), so it runs on
+			// a duty cycle: immediately when the base or source buffer changes,
+			// when the outside regions change, and every
+			// auto_crop_scan_interval-th frame otherwise. Between scans the last
+			// scan's rect is reused, eliminating the per-frame pixel walk. The
+			// outside regions are sampled on a coarse two-pass grid (see
+			// amiberry_auto_crop_outside_regions_changed) and compared against a
+			// color-agnostic signature from the last observation; any sampled
+			// change triggers an immediate scan. Because the comparison carries
+			// no color semantics, stable sub-threshold specks the last scan
+			// rejected keep matching the signature and stay silent, and newly
+			// appearing content of any color triggers within one frame. A
+			// trigger-initiated scan that leaves the rect unchanged parks the
+			// trigger for auto_crop_trigger_backoff frames, so animated outside
+			// content cannot force a full scan every frame.
+			static SDL_Rect last_scan_rect = { 0, 0, 0, 0 };
+			static SDL_Rect last_scan_base = { 0, 0, 0, 0 };
+			static int last_scan_hres = -1, last_scan_vres = -1;
+			static SDL_Surface* last_scan_surface = nullptr;
+			static int last_scan_surface_w = 0, last_scan_surface_h = 0;
+			static unsigned scan_frame = 0;
+			static int trigger_backoff = 0;
+			static unsigned inside_band_confirmed_mask = 0;
+			bool trigger_scan = false;
+			scan_frame++;
+			const bool scan_context_matches = last_scan_surface == surface
+				&& last_scan_surface_w == surface_w && last_scan_surface_h == surface_h
+				&& last_scan_hres == hres && last_scan_vres == vres
+				&& last_scan_base.x == cx && last_scan_base.y == cy
+				&& last_scan_base.w == cw && last_scan_base.h == ch;
+			if (!scan_context_matches && trigger_backoff > 0) {
+				// A context change forces a scan for the new context; an armed
+				// back-off describes animation in the previous one and must
+				// not suppress change checks here.
+				trigger_backoff = 0;
+			}
+			bool scan_due = !scan_context_matches
+				|| force_auto_crop
+				|| last_autocrop != currprefs.gfx_auto_crop
+				|| (scan_frame % auto_crop_scan_interval) == 0;
+			if (!scan_due && last_scan_rect.w > 0 && last_scan_rect.h > 0) {
+				// The back-off only pauses the change check; the last scan's
+				// rect is still the presented crop on these frames.
+				crop_rect = last_scan_rect;
+				clamp_auto_crop_rect(surface, crop_rect);
+				if (trigger_backoff > 0) {
+					trigger_backoff--;
+				} else {
+					AmiberryAutoCropPixelBuffer outside_buffer;
+					const bool buffer_valid = get_auto_crop_pixel_buffer(
+						surface, outside_buffer);
+					const bool outside_changed = buffer_valid
+						&& amiberry_auto_crop_outside_regions_changed(outside_buffer,
+							{ last_scan_rect.x, last_scan_rect.y,
+								last_scan_rect.w, last_scan_rect.h },
+							scan_state.outside_signature);
+					if (outside_changed) {
+						scan_due = true;
+						trigger_scan = true;
+					} else {
+						// Stale-rect detector: when the held crop is too
+						// large, the perimeter band just inside it turns
+						// border-colored while the real content moved
+						// inward — a change the outside signature cannot
+						// see because it happens inside the rect (e.g. a
+						// settled intro picture after full-surface strobe
+						// shots).
+						// Per-side confirm-then-stay-quiet: a side turning
+						// empty triggers one scan; the scan either shrinks
+						// the rect or confirms that side legitimately shows
+						// border inside the register window, and each side's
+						// confirmation only re-arms when that side gains
+						// content again — an always-border side cannot mask
+						// a transition on another side.
+						bool band_sides_empty[4];
+						if (buffer_valid) {
+							amiberry_auto_crop_inside_band_empty_sides(
+								outside_buffer,
+								{ last_scan_rect.x, last_scan_rect.y,
+									last_scan_rect.w, last_scan_rect.h },
+								scan_state.border, band_sides_empty);
+						} else {
+							band_sides_empty[0] = band_sides_empty[1]
+								= band_sides_empty[2] = band_sides_empty[3] = false;
+						}
+						unsigned empty_mask = 0;
+						for (int i = 0; i < 4; i++) {
+							empty_mask |= static_cast<unsigned>(band_sides_empty[i]) << i;
+						}
+						const unsigned fire_mask = empty_mask & ~inside_band_confirmed_mask;
+						if (fire_mask != 0) {
+							scan_due = true;
+							trigger_scan = true;
+						}
+						inside_band_confirmed_mask = (inside_band_confirmed_mask | fire_mask)
+							& empty_mask;
+					}
+				}
+			}
+			if (scan_due) {
+				const int sprite_horizontal_edges = get_autoscale_sprite_horizontal_edges();
+				int sprite_zero_left = 0;
+				int sprite_zero_right = 0;
+				const int sprite_zero_edges = get_autoscale_sprite_zero_horizontal_edges(
+					&sprite_zero_left, &sprite_zero_right);
+				const AmiberryAutoCropHorizontalEvidence sprite_zero = {
+					sprite_zero_left,
+					sprite_zero_right,
+					(sprite_zero_edges & AUTOSCALE_SPRITE_EDGE_LEFT) != 0,
+					(sprite_zero_edges & AUTOSCALE_SPRITE_EDGE_RIGHT) != 0
+				};
+				clamp_auto_crop_rect(surface, crop_rect);
+				const SDL_Rect source_crop_rect = crop_rect;
+				// DIW/bitplane limits can exclude visible sprites or raster content.
+				// Preserve real pixels outside those limits without restoring the
+				// conservative minimum frame that keeps intentional black borders.
+				// Only a line-doubled interlaced buffer weaves two fields together.
+				const bool interlaced = interlace_seen > 0 && vres > VRES_NONDOUBLE;
+				expand_auto_crop_rect_to_visible_content(surface, crop_rect, interlaced,
+					scan_state);
+				preserve_auto_crop_visible_content(surface, source_crop_rect, crop_rect,
+					hres, vres, scan_state.border,
+					(sprite_horizontal_edges & AUTOSCALE_SPRITE_EDGE_LEFT) != 0,
+					(sprite_horizontal_edges & AUTOSCALE_SPRITE_EDGE_RIGHT) != 0, sprite_zero,
+					visible_state,
+					force_auto_crop || last_autocrop != currprefs.gfx_auto_crop);
+				// A trigger-initiated scan that left the rect unchanged means the
+				// outside content is animated but does not affect the crop: back
+				// off the trigger for a few frames so animated borders cannot
+				// force a full scan every frame. The signature still refreshes
+				// on every checked frame, so genuinely new outside content ends
+				// the backoff at its first check after appearing.
+				if (trigger_scan && auto_crop_rect_equals(last_scan_rect, crop_rect)) {
+					trigger_backoff = auto_crop_trigger_backoff;
+				}
+				last_scan_rect = crop_rect;
+				last_scan_base = { cx, cy, cw, ch };
+				last_scan_hres = hres;
+				last_scan_vres = vres;
+				last_scan_surface = surface;
+				last_scan_surface_w = surface_w;
+				last_scan_surface_h = surface_h;
+				scan_count++;
+
+				// Re-baseline the outside signature against the scan's own
+				// frame and rect. Without this, the first check after a scan
+				// would adopt whatever that frame shows as the baseline
+				// (empty signature on first activation, stale geometry
+				// otherwise), so new outside content appearing between the
+				// scan and the first check would go unnoticed until the
+				// periodic scan.
+				AmiberryAutoCropPixelBuffer scan_buffer;
+				if (get_auto_crop_pixel_buffer(surface, scan_buffer)) {
+					amiberry_auto_crop_outside_regions_changed(scan_buffer,
+						{ last_scan_rect.x, last_scan_rect.y,
+							last_scan_rect.w, last_scan_rect.h },
+						scan_state.outside_signature);
+				}
+			}
+
+			// Shrink hysteresis: software that alternates between a large
+			// effect frame and a smaller picture (Pinball Illusions' intro
+			// strobes full-surface raster shots between intro pictures) makes
+			// consecutive scans produce alternating rects, which presents as
+			// aspect flicker. When a scan result is smaller than the presented
+			// rect while the register base and surface are unchanged, keep
+			// presenting the larger rect until the smaller one has persisted
+			// for auto_crop_shrink_hold_frames consecutive frames. Growth and
+			// any register-base/surface change still apply immediately; only a
+			// fresh scan that reproduces or moves the presented rect clears
+			// the pending shrink — frames that merely reuse the last scan's
+			// small result keep counting toward it.
+			static SDL_Rect presented_rect = { 0, 0, 0, 0 };
+			static SDL_Rect presented_base = { 0, 0, 0, 0 };
+			static SDL_Surface* presented_surface = nullptr;
+			static int presented_surface_w = 0, presented_surface_h = 0;
+			static int presented_hres = -1, presented_vres = -1;
+			static SDL_Rect pending_shrink_rect = { 0, 0, 0, 0 };
+			static int pending_shrink_frames = 0;
+			static bool pending_shrink_valid = false;
+			const bool presented_context_matches = presented_surface == surface
+				&& presented_surface_w == surface_w
+				&& presented_surface_h == surface_h
+				&& presented_hres == hres && presented_vres == vres
+				&& presented_base.x == cx && presented_base.y == cy
+				&& presented_base.w == cw && presented_base.h == ch
+				&& presented_rect.w > 0 && presented_rect.h > 0;
+			if (presented_context_matches
+				&& auto_crop_rect_contains(presented_rect, crop_rect)
+				&& !auto_crop_rect_equals(presented_rect, crop_rect)) {
+				if (pending_shrink_valid
+					&& auto_crop_rect_equals(pending_shrink_rect, crop_rect)) {
+					pending_shrink_frames++;
+				} else {
+					pending_shrink_rect = crop_rect;
+					pending_shrink_frames = 0;
+					pending_shrink_valid = true;
+				}
+				if (pending_shrink_valid) {
+					if (pending_shrink_frames >= auto_crop_shrink_hold_frames) {
+						presented_rect = crop_rect;
+						pending_shrink_valid = false;
+					} else {
+						crop_rect = presented_rect;
+						clamp_auto_crop_rect(surface, crop_rect);
+					}
+				}
+			} else if (scan_due
+				|| !auto_crop_rect_equals(presented_rect, crop_rect)) {
+				presented_rect = crop_rect;
+				presented_base = { cx, cy, cw, ch };
+				presented_surface = surface;
+				presented_surface_w = surface_w;
+				presented_surface_h = surface_h;
+				presented_hres = hres;
+				presented_vres = vres;
+				pending_shrink_valid = false;
+			}
 		}
 		cx = crop_rect.x;
 		cy = crop_rect.y;
@@ -2422,7 +2791,8 @@ void auto_crop_image()
 		renderer->crop_aspect = (height > 0) ? static_cast<float>(width) / static_cast<float>(height) : 0.0f;
 		renderer->crop_display_w = integer_width;
 		renderer->crop_display_h = integer_height;
-		write_log(_T("auto_crop: raw=%dx%d+%d+%d valid=%d provisional=%d final=%dx%d+%d+%d render_res=%d/%d content_res=%d/%d content=%dx%d ntsc=%d (vblank=%.1fHz) => display %dx%d aspect=%.4f\n"),
+		write_log(_T("auto_crop: scans=%u raw=%dx%d+%d+%d valid=%d provisional=%d final=%dx%d+%d+%d render_res=%d/%d content_res=%d/%d content=%dx%d ntsc=%d (vblank=%.1fHz) => display %dx%d aspect=%.4f\n"),
+			scan_count,
 			raw_cw, raw_ch, raw_cx, raw_cy, raw_crop_valid, raw_crop_provisional,
 			cw, ch, cx, cy, hres, vres,
 			content_hres, content_vres, content_width, content_height,
@@ -2582,6 +2952,9 @@ bool amiberry_capture_actionable_screenshot(const int monid,
 	}
 
 	for (int attempt = 0; attempt < 3; ++attempt) {
+		// Zero-copy image mode does not update the Picasso96 span; refresh
+		// it from the live export so the capture shows current pixels.
+		minigl_display_materialize();
 		const auto before = amiberry_gui_geometry_snapshot();
 		SDL_Surface* surface = get_amiga_surface(monid);
 		if (!before.valid || before.monitor_id != monid || !surface
@@ -2636,6 +3009,10 @@ bool create_screenshot()
         current_screenshot = nullptr;
     }
 
+    // Zero-copy image mode does not update the Picasso96 span; refresh it
+    // from the live export so every screenshot path captures current
+    // pixels rather than the last span-backed frame.
+    minigl_display_materialize();
     SDL_Surface* surface = get_amiga_surface(0);
     return gfx_platform_create_screenshot(surface, &current_screenshot);
 }
@@ -2652,25 +3029,27 @@ int save_thumb(const std::string& path)
 	return ret;
 }
 
+bool screenshot_save(int monid, const TCHAR* path)
+{
+	(void)monid;
+	if (!path || !*path || !create_screenshot())
+		return false;
+	return save_thumb(path) != 0;
+}
+
 void screenshot(int monid, int mode, int doprepare)
 {
-	std::string filename;
-
 	if (!create_screenshot())
 	{
 		write_log(_T("Failed to create screenshot\n"));
 		return;
 	}
 
-	if (strlen(currprefs.floppyslots[0].df) > 0)
-		filename = extract_filename(currprefs.floppyslots[0].df);
-	else if (currprefs.cdslots[0].inuse && strlen(currprefs.cdslots[0].name) > 0)
-		filename = extract_filename(currprefs.cdslots[0].name);
-	else
-		filename = "default.uae";
+	std::string name = current_content_name();
+	if (name.empty())
+		name = "default";
 
-	std::string base_path = get_screenshot_path();
-	base_path += remove_file_extension(filename);
+	const std::string base_path = get_screenshot_path() + name;
 
 	screenshot_filename = base_path + ".png";
 

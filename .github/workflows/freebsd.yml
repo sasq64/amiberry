@@ -1,0 +1,149 @@
+name: FreeBSD CI
+
+# The FreeBSD VM builds take long, so they run only for release tags (and
+# by hand), not on master pushes or pull requests.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+      - 'preview-v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-freebsd:
+    name: FreeBSD ${{ matrix.release }} / ${{ matrix.arch }}
+    # The VM action runs both architectures on an x86_64 Linux host.
+    # amd64 is KVM-accelerated on GitHub-hosted runners (~10 min), while
+    # aarch64 uses QEMU TCG and needs ~3.5 h for a full -O3 build.
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.arch == 'aarch64' && 300 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.5', '15.1']
+        arch: [amd64, aarch64]
+    # The VM action caches its VM images through the Actions cache,
+    # which requires actions: write (same grant as the c-cpp.yml jobs).
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build in FreeBSD
+        uses: vmactions/freebsd-vm@8b0f1a8fc0ea0def307835c258940ca358fe6480 # v1.5.6
+        with:
+          release: ${{ matrix.release }}
+          arch: ${{ matrix.arch }}
+          cpu: 4
+          mem: 8192
+          sync: rsync
+          prepare: |
+            set -eu
+            # The VM images use the latest package branch. Release packages
+            # record exact shared-library versions, so build them against
+            # quarterly, the branch a stock FreeBSD install uses.
+            pkg_branch=${{ github.ref_type == 'tag' && 'quarterly' || 'latest' }}
+            if [ "$pkg_branch" = quarterly ]; then
+              for conf in /etc/pkg/*.conf /usr/local/etc/pkg/repos/*.conf; do
+                if [ -f "$conf" ]; then
+                  sed -i '' 's|/latest"|/quarterly"|' "$conf"
+                fi
+              done
+              if pkg -vv | grep -q '/latest"'; then
+                echo "error: a package repository still points at latest" >&2
+                exit 1
+              fi
+              pkg update -f
+            fi
+            pkg install -y \
+              cmake ninja pkgconf git \
+              sdl3 sdl3_image flac mpg123 ffmpeg webp png curl nlohmann-json \
+              libsysinfo libglvnd dbus \
+              libserialport enet portmidi libmpeg2 libpcap zstd \
+              desktop-file-utils shared-mime-info
+          run: |
+            set -eu
+            freebsd-version
+            uname -m
+            cc --version
+            pkg -vv | sed -n '/^Repositories:/,$p'
+
+            # Native optimization (-mcpu=native) runs on 15.1 except for
+            # release tags, whose packages must run on any CPU. Build and
+            # stage outside the synced workspace so the action's copyback
+            # returns only the package, not the build tree.
+            cmake -S . -B /tmp/build-freebsd -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr/local \
+              -DWITH_OPTIMIZE=${{ matrix.release == '15.1' && github.ref_type != 'tag' && 'ON' || 'OFF' }}
+            cmake --build /tmp/build-freebsd --parallel 4
+
+            # Stage through the normal install rules, including CAPSImage and
+            # floppybridge, and package the staged tree.
+            DESTDIR=/tmp/stage-freebsd cmake --install /tmp/build-freebsd
+            pkg_file="amiberry-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-freebsd$(freebsd-version -u | cut -d. -f1)-${{ matrix.arch }}.pkg"
+            sh .github/scripts/freebsd-package.sh /tmp/build-freebsd /tmp/stage-freebsd "$pkg_file"
+
+            # Install the package the way users will, then run it.
+            pkg install -y "./$pkg_file"
+            pkg check -d amiberry
+            amiberry --version
+            pkg delete -y amiberry
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amiberry-freebsd-${{ matrix.release }}-${{ matrix.arch }}
+          path: amiberry-*-freebsd*.pkg
+          if-no-files-found: error
+          retention-days: 7
+
+  attach-release:
+    name: Attach to release
+    needs: build-freebsd
+    if: github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'preview-v'))
+    runs-on: ubuntu-24.04
+    # The script waits up to 120 minutes for c-cpp.yml to publish the release.
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      actions: read
+    # FreeBSD and Haiku attach jobs rewrite the release's SHA256SUMS; the
+    # shared group (concurrency groups are repository-wide) serializes them
+    # so neither drops the other's entries.
+    concurrency:
+      group: release-assets-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: amiberry-freebsd-*
+          path: packages
+          merge-multiple: true
+
+      - name: Attach packages and checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/scripts/attach-release-assets.sh "${{ github.ref_name }}" '[[:space:]]\*?amiberry-.*-freebsd[0-9]+-[[:alnum:]_]+\.pkg$' packages/*.pkg

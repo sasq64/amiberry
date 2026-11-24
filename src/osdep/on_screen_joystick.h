@@ -9,6 +9,10 @@ void on_screen_joystick_init(SDL_Renderer* renderer);
 
 // Clean up textures/surfaces and state.
 void on_screen_joystick_quit();
+// The renderer is destroying a GL context: the textures and shader made in
+// it go with it, so their names are forgotten (the next draw makes them in
+// the context then current).
+void on_screen_joystick_gl_context_destroyed(void* context);
 
 // Render the on-screen joystick controls using SDL renderer.
 // Call during the rendering frame, after the game screen is drawn.
@@ -30,6 +34,10 @@ bool on_screen_joystick_handle_finger_motion(const SDL_Event& event);
 // Query / set enabled state
 bool on_screen_joystick_is_enabled();
 void on_screen_joystick_set_enabled(bool enabled);
+
+// Advance the emulated frame clock before processing host input for that frame.
+// Deferred short-touch releases are delivered on this boundary.
+void on_screen_joystick_advance_frame();
 
 // Release all active touch-control state without changing the enabled setting.
 void on_screen_joystick_release_all();

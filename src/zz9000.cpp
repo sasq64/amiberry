@@ -1,8 +1,8 @@
 /*
- * MNT ZZ9000 RTG emulation
+ * MNT ZZ9000 RTG, Ethernet, and ZZ9000AX audio emulation
  *
  * Implements the register and framebuffer ABI used by the current
- * ZZ9000.card driver and ZZ9000OS 2.7 firmware.  The optional surface
+ * ZZ9000.card driver and ZZ9000OS 2.8 firmware.  The optional surface
  * allocator and packed-YUV video overlay use the same GFXData command
  * interface as the hardware.
  *
@@ -15,13 +15,29 @@
 #include "memory.h"
 #include "picasso96.h"
 #include "gfxboard.h"
+#include "custom.h"
+#include "ethernet.h"
+#include "zz9000_net_protocol.h"
+#include "zz9000_sdk.h"
 #ifdef AMIBERRY
 #include "amiberry_cursor.h"
 #endif
-#include "xwin.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <deque>
+#include <mutex>
+#include <new>
+#include <vector>
+#if defined(AHI) && !defined(LIBRETRO)
+#include <chrono>
+#include <SDL3/SDL.h>
+#include "sounddep/sound.h"
+struct zz_ax_audio_engine;
+#endif
+struct zz9000_net_engine;
+
 
 static constexpr uae_u32 ZZ9000_Z2_SIZE = 0x00400000;
 static constexpr uae_u32 ZZ9000_Z3_SIZE = 0x08000000;
@@ -84,9 +100,30 @@ enum zz9000_register {
 	ZZ_REG_ACC_OP = 0x5c,
 	ZZ_REG_SPLIT_POS = 0x5e,
 	ZZ_REG_SET_FEATURE = 0x60,
+	ZZ_REG_ETH_TX = 0x80,
+	ZZ_REG_ETH_RX = 0x82,
+	ZZ_REG_ETH_MAC_HI = 0x84,
+	ZZ_REG_ETH_MAC_MID = 0x86,
+	ZZ_REG_ETH_MAC_LO = 0x88,
+	ZZ_REG_ETH_RX_STATUS = 0x8c,
+	ZZ_REG_ETH_RX_STATS = 0x8e,
 	ZZ_REG_FW_VERSION = 0xc0,
+	ZZ_REG_FW_CAPABILITIES = 0xe6,
 	ZZ_REG_CONFIG_KEY = 0xe8,
-	ZZ_REG_CONFIG_PRESENT = 0xea
+	ZZ_REG_CONFIG_PRESENT = 0xea,
+	// Raw ZZ9000.CFG access for ZZTop: write 0 resets the handshake to
+	// IDLE, write 1 stages the file; reads return the status and length.
+	ZZ_REG_CONFIG_FILE = 0xec,
+	ZZ_REG_CONFIG_FILE_LEN = 0xee,
+
+	// ZZ9000AX audio (AHI card)
+	ZZ_REG_AUDIO_SWAB = 0x70,
+	ZZ_REG_AUDIO_SCALE = 0x74,
+	ZZ_REG_AUDIO_PARAM = 0x76,
+	ZZ_REG_AUDIO_VAL = 0x78,
+	ZZ_REG_AUDIO_CONFIG = 0xf4,
+	ZZ_REG_AUDIO_RX_STATUS = 0xf6,
+	ZZ_REG_AUDIO_TX_STATUS = 0xf8
 };
 
 enum zz9000_dma_op {
@@ -177,6 +214,9 @@ struct zz9000_state {
 	uae_u32 configured;
 	uae_u32 card_size;
 	uae_u8 *memory;
+	uae_u8 *io_memory;
+	addrbank vram_bank;
+	std::vector<uae_u8> line_buffer;
 	uae_u16 registers[0x808];
 
 	bool enabled;
@@ -188,6 +228,7 @@ struct zz9000_state {
 	bool overlay_feature;
 	bool secondary_palette_feature;
 	uae_u16 config_key;
+	uae_u16 config_file_status = 0xffff; // ZZ_CONFIG_FILE_IDLE
 	bool vblank_read;
 
 	int mode_id;
@@ -197,6 +238,7 @@ struct zz9000_state {
 	int height;
 	uae_u32 pan_offset;
 	uae_u32 pan_width;
+	uae_u32 pan_hi; // PAN_HI half staged for the PAN_LO write that applies it
 	uae_u32 split_offset;
 	int split_position;
 
@@ -229,6 +271,34 @@ struct zz9000_state {
 	int sprite_height;
 	uae_u8 sprite_pixels[32 * 48];
 	uae_u32 sprite_colors[4];
+
+	// ZZ9000AX audio (AHI card): same physical MNT ZZ9000 board as the RTG
+	// model (identical Zorro ConfigDev), so the audio registers and the
+	// TX/RX rings live in this board's register bank and card memory.
+	bool audio_play;
+	bool audio_record;
+	uae_u16 audio_scale;
+	bool audio_collision;
+	uae_u16 audio_tx_seq;
+	uae_u8 audio_tx_read_period;
+	uae_u16 audio_rx_seq;
+	uae_u8 audio_rx_write_period;
+	uae_u32 audio_tx_ring_off;
+	uae_u32 audio_rx_ring_off;
+	bool audio_intreq_pending;
+	// E2E diagnostics: rate-limited logging of unmodified-driver traffic.
+	// audio_log_flags bits: 0 = first 0xF4 probe read, 1 = first 0xF4
+	// setup write, 2 = first INT6 assert, 3 = first 0x04 ISR ack.
+	uae_u32 audio_log_kicks;
+	uae_u32 audio_log_periods;
+	uae_u32 audio_log_flags;
+	uae_u32 audio_cfg_reads;
+	zz9000_net_engine *net;
+	zz9000_sdk::Engine *sdk;
+	bool int2;
+#if defined(AHI) && !defined(LIBRETRO)
+	zz_ax_audio_engine *ax_audio;
+#endif
 };
 
 static zz9000_state *zz9000_boards[MAX_RTG_BOARDS];
@@ -239,19 +309,25 @@ static uae_u32 REGPARAM2 zz9000_bget(uaecptr addr);
 static void REGPARAM2 zz9000_lput(uaecptr addr, uae_u32 value);
 static void REGPARAM2 zz9000_wput(uaecptr addr, uae_u32 value);
 static void REGPARAM2 zz9000_bput(uaecptr addr, uae_u32 value);
-static int REGPARAM2 zz9000_check(uaecptr addr, uae_u32 size);
-static uae_u8 *REGPARAM2 zz9000_xlate(uaecptr addr);
+static int REGPARAM2 zz9000_vram_check(uaecptr addr, uae_u32 size);
+static uae_u8 *REGPARAM2 zz9000_vram_xlate(uaecptr addr);
 
-static addrbank zz9000_bank = {
+static addrbank zz9000_io_bank = {
 	zz9000_lget, zz9000_wget, zz9000_bget,
 	zz9000_lput, zz9000_wput, zz9000_bput,
-	zz9000_xlate, zz9000_check, nullptr, nullptr, _T("ZZ9000"),
+	default_xlate, default_check, nullptr, nullptr, _T("ZZ9000 registers"),
 	zz9000_lget, zz9000_wget,
-	/* ZZ9000 VRAM lives in the board's private allocation, not at its
-	 * natmem address. Force JIT accesses through the bank translation and
-	 * helpers instead of replaying faulting direct accesses. */
-	ABFLAG_IO, S_READ | S_N_ADDR, S_WRITE | S_N_ADDR
+	ABFLAG_IO, S_READ, S_WRITE
 };
+
+static const addrbank zz9000_vram_bank_template = {
+	zz9000_lget, zz9000_wget, zz9000_bget,
+	zz9000_lput, zz9000_wput, zz9000_bput,
+	zz9000_vram_xlate, zz9000_vram_check, nullptr, _T("*"), _T("ZZ9000 VRAM"),
+	zz9000_lget, zz9000_wget,
+	ABFLAG_RAM | ABFLAG_DIRECTACCESS, 0, 0
+};
+
 
 static inline uae_u16 zz_bswap16(uae_u16 value)
 {
@@ -297,9 +373,9 @@ static inline void zz_write_le32(uae_u8 *p, uae_u32 value)
 static uae_u8 *zz_memory_ptr(zz9000_state *data, uae_u32 offset, uae_u32 size = 1)
 {
 	const uae_u64 card_offset = static_cast<uae_u64>(ZZ9000_MEMORY_BASE) + offset;
-	if (card_offset + size > data->card_size)
+	if (!data->memory || card_offset + size > data->card_size)
 		return nullptr;
-	return data->memory + card_offset;
+	return data->memory + offset;
 }
 
 static const uae_u8 *zz_memory_ptr(const zz9000_state *data, uae_u32 offset, uae_u32 size = 1)
@@ -415,29 +491,27 @@ static zz9000_state *zz_find_board(uaecptr addr)
 	return nullptr;
 }
 
-static int REGPARAM2 zz9000_check(uaecptr addr, uae_u32 size)
+static int REGPARAM2 zz9000_vram_check(uaecptr addr, uae_u32 size)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return 0;
 	const uae_u32 offset = addr - data->configured;
 	return offset >= ZZ9000_MEMORY_BASE && offset < data->card_size &&
 		size <= data->card_size - offset;
 }
 
-static uae_u8 *REGPARAM2 zz9000_xlate(uaecptr addr)
+static uae_u8 *REGPARAM2 zz9000_vram_xlate(uaecptr addr)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return default_xlate(addr);
 	const uae_u32 offset = addr - data->configured;
 	if (offset < ZZ9000_MEMORY_BASE || offset >= data->card_size)
 		return default_xlate(addr);
-	/* Callers using a translated pointer bypass the byte/word/long bank
-	 * handlers, so conservatively flag VRAM as changed for display refresh. */
-	data->modified = true;
-	return data->memory + offset;
+	return data->memory + offset - ZZ9000_MEMORY_BASE;
 }
+
 
 static uae_u32 zz_apply_minterm(uae_u32 source, uae_u32 destination, int minterm)
 {
@@ -958,6 +1032,10 @@ static void zz_update_palette(zz9000_state *data, int index, int red, int green,
 	if (!secondary) {
 		picasso96_state[data->monitor_id].CLUT[index] = entry;
 		zz_refresh_host_palette(data);
+		// The card's SDK keeps a shadow of the primary CLUT for
+		// QUERY_PALETTE (0x0205).
+		if (data->sdk)
+			data->sdk->set_palette_entry(index, entry.Red, entry.Green, entry.Blue);
 	}
 	data->modified = true;
 }
@@ -1306,8 +1384,529 @@ static void zz_palette_write_z2(zz9000_state *data, int operation)
 		(data->palette_data >> 8) & 0xff, data->palette_data & 0xff, operation == 19);
 }
 
+static constexpr uae_u32 ZZ_NET_RX_WINDOW = 0x2000;
+static constexpr uae_u32 ZZ_NET_TX_WINDOW = 0x8000;
+static constexpr uae_u32 ZZ_NET_WINDOW_BYTES = 0x2000;
+static constexpr uae_u8 ZZ_NET_DEFAULT_MAC[6] = {0x68, 0x82, 0xf2, 0x00, 0x01, 0x00};
+
+struct zz9000_net_engine {
+    struct packet {
+        int length;
+        std::array<uae_u8, zz9000_net::RxQueue::max_frame> bytes;
+    };
+
+    // Backend callbacks can arrive off the emulation thread. The card RX
+    // window and interrupt state are updated only when hsync drains this queue.
+    std::mutex incoming_mutex;
+    std::deque<packet> incoming;
+    uae_u32 incoming_drops = 0;
+    zz9000_net::RxQueue rx;
+    std::array<uae_u8, ZZ_NET_WINDOW_BYTES> tx{};
+    uae_u8 mac[6] = {};
+    netdriverdata *backend = nullptr;
+    uae_u8 *backend_data = nullptr;
+    int tx_length = 0;
+    uae_u16 tx_status = 0;
+    bool irq_enabled = false;
+    bool irq_pending = false;
+};
+
+bool zz9000_net_board_present(void)
+{
+    for (const auto *board : zz9000_boards) {
+        if (board && board->configured)
+            return true;
+    }
+    return false;
+}
+
+bool zz9000_net_host_active(void)
+{
+    for (const auto *board : zz9000_boards) {
+        if (board && board->configured && board->net && board->net->backend)
+            return true;
+    }
+    return false;
+}
+
+static void zz_card_raise_interrupt(const zz9000_state *data)
+{
+    // PORTS is INT2 (bit 3); EXTER is INT6 (bit 13).
+    INTREQ_0(0x8000 | (data->int2 ? 0x0008 : 0x2000));
+}
+
+static void zz_net_received(void *user, const uae_u8 *bytes, int length)
+{
+    auto *net = static_cast<zz9000_net_engine *>(user);
+    if (!net || !bytes || length < 14 ||
+        length > static_cast<int>(zz9000_net::RxQueue::max_frame))
+        return;
+    std::lock_guard<std::mutex> lock(net->incoming_mutex);
+    if (net->incoming.size() >= zz9000_net::RxQueue::capacity) {
+        ++net->incoming_drops;
+        return;
+    }
+    zz9000_net_engine::packet packet{};
+    packet.length = length;
+    std::copy_n(bytes, length, packet.bytes.begin());
+    net->incoming.push_back(packet);
+}
+
+static int zz_net_transmit(void *user, uae_u8 *bytes, int *length)
+{
+    auto *net = static_cast<zz9000_net_engine *>(user);
+    if (!net || !bytes || !length || net->tx_length <= 0 ||
+        net->tx_length > *length)
+        return 0;
+    std::copy_n(net->tx.begin(), net->tx_length, bytes);
+    *length = net->tx_length;
+    net->tx_length = 0;
+    return 1;
+}
+
+static void zz_net_close(zz9000_net_engine *net)
+{
+    if (!net)
+        return;
+    if (net->backend && net->backend_data)
+        ethernet_close(net->backend, net->backend_data);
+    xfree(net->backend_data);
+    net->backend_data = nullptr;
+    net->backend = nullptr;
+    net->tx_length = 0;
+    std::lock_guard<std::mutex> lock(net->incoming_mutex);
+    net->incoming.clear();
+    net->incoming_drops = 0;
+}
+
+static void zz_net_open(zz9000_state *data, const TCHAR *name)
+{
+    auto *net = data->net;
+    if (!net || !name || !name[0] || !_tcsicmp(name, _T("none")))
+        return;
+    netdriverdata *backend = ethernet_find_driver(name);
+    if (backend) {
+        const int data_length = ethernet_getdatalength(backend);
+        if (data_length > 0) {
+            net->backend_data = xcalloc(uae_u8, data_length);
+            if (net->backend_data) {
+                if (ethernet_open(backend, net->backend_data, net,
+                                  zz_net_received, zz_net_transmit, 0, net->mac)) {
+                    net->backend = backend;
+                    write_log(_T("ZZ9000Net: host backend '%s' open\n"), name);
+                    return;
+                }
+                xfree(net->backend_data);
+                net->backend_data = nullptr;
+            }
+        }
+    }
+    write_log(_T("ZZ9000Net: host backend '%s' unavailable; card disconnected\n"), name);
+}
+
+static void zz_net_tick(zz9000_state *data)
+{
+    auto *net = data->net;
+    if (!net)
+        return;
+    if (net->backend)
+        ethernet_receive_poll(net->backend, net->backend_data);
+    {
+        std::lock_guard<std::mutex> lock(net->incoming_mutex);
+        while (!net->incoming.empty()) {
+            const auto &packet = net->incoming.front();
+            net->rx.enqueue(packet.bytes.data(), packet.length);
+            net->incoming.pop_front();
+        }
+        net->rx.record_drop(net->incoming_drops);
+        net->incoming_drops = 0;
+    }
+    if (net->irq_enabled && net->rx.ready() && !net->irq_pending)
+        net->irq_pending = true;
+    // Exec can clear the shared Paula request after one interrupt server
+    // accepts it. Reassert a second source still pending on the next hsync.
+    if (net->irq_pending || data->audio_intreq_pending)
+        zz_card_raise_interrupt(data);
+}
+
+static void zz_net_reset(zz9000_state *data)
+{
+    auto *net = data->net;
+    if (!net)
+        return;
+    zz_net_close(net);
+    net->rx.reset();
+    net->tx.fill(0);
+    std::copy_n(ZZ_NET_DEFAULT_MAC, 6, net->mac);
+    net->tx_status = 0;
+    net->irq_enabled = false;
+    net->irq_pending = false;
+    zz_net_open(data, currprefs.zz9000net_name);
+}
+
+// ZZ9000AX audio: 8-slot DMA ring in card memory (8 x 3840 bytes).
+// Each slot is 20 ms of 16-bit stereo at 96 kHz. The host is the single
+// producer (capture) / consumer (playback) of the ring; the Amiga-side
+// driver only pokes the kick register and polls the packed status words.
+static constexpr uae_u32 ZZ_AX_PERIOD_BYTES = 3840;
+static constexpr uae_u32 ZZ_AX_PERIODS = 8;
+static constexpr uae_u32 ZZ_AX_RING_BYTES = ZZ_AX_PERIODS * ZZ_AX_PERIOD_BYTES;
+
+// Packed status word: bit 15 = formatter present, bits 12-14 = period
+// index (0..7), bits 0-11 = completed sequence (0..4095).
+static inline uae_u16 zz_ax_status(uae_u8 period, uae_u16 seq)
+{
+	return 0x8000u | static_cast<uae_u16>((period & 0x07u) << 12) | (seq & 0x0fffu);
+}
+
+// The SWAB kick value is the ring byte offset shifted right by 8 bits.
+// A collision means the Amiga-side kick lands inside the host reader's
+// active period, which the firmware reports as an overrun.
+static inline bool zz_ax_collision(const zz9000_state *data, uae_u32 swab_value)
+{
+	const uae_u32 reader = static_cast<uae_u32>(data->audio_tx_read_period) * ZZ_AX_PERIOD_BYTES;
+	const uae_u32 kick = ((swab_value & 0x7fffu) * 256u) % ZZ_AX_RING_BYTES;
+	const uae_u32 d = (reader >= kick) ? (reader - kick) : (ZZ_AX_RING_BYTES - (kick - reader));
+	return d < ZZ_AX_PERIOD_BYTES;
+}
+
+static void zz_ax_clear_interrupt(zz9000_state *data)
+{
+	// Exec clears the shared EXTER line after dispatching its server chain.
+	// Card acknowledgement must only clear this device's pending state.
+	data->audio_intreq_pending = false;
+}
+
+#if defined(AHI) && !defined(LIBRETRO)
+// Card registers, ring memory, and the formatter advance on the emulation
+// thread. This avoids racing guest writes and lets the physical EXTER
+// interrupt number used by the stock driver work without driver changes.
+struct zz_ax_audio_engine {
+    SDL_AudioStream *play_stream = nullptr;
+    SDL_AudioStream *rec_stream = nullptr;
+    std::chrono::steady_clock::time_point next_period;
+    std::chrono::steady_clock::time_point next_play_retry;
+    std::chrono::steady_clock::time_point next_record_retry;
+    uae_u32 rate = 48000;
+    uae_u32 last_peak = 0;
+    bool play_enabled = false;
+    bool record_enabled = false;
+    bool play_paused = false;
+    float play_gain = -1.0f;
+    int soundcard = -1;
+    bool soundcard_default = true;
+    int samplersoundcard = -1;
+};
+
+static constexpr uae_u32 ZZ_AX_MAX_FRAMES = ZZ_AX_PERIOD_BYTES / 4;
+
+static uae_u32 zz_ax_frames(const zz9000_state *data)
+{
+    return data->audio_scale > 0 && data->audio_scale <= ZZ_AX_MAX_FRAMES
+        ? data->audio_scale : ZZ_AX_MAX_FRAMES;
+}
+
+static void zz_ax_swap16(uae_u8 *samples, uae_u32 bytes)
+{
+    for (uae_u32 i = 0; i + 1 < bytes; i += 2)
+        std::swap(samples[i], samples[i + 1]);
+}
+
+static void zz_ax_swap_stereo(uae_u8 *samples, uae_u32 bytes)
+{
+    for (uae_u32 i = 0; i + 3 < bytes; i += 4) {
+        std::swap(samples[i], samples[i + 2]);
+        std::swap(samples[i + 1], samples[i + 3]);
+    }
+}
+
+static void zz_ax_period_pending(zz9000_state *data)
+{
+    if (data->audio_intreq_pending)
+        return;
+    data->audio_intreq_pending = true;
+	// The installed AHI ISR uses the selected PORTS or EXTER line.
+	zz_card_raise_interrupt(data);
+    if (!(data->audio_log_flags & (1u << 2))) {
+        data->audio_log_flags |= 1u << 2;
+        write_log(_T("ZZ9000AX: audio interrupt pending (tx_seq=%u rx_seq=%u)\n"),
+            data->audio_tx_seq, data->audio_rx_seq);
+    }
+}
+
+static void zz_ax_audio_period(zz9000_state *data)
+{
+    zz_ax_audio_engine *eng = data->ax_audio;
+    const uae_u32 bytes = zz_ax_frames(data) * 4;
+    if (data->audio_play) {
+        uae_u8 *slot = data->memory + data->audio_tx_ring_off - ZZ9000_MEMORY_BASE +
+            static_cast<uae_u32>(data->audio_tx_read_period) * ZZ_AX_PERIOD_BYTES;
+        if (eng->play_stream && !eng->play_paused &&
+            SDL_GetAudioStreamQueued(eng->play_stream) < static_cast<int>(bytes * ZZ_AX_PERIODS)) {
+            if (currprefs.sound_stereo_swap_ahi) {
+                uae_u8 samples[ZZ_AX_PERIOD_BYTES];
+                memcpy(samples, slot, bytes);
+                zz_ax_swap_stereo(samples, bytes);
+                SDL_PutAudioStreamData(eng->play_stream, samples, static_cast<int>(bytes));
+            } else {
+                SDL_PutAudioStreamData(eng->play_stream, slot, static_cast<int>(bytes));
+            }
+        }
+        uae_u32 peak = 0;
+        for (uae_u32 i = 0; i + 1 < bytes; i += 2) {
+            const uae_u32 sample = (slot[i + 1] << 8) | slot[i];
+            peak = std::max(peak, (sample & 0x8000) ? 0x10000u - sample : sample);
+        }
+        eng->last_peak = peak;
+        data->audio_tx_seq = (data->audio_tx_seq + 1) & 0x0fff;
+        // TX status names the period that just finished, which the driver
+        // can refill. The next read period is advanced only afterward.
+        data->audio_tx_read_period = (data->audio_tx_read_period + 1) % ZZ_AX_PERIODS;
+        zz_ax_period_pending(data);
+    }
+    if (data->audio_record) {
+        uae_u8 samples[ZZ_AX_PERIOD_BYTES] = {};
+        if (eng->rec_stream) {
+            const int period_bytes = static_cast<int>(bytes);
+            const int available = SDL_GetAudioStreamAvailable(eng->rec_stream);
+            // A short scheduling delay is harmless. After a longer stall,
+            // discard old input so the guest receives the latest period.
+            if (available > period_bytes * 3) {
+                int stale_bytes = (available - period_bytes) & ~3;
+                while (stale_bytes > 0) {
+                    const int count = std::min(stale_bytes, static_cast<int>(sizeof samples));
+                    const int read = SDL_GetAudioStreamData(eng->rec_stream, samples, count);
+                    if (read <= 0)
+                        break;
+                    stale_bytes -= read;
+                }
+                memset(samples, 0, bytes);
+            }
+            SDL_GetAudioStreamData(eng->rec_stream, samples, period_bytes);
+        }
+        if (currprefs.sound_stereo_swap_ahi)
+            zz_ax_swap_stereo(samples, bytes);
+        const uae_u32 filled =
+            (static_cast<uae_u32>(data->audio_rx_write_period) + 1) % ZZ_AX_PERIODS;
+        uae_u8 *slot = data->memory + data->audio_rx_ring_off - ZZ9000_MEMORY_BASE + filled * ZZ_AX_PERIOD_BYTES;
+        memcpy(slot, samples, bytes);
+        zz_ax_swap16(slot, bytes);
+        data->audio_rx_write_period = static_cast<uae_u8>(filled);
+        data->audio_rx_seq = (data->audio_rx_seq + 1) & 0x0fff;
+        zz_ax_period_pending(data);
+    }
+    if (data->audio_log_periods == 0 || data->audio_log_periods % 250 == 0)
+        write_log(_T("ZZ9000AX: period %u tx_seq=%u rx_seq=%u peak=%u pending=%d\n"),
+            data->audio_log_periods, data->audio_tx_seq, data->audio_rx_seq,
+            eng->last_peak, data->audio_intreq_pending ? 1 : 0);
+    data->audio_log_periods++;
+}
+
+static void zz_ax_audio_close(zz9000_state *data)
+{
+    auto *eng = data->ax_audio;
+    if (!eng)
+        return;
+    if (eng->play_stream) {
+        SDL_DestroyAudioStream(eng->play_stream);
+        eng->play_stream = nullptr;
+    }
+    if (eng->rec_stream) {
+        SDL_DestroyAudioStream(eng->rec_stream);
+        eng->rec_stream = nullptr;
+    }
+    eng->play_paused = false;
+    eng->play_gain = -1.0f;
+}
+
+static void zz_ax_audio_start(zz9000_state *data)
+{
+    if (!data->ax_audio)
+        data->ax_audio = new zz_ax_audio_engine();
+    auto *eng = data->ax_audio;
+    const uae_u32 rate = zz_ax_frames(data) * 50;
+    const auto now = std::chrono::steady_clock::now();
+    const bool play_enabled = data->audio_play && currprefs.produce_sound >= 2;
+    const bool starting = eng->next_period == std::chrono::steady_clock::time_point{};
+    const bool rate_changed = eng->rate != rate;
+    const bool play_changed = starting || rate_changed || eng->play_enabled != play_enabled ||
+        (play_enabled && (eng->soundcard != currprefs.soundcard ||
+            eng->soundcard_default != currprefs.soundcard_default ||
+            (!eng->play_stream && now >= eng->next_play_retry)));
+    const bool record_enabled = data->audio_record && currprefs.samplersoundcard >= 0;
+    const bool record_changed = starting || rate_changed || eng->record_enabled != record_enabled ||
+        (record_enabled && (eng->samplersoundcard != currprefs.samplersoundcard ||
+            (!eng->rec_stream && now >= eng->next_record_retry)));
+    if (!play_changed && !record_changed)
+        return;
+    if (play_changed && eng->play_stream) {
+        SDL_DestroyAudioStream(eng->play_stream);
+        eng->play_stream = nullptr;
+        eng->play_paused = false;
+    }
+    if (record_changed && eng->rec_stream) {
+        SDL_DestroyAudioStream(eng->rec_stream);
+        eng->rec_stream = nullptr;
+    }
+    eng->rate = rate;
+    eng->play_enabled = play_enabled;
+    eng->record_enabled = record_enabled;
+    eng->soundcard = currprefs.soundcard;
+    eng->soundcard_default = currprefs.soundcard_default;
+    eng->samplersoundcard = currprefs.samplersoundcard;
+    SDL_AudioSpec spec = {};
+    spec.format = SDL_AUDIO_S16LE;
+    spec.channels = 2;
+    spec.freq = static_cast<int>(rate);
+    if ((play_changed && play_enabled) || (record_changed && record_enabled))
+        enumerate_sound_devices();
+    if (play_changed && play_enabled) {
+        const int soundcard = currprefs.soundcard;
+        const bool use_default_device = currprefs.soundcard_default || soundcard < 0 ||
+            soundcard >= MAX_SOUND_DEVICES || sound_devices[soundcard] == nullptr;
+        const SDL_AudioDeviceID device_id = use_default_device
+            ? SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK
+            : static_cast<SDL_AudioDeviceID>(sound_devices[soundcard]->id);
+        eng->play_stream = SDL_OpenAudioDeviceStream(
+            device_id, &spec, nullptr, nullptr);
+        if (!eng->play_stream && !use_default_device) {
+            write_log(_T("ZZ9000AX: selected playback device open failed, retrying default: %s\n"), SDL_GetError());
+            eng->play_stream = SDL_OpenAudioDeviceStream(
+                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        }
+        if (eng->play_stream) {
+            eng->next_play_retry = {};
+            eng->play_paused = sound_paused();
+            eng->play_gain = -1.0f;
+            if (!eng->play_paused)
+                SDL_ResumeAudioStreamDevice(eng->play_stream);
+        } else {
+            eng->next_play_retry = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            write_log(_T("ZZ9000AX: playback device open failed: %s\n"), SDL_GetError());
+        }
+    }
+    if (record_changed && record_enabled) {
+        const int soundcard = currprefs.samplersoundcard;
+        const bool use_default_device = soundcard >= MAX_SOUND_DEVICES ||
+            record_devices[soundcard] == nullptr;
+        const SDL_AudioDeviceID device_id = use_default_device
+            ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING
+            : static_cast<SDL_AudioDeviceID>(record_devices[soundcard]->id);
+        eng->rec_stream = SDL_OpenAudioDeviceStream(
+            device_id, &spec, nullptr, nullptr);
+        if (!eng->rec_stream && !use_default_device) {
+            write_log(_T("ZZ9000AX: selected recording device open failed, retrying default: %s\n"), SDL_GetError());
+            eng->rec_stream = SDL_OpenAudioDeviceStream(
+                SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, nullptr, nullptr);
+        }
+        if (eng->rec_stream) {
+            eng->next_record_retry = {};
+            SDL_ResumeAudioStreamDevice(eng->rec_stream);
+        } else {
+            eng->next_record_retry = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            write_log(_T("ZZ9000AX: recording device open failed: %s\n"), SDL_GetError());
+        }
+    }
+    if (starting)
+        eng->next_period = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+    write_log(_T("ZZ9000AX audio: %u Hz, play=%d record=%d\n"), rate,
+        data->audio_play ? 1 : 0, data->audio_record ? 1 : 0);
+}
+
+static void zz_ax_audio_stop(zz9000_state *data)
+{
+    zz_ax_audio_close(data);
+    if (data->ax_audio)
+        data->ax_audio->next_period = {};
+}
+
+static void zz_ax_audio_tick(zz9000_state *data)
+{
+    auto *eng = data->ax_audio;
+    if (!data->memory || !eng || (!data->audio_play && !data->audio_record))
+        return;
+    zz_ax_audio_start(data);
+    if (eng->play_stream) {
+        const float master_gain = (100 - std::clamp(currprefs.sound_volume_master, 0, 100)) / 100.0f;
+        const float board_gain = (100 - std::clamp(currprefs.sound_volume_board, 0, 100)) / 100.0f;
+        const float gain = sound_muted() ? 0.0f : master_gain * board_gain;
+        if (gain != eng->play_gain && SDL_SetAudioStreamGain(eng->play_stream, gain))
+            eng->play_gain = gain;
+    }
+    const bool paused = sound_paused();
+    if (eng->play_stream && eng->play_paused != paused) {
+        if (paused)
+            SDL_PauseAudioStreamDevice(eng->play_stream);
+        SDL_ClearAudioStream(eng->play_stream);
+        eng->play_paused = paused;
+        if (!paused)
+            SDL_ResumeAudioStreamDevice(eng->play_stream);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < eng->next_period)
+        return;
+    eng->next_period += std::chrono::milliseconds(20);
+    if (eng->next_period < now) {
+        eng->next_period = now + std::chrono::milliseconds(20);
+        // A full emulator pause stops hsync, so discard any host audio that
+        // was queued before the pause when emulation resumes.
+        if (eng->play_stream)
+            SDL_ClearAudioStream(eng->play_stream);
+    }
+    zz_ax_audio_period(data);
+}
+#endif
+
+static void zz_sdk_update_framebuffer(zz9000_state *data)
+{
+	if (!data->sdk)
+		return;
+	// As the card's color_mode_surface_format(): an 8-bit CLUT screen is the
+	// INDEX8 surface (4), not UNKNOWN — CLUT8 console clients key on it.
+	const uae_u32 format = data->color_mode == ZZ_COLOR_BGRA32 ? 7 :
+		data->color_mode == ZZ_COLOR_RGB565 ? 1 :
+		data->color_mode == ZZ_COLOR_RGB555 ? 6 :
+		data->color_mode == ZZ_COLOR_CLUT ? 4 : 0;
+	const uae_u32 bpp = zz_bytes_per_pixel(data->color_mode);
+	// RTG offsets are relative to VRAM, which starts after the register aperture.
+	const uae_u32 framebuffer_offset = data->pan_offset <=
+		data->card_size - ZZ9000_MEMORY_BASE ?
+		ZZ9000_MEMORY_BASE + data->pan_offset : data->card_size;
+	data->sdk->set_framebuffer(framebuffer_offset,
+		data->width > 0 ? data->width : 0,
+		data->height > 0 ? data->height : 0,
+		data->pan_width * bpp, format);
+	const auto &overlay = data->overlay;
+	const uae_u32 overlay_offset = overlay.source_offset <=
+		data->card_size - ZZ9000_MEMORY_BASE ?
+		ZZ9000_MEMORY_BASE + overlay.source_offset : data->card_size;
+	// Full presentation-path facts for media status page 4: the PIP's
+	// destination rect and the screen mode it was configured against. A
+	// mode-stale overlay is not presenting, exactly as on the card.
+	zz9000_sdk::Engine::OverlayGeometry overlay_geometry;
+	overlay_geometry.dst_x = overlay.destination_x;
+	overlay_geometry.dst_y = overlay.destination_y;
+	overlay_geometry.dst_w = overlay.destination_width;
+	overlay_geometry.dst_h = overlay.destination_height;
+	overlay_geometry.screen_w = static_cast<uint32_t>(std::max(0, data->width));
+	overlay_geometry.screen_h = static_cast<uint32_t>(std::max(0, data->height));
+	data->sdk->set_overlay(overlay_offset, overlay.source_width,
+		overlay.source_height, overlay.source_pitch, overlay.variant,
+		overlay.configured,
+		overlay.configured && overlay.active && !overlay.mode_stale,
+		overlay_geometry);
+}
+
 static void zz_write_register(zz9000_state *data, uae_u32 offset, uae_u16 value)
 {
+	if (data->sdk && ((offset >= 0x100 && offset <= 0x10c) ||
+	                  (offset >= 0x1108 && offset <= 0x110c) ||
+	                  (offset >= 0x111c && offset <= 0x111e))) {
+		zz_sdk_update_framebuffer(data);
+		if (data->sdk->write_register(offset >= 0x1000 ? offset - 0x1000 : offset, value))
+			data->modified = true;
+		return;
+	}
 	if (offset / 2 < sizeof data->registers / sizeof data->registers[0])
 		data->registers[offset / 2] = value;
 
@@ -1359,10 +1958,14 @@ static void zz_write_register(zz9000_state *data, uae_u32 offset, uae_u16 value)
 				(static_cast<uae_u32>(zz_bswap16(value)) << 16);
 			break;
 		case ZZ_REG_PAN_HI:
-			data->pan_offset = (data->pan_offset & 0xffff) | (static_cast<uae_u32>(value) << 16);
+			data->pan_hi = static_cast<uae_u32>(value) << 16;
 			break;
 		case ZZ_REG_PAN_LO: {
-			const uae_u32 base = (data->pan_offset & 0xffff0000) | value;
+			const uae_u32 base = data->pan_hi | value;
+			// SetSwitch(native) still writes the old fixed capture area. As in
+			// firmware 2.9, ignore it so the RTG pan survives the switch.
+			if (base == 0x00e00000 || base == 0x00dff2f8)
+				break;
 			zz_set_pan(data, base, static_cast<int16_t>(data->x[0]),
 				static_cast<int16_t>(data->y[0]), data->x[1], data->blit_color_mode);
 			data->sprite_x_offset = static_cast<int16_t>(data->x[0]);
@@ -1464,6 +2067,45 @@ static void zz_write_register(zz9000_state *data, uae_u32 offset, uae_u16 value)
 		case ZZ_REG_CONFIG_KEY:
 			data->config_key = value;
 			break;
+		case ZZ_REG_CONFIG_FILE:
+			// As the firmware's REG_ZZ_CONFIG_FILE: 0 resets to IDLE, 1
+			// stages ZZ9000.CFG from the SD card. An emulated card has no
+			// SD card, so a read finds no file (ZZ_CONFIG_FILE_NO_FILE).
+			if (value == 0)
+				data->config_file_status = 0xffff;
+			else if (value == 1)
+				data->config_file_status = 1;
+			break;
+		case ZZ_REG_ETH_TX:
+			if (data->net) {
+				auto *net = data->net;
+				net->tx_status = 1;
+				if (value >= 14 && value <= zz9000_net::RxQueue::max_frame &&
+				    net->backend) {
+					net->tx_length = value;
+					ethernet_trigger(net->backend, net->backend_data);
+					net->tx_status = net->tx_length == 0 ? 0 : 2;
+					net->tx_length = 0;
+				}
+			}
+			break;
+		case ZZ_REG_ETH_RX:
+			if (data->net)
+				data->net->rx.accept(value);
+			break;
+		case ZZ_REG_ETH_MAC_HI:
+		case ZZ_REG_ETH_MAC_MID:
+		case ZZ_REG_ETH_MAC_LO:
+			if (data->net) {
+				const int index = (offset - ZZ_REG_ETH_MAC_HI) / 2 * 2;
+				data->net->mac[index] = static_cast<uae_u8>(value >> 8);
+				data->net->mac[index + 1] = static_cast<uae_u8>(value);
+				if (offset == ZZ_REG_ETH_MAC_LO && data->net->backend) {
+					zz_net_close(data->net);
+					zz_net_open(data, currprefs.zz9000net_name);
+				}
+			}
+			break;
 		case 0x1000:
 			data->palette_data = (data->palette_data & 0xffff) |
 				(static_cast<uae_u32>(value) << 16);
@@ -1483,6 +2125,72 @@ static void zz_write_register(zz9000_state *data, uae_u32 offset, uae_u16 value)
 			data->split_position = static_cast<int16_t>(value);
 			data->modified = true;
 			break;
+		case ZZ_REG_AUDIO_SWAB:
+			data->audio_collision = zz_ax_collision(data, value);
+			// Firmware converts the newly submitted guest period at the kick,
+			// not when the formatter later reads it. A silent/stale slot must
+			// never be byte-swapped a second time on the next ring revolution.
+#if defined(AHI) && !defined(LIBRETRO)
+			if (!(value & 0x8000)) {
+				const uae_u32 slot_offset = ((value & 0x7fffu) * 256u) % ZZ_AX_RING_BYTES;
+				if (slot_offset + zz_ax_frames(data) * 4 <= ZZ_AX_RING_BYTES)
+					zz_ax_swap16(data->memory + data->audio_tx_ring_off - ZZ9000_MEMORY_BASE + slot_offset,
+						zz_ax_frames(data) * 4);
+			}
+#endif
+			if (data->audio_log_kicks == 0)
+				write_log(_T("ZZ9000AX: first SWAB kick 0x%04x\n"), value);
+			else if (data->audio_log_kicks % 250 == 0)
+				write_log(_T("ZZ9000AX: SWAB kick 0x%04x (tx_seq=%u)\n"),
+					value, data->audio_tx_seq);
+			data->audio_log_kicks++;
+			break;
+		case ZZ_REG_AUDIO_SCALE:
+			data->audio_scale = value;
+#if defined(AHI) && !defined(LIBRETRO)
+			if (data->audio_play || data->audio_record)
+				zz_ax_audio_start(data);
+#endif
+			break;
+		case ZZ_REG_AUDIO_CONFIG:
+			data->audio_play = (value & 1) != 0;
+			data->audio_record = (value & 2) != 0;
+			if (!(data->audio_log_flags & (1u << 1))) {
+				data->audio_log_flags |= 1u << 1;
+				write_log(_T("ZZ9000AX: intreq mask 0x%04x (play=%d rec=%d)\n"),
+					value, data->audio_play ? 1 : 0, data->audio_record ? 1 : 0);
+			}
+#if defined(AHI) && !defined(LIBRETRO)
+			if (data->audio_play || data->audio_record) {
+				zz_ax_audio_start(data);
+			} else {
+				// Stop: clear a still-pending card latch (a period may
+				// have gone pending without an 0x04 acknowledgement).
+				zz_ax_clear_interrupt(data);
+				zz_ax_audio_stop(data);
+			}
+#endif
+			break;
+		case ZZ_REG_CONFIG:
+			// Bit 3 selects ack mode. Bits 4 and 5 independently
+			// acknowledge Ethernet and audio on the shared IRQ line.
+			if (value & 8) {
+				if ((value & 16) && data->net)
+					data->net->irq_pending = false;
+				if (value & 32) {
+					if (data->audio_intreq_pending &&
+					    !(data->audio_log_flags & (1u << 3))) {
+						data->audio_log_flags |= 1u << 3;
+						write_log(_T("ZZ9000AX: interrupt acked via 0x04 write 0x%04x\n"), value);
+					}
+					zz_ax_clear_interrupt(data);
+				}
+			} else if (!(value & 128) && data->net) {
+				data->net->irq_enabled = (value & 1) != 0;
+				if (!data->net->irq_enabled)
+					data->net->irq_pending = false;
+			}
+			break;
 		default:
 			break;
 	}
@@ -1490,19 +2198,82 @@ static void zz_write_register(zz9000_state *data, uae_u32 offset, uae_u16 value)
 
 static uae_u16 zz_read_register(zz9000_state *data, uae_u32 offset)
 {
+	if (data->sdk && ((offset >= 0x100 && offset <= 0x10c) ||
+	                  (offset >= 0x111c && offset <= 0x111e)))
+		return data->sdk->read_register(offset >= 0x1000 ? offset - 0x1000 : offset);
 	switch (offset) {
 		case ZZ_REG_FW_VERSION:
-			return 0x0207;
+			/* ZZ9000.card 2.14 (2.9.1 kit) refuses firmware below 2.9.
+			 * The 2.9 drivers gate nothing else on the version. */
+			return 0x0209;
+		case ZZ_REG_FW_CAPABILITIES:
+			/* No capability bits: custom P96 modelines, Z2 aperture
+			 * negotiation, the VCAP centered-1080p / live-calibration
+			 * stack and firmware modules are not emulated, so the card
+			 * driver and ZZTop stay on the legacy paths this emulation
+			 * backs. */
+			return 0;
+		case ZZ_REG_ETH_TX:
+			return data->net ? data->net->tx_status : 1;
+		case ZZ_REG_ETH_MAC_HI:
+		case ZZ_REG_ETH_MAC_MID:
+		case ZZ_REG_ETH_MAC_LO:
+			if (data->net) {
+				const int index = (offset - ZZ_REG_ETH_MAC_HI) / 2 * 2;
+				return (data->net->mac[index] << 8) | data->net->mac[index + 1];
+			}
+			return 0;
+		case ZZ_REG_ETH_RX_STATUS:
+			return data->net ? static_cast<uae_u16>(
+				(data->net->rx.ready() >= zz9000_net::RxQueue::capacity ? 0x8000 : 0) |
+				std::min<size_t>(data->net->rx.ready(), 255)) : 0;
+		case ZZ_REG_ETH_RX_STATS:
+			return data->net ? static_cast<uae_u16>(
+				std::min<uae_u32>(data->net->rx.dropped(), 255) << 8) : 0;
 		case ZZ_REG_VBLANK:
 			data->vblank_read = !data->vblank_read;
 			return data->vblank_read ? 1 : 0;
 		case ZZ_REG_CONFIG_KEY:
-			if (data->config_key == 9 || data->config_key == 10 || data->config_key == 11)
-				return 1;
-			return 0;
 		case ZZ_REG_CONFIG_PRESENT:
-			return data->config_key == 9 || data->config_key == 10 ||
-				data->config_key == 11 ? 1 : 0;
+			// Key 10 (yuv_rect) is reserved and reads absent, as in the
+			// firmware's zz_config_query().
+			return (data->config_key == 5 && data->int2) ||
+				data->config_key == 9 || data->config_key == 11 ? 1 : 0;
+		case ZZ_REG_CONFIG_FILE:
+			return data->config_file_status;
+		case ZZ_REG_CONFIG_FILE_LEN:
+			return 0;
+		case ZZ_REG_AUDIO_CONFIG:
+			// Libretro's SDL audio stream stub does not deliver AX samples
+			// to its frontend; do not advertise a silent card there.
+#if defined(AHI) && !defined(LIBRETRO)
+			// bit 0 = AX present, bit 1 = TX status capable
+			if (!(data->audio_log_flags & 1u)) {
+				data->audio_log_flags |= 1u;
+				write_log(_T("ZZ9000AX: probed (0xF4 read)\n"));
+			}
+			return 0x3;
+#else
+			return 0;
+#endif
+		case ZZ_REG_AUDIO_RX_STATUS:
+			return zz_ax_status(data->audio_rx_write_period, data->audio_rx_seq);
+		case ZZ_REG_AUDIO_TX_STATUS:
+			return zz_ax_status((data->audio_tx_read_period + ZZ_AX_PERIODS - 1) % ZZ_AX_PERIODS,
+				data->audio_tx_seq);
+		case ZZ_REG_AUDIO_SWAB:
+			return data->audio_collision ? 1 : 0;
+		case ZZ_REG_CONFIG:
+			// Ethernet uses bit 0; AX audio uses bit 1. RTG does not
+			// use this interrupt register.
+			data->audio_cfg_reads++;
+			if (data->audio_cfg_reads % 500 == 1)
+				write_log(_T("ZZ9000: 0x04 read=%u (n=%u)\n"),
+					(data->audio_intreq_pending ? 2 : 0) |
+					(data->net && data->net->irq_pending ? 1 : 0),
+					data->audio_cfg_reads);
+			return (data->audio_intreq_pending ? 2 : 0) |
+				(data->net && data->net->irq_pending ? 1 : 0);
 		default:
 			if (offset / 2 < sizeof data->registers / sizeof data->registers[0])
 				return data->registers[offset / 2];
@@ -1513,13 +2284,20 @@ static uae_u16 zz_read_register(zz9000_state *data, uae_u32 offset)
 static uae_u32 REGPARAM2 zz9000_wget(uaecptr addr)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return 0;
 	const uae_u32 offset = addr - data->configured;
+	if (data->net && offset >= ZZ_NET_RX_WINDOW && offset + 1 < 0x6000)
+		return (data->net->rx.read(offset - ZZ_NET_RX_WINDOW) << 8) |
+			data->net->rx.read(offset + 1 - ZZ_NET_RX_WINDOW);
+	if (data->net && offset >= ZZ_NET_TX_WINDOW && offset + 1 < ZZ_NET_TX_WINDOW + ZZ_NET_WINDOW_BYTES)
+		return (data->net->tx[offset - ZZ_NET_TX_WINDOW] << 8) |
+			data->net->tx[offset + 1 - ZZ_NET_TX_WINDOW];
 	if (offset >= ZZ9000_MEMORY_BASE) {
-		if (offset + 1 >= data->card_size)
+		if (!data->memory || offset + 1 >= data->card_size)
 			return 0;
-		return (data->memory[offset] << 8) | data->memory[offset + 1];
+		return (data->memory[offset - ZZ9000_MEMORY_BASE] << 8) |
+			data->memory[offset + 1 - ZZ9000_MEMORY_BASE];
 	}
 	return zz_read_register(data, offset & ~1U);
 }
@@ -1527,11 +2305,15 @@ static uae_u32 REGPARAM2 zz9000_wget(uaecptr addr)
 static uae_u32 REGPARAM2 zz9000_bget(uaecptr addr)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return 0;
 	const uae_u32 offset = addr - data->configured;
+	if (data->net && offset >= ZZ_NET_RX_WINDOW && offset < 0x6000)
+		return data->net->rx.read(offset - ZZ_NET_RX_WINDOW);
+	if (data->net && offset >= ZZ_NET_TX_WINDOW && offset < ZZ_NET_TX_WINDOW + ZZ_NET_WINDOW_BYTES)
+		return data->net->tx[offset - ZZ_NET_TX_WINDOW];
 	if (offset >= ZZ9000_MEMORY_BASE)
-		return offset < data->card_size ? data->memory[offset] : 0;
+		return data->memory && offset < data->card_size ? data->memory[offset - ZZ9000_MEMORY_BASE] : 0;
 	const uae_u16 value = zz_read_register(data, offset & ~1U);
 	return (offset & 1) ? value & 0xff : value >> 8;
 }
@@ -1544,14 +2326,21 @@ static uae_u32 REGPARAM2 zz9000_lget(uaecptr addr)
 static void REGPARAM2 zz9000_wput(uaecptr addr, uae_u32 value)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return;
 	const uae_u32 offset = addr - data->configured;
+	if (offset >= ZZ_NET_RX_WINDOW && offset < 0x6000)
+		return;
+	if (data->net && offset >= ZZ_NET_TX_WINDOW && offset + 1 < ZZ_NET_TX_WINDOW + ZZ_NET_WINDOW_BYTES) {
+		data->net->tx[offset - ZZ_NET_TX_WINDOW] = static_cast<uae_u8>(value >> 8);
+		data->net->tx[offset + 1 - ZZ_NET_TX_WINDOW] = static_cast<uae_u8>(value);
+		return;
+	}
 	if (offset >= ZZ9000_MEMORY_BASE) {
-		if (offset + 1 >= data->card_size)
+		if (!data->memory || offset + 1 >= data->card_size)
 			return;
-		data->memory[offset] = static_cast<uae_u8>(value >> 8);
-		data->memory[offset + 1] = static_cast<uae_u8>(value);
+		data->memory[offset - ZZ9000_MEMORY_BASE] = static_cast<uae_u8>(value >> 8);
+		data->memory[offset + 1 - ZZ9000_MEMORY_BASE] = static_cast<uae_u8>(value);
 		data->modified = true;
 		return;
 	}
@@ -1561,13 +2350,19 @@ static void REGPARAM2 zz9000_wput(uaecptr addr, uae_u32 value)
 static void REGPARAM2 zz9000_bput(uaecptr addr, uae_u32 value)
 {
 	zz9000_state *data = zz_find_board(addr);
-	if (!data)
+	if (!data || !data->memory)
 		return;
 	const uae_u32 offset = addr - data->configured;
+	if (offset >= ZZ_NET_RX_WINDOW && offset < 0x6000)
+		return;
+	if (data->net && offset >= ZZ_NET_TX_WINDOW && offset < ZZ_NET_TX_WINDOW + ZZ_NET_WINDOW_BYTES) {
+		data->net->tx[offset - ZZ_NET_TX_WINDOW] = static_cast<uae_u8>(value);
+		return;
+	}
 	if (offset >= ZZ9000_MEMORY_BASE) {
-		if (offset >= data->card_size)
+		if (!data->memory || offset >= data->card_size)
 			return;
-		data->memory[offset] = static_cast<uae_u8>(value);
+		data->memory[offset - ZZ9000_MEMORY_BASE] = static_cast<uae_u8>(value);
 		data->modified = true;
 		return;
 	}
@@ -1689,7 +2484,7 @@ static void zz_composite_sprite_row(zz9000_state *data, uae_u8 *row, int screen_
 static bool zz9000_vsync(void *userdata, gfxboard_mode *mode)
 {
 	auto *data = static_cast<zz9000_state *>(userdata);
-	if (!data->visible || data->capture_mode || !data->width || !data->height)
+	if (!data->memory || !data->visible || data->capture_mode || !data->width || !data->height)
 		return false;
 	const int bpp = zz_bytes_per_pixel(data->color_mode);
 	const RGBFTYPE rgb_format = zz_rgb_format(data->color_mode);
@@ -1722,46 +2517,44 @@ static bool zz9000_vsync(void *userdata, gfxboard_mode *mode)
 	uae_u8 *surface = gfx_lock_picasso(data->monitor_id, false);
 	if (!surface)
 		return false;
-	if (data->modified || data->mode_changed || mode->redraw_required) {
-		const size_t line_size = static_cast<size_t>(data->width) * bpp;
-		uae_u8 *line = xmalloc(uae_u8, line_size);
-		if (line) {
-			const uae_u32 source_pitch = data->pan_width * bpp;
-			bool secondary_palette_active = false;
-			for (int y = 0; y < data->height; ++y) {
-				const bool split = data->split_position > 0 && y >= data->split_position;
-				const uae_u32 source_base = split ? data->split_offset : data->pan_offset;
-				const int source_y = split ? y - data->split_position : y;
-				if (split && data->secondary_palette_feature && !secondary_palette_active &&
-					data->color_mode == ZZ_COLOR_CLUT) {
-					zz_activate_palette(data, data->secondary_palette);
-					secondary_palette_active = true;
-				}
-				const uae_u8 *source = zz_memory_ptr(data, source_base + source_y * source_pitch,
-					static_cast<uae_u32>(line_size));
-				if (data->display_blank || !source)
-					memset(line, 0, line_size);
-				else
-					memcpy(line, source, line_size);
-				if (!data->display_blank) {
-					zz_composite_overlay_row(data, line, y);
-#ifdef AMIBERRY
-					if (!host_only_cursor) {
-						zz_composite_sprite_row(data, line, y);
-					}
-#else
-					zz_composite_sprite_row(data, line, y);
-#endif
-				}
-				fb_copyrow(data->monitor_id, line, surface, 0, 0, data->width, bpp, y);
-			}
-			if (secondary_palette_active)
-				zz_activate_palette(data, data->primary_palette);
-			xfree(line);
-			data->modified = false;
-			data->mode_changed = false;
+	const size_t line_size = static_cast<size_t>(data->width) * bpp;
+	if (data->line_buffer.size() != line_size)
+		data->line_buffer.resize(line_size);
+	uae_u8 *line = data->line_buffer.data();
+	const uae_u32 source_pitch = data->pan_width * bpp;
+	bool secondary_palette_active = false;
+	for (int y = 0; y < data->height; ++y) {
+		const bool split = data->split_position > 0 && y >= data->split_position;
+		const uae_u32 source_base = split ? data->split_offset : data->pan_offset;
+		const int source_y = split ? y - data->split_position : y;
+		if (split && data->secondary_palette_feature && !secondary_palette_active &&
+			data->color_mode == ZZ_COLOR_CLUT) {
+			zz_activate_palette(data, data->secondary_palette);
+			secondary_palette_active = true;
 		}
+		const uae_u8 *source = zz_memory_ptr(data, source_base + source_y * source_pitch,
+			static_cast<uae_u32>(line_size));
+		if (data->display_blank || !source)
+			memset(line, 0, line_size);
+		else
+			memcpy(line, source, line_size);
+		if (!data->display_blank) {
+			zz_composite_overlay_row(data, line, y);
+#ifdef AMIBERRY
+			if (!host_only_cursor) {
+				zz_composite_sprite_row(data, line, y);
+			}
+#else
+			zz_composite_sprite_row(data, line, y);
+#endif
+		}
+		fb_copyrow(data->monitor_id, line, surface, 0, 0, data->width, bpp, y);
 	}
+	if (secondary_palette_active)
+		zz_activate_palette(data, data->primary_palette);
+	data->modified = false;
+	data->mode_changed = false;
+
 	gfx_unlock_picasso(data->monitor_id, true);
 	return true;
 }
@@ -1792,7 +2585,23 @@ static bool zz9000_toggle(void *userdata, int mode)
 static void zz9000_configured(void *userdata, uae_u32 address)
 {
 	auto *data = static_cast<zz9000_state *>(userdata);
+	const uae_u32 vram_start = address + ZZ9000_MEMORY_BASE;
+	const uae_u32 vram_size = data->card_size - ZZ9000_MEMORY_BASE;
+	data->vram_bank.start = vram_start;
+	data->vram_bank.reserved_size = vram_size;
+	data->vram_bank.mask = data->card_size - 1;
+	if (!mapped_malloc(&data->vram_bank)) {
+		write_log(_T("ZZ9000: failed to allocate %u MB of VRAM at %08x\n"),
+			vram_size >> 20, vram_start);
+		return;
+	}
+	data->memory = data->vram_bank.baseaddr;
+	map_banks(&data->vram_bank, vram_start >> 16, vram_size >> 16, 0);
 	data->configured = address;
+	data->sdk = new (std::nothrow) zz9000_sdk::Engine(
+		data->io_memory, data->memory, data->card_size);
+	if (!data->sdk)
+		write_log(_T("ZZ9000: failed to create SDK engine\n"));
 	write_log(_T("ZZ9000 %s configured at %08x (%u MB)\n"),
 		data->z3 ? _T("Z3") : _T("Z2"), address, data->card_size >> 20);
 }
@@ -1800,16 +2609,41 @@ static void zz9000_configured(void *userdata, uae_u32 address)
 static void zz9000_refresh(void *userdata)
 {
 	auto *data = static_cast<zz9000_state *>(userdata);
-	data->modified = true;
+	if (data->memory)
+		data->modified = true;
 }
 
 static void zz9000_hsync(void *userdata)
 {
+	auto *data = static_cast<zz9000_state *>(userdata);
+	if (!data->memory)
+		return;
+	if (data->sdk) {
+		zz_sdk_update_framebuffer(data);
+		if (data->sdk->poll())
+			data->modified = true;
+	}
+	zz_net_tick(data);
+#if defined(AHI) && !defined(LIBRETRO)
+	zz_ax_audio_tick(data);
+#endif
 }
 
 static void zz9000_reset(void *userdata)
 {
 	auto *data = static_cast<zz9000_state *>(userdata);
+#if defined(AHI) && !defined(LIBRETRO)
+	zz_ax_audio_stop(data);
+#endif
+	if (data->sdk) {
+		data->sdk->reset();
+		// The palette survives an Amiga reset on the card, and so does
+		// the SDK's shadow of it.
+		for (int i = 0; i < 256; i++)
+			data->sdk->set_palette_entry(i, data->primary_palette[i].Red,
+				data->primary_palette[i].Green, data->primary_palette[i].Blue);
+	}
+	data->config_file_status = 0xffff;
 #ifdef AMIBERRY
 	picasso_clear_external_host_cursor(data->monitor_id);
 #endif
@@ -1820,6 +2654,20 @@ static void zz9000_reset(void *userdata)
 	data->display_blank = false;
 	data->sprite_visible = false;
 	data->split_position = 0;
+	data->audio_play = false;
+	data->audio_record = false;
+	data->audio_scale = 0;
+	data->audio_collision = false;
+	data->audio_tx_seq = 0;
+	data->audio_tx_read_period = 0;
+	data->audio_rx_seq = 0;
+	data->audio_rx_write_period = 0;
+	zz_ax_clear_interrupt(data);
+	data->audio_log_kicks = 0;
+	data->audio_log_periods = 0;
+	data->audio_log_flags = 0;
+	data->audio_cfg_reads = 0;
+	zz_net_reset(data);
 	data->modified = true;
 }
 
@@ -1833,9 +2681,22 @@ static void zz9000_free(void *userdata)
 #endif
 	if (data->devnum >= 0 && data->devnum < MAX_RTG_BOARDS)
 		zz9000_boards[data->devnum] = nullptr;
-	xfree(data->memory);
+#if defined(AHI) && !defined(LIBRETRO)
+	zz_ax_audio_stop(data);
+	delete data->ax_audio;
+	data->ax_audio = nullptr;
+#endif
+	zz_ax_clear_interrupt(data);
+	zz_net_close(data->net);
+	delete data->sdk;
+	data->sdk = nullptr;
+	delete data->net;
+	data->net = nullptr;
+	mapped_free(&data->vram_bank);
 	data->memory = nullptr;
-	xfree(data);
+	xfree(data->io_memory);
+	data->io_memory = nullptr;
+	delete data;
 }
 
 static bool zz9000_init(autoconfig_info *aci)
@@ -1847,23 +2708,38 @@ static bool zz9000_init(autoconfig_info *aci)
 	if (!aci->doinit)
 		return true;
 
-	auto *data = xcalloc(zz9000_state, 1);
+	auto *data = new (std::nothrow) zz9000_state{};
 	if (!data)
 		return false;
 	data->devnum = aci->devnum;
 	data->monitor_id = aci->prefs->rtgboards[aci->devnum].monitor_id;
 	data->z3 = z3;
+	data->int2 = aci->prefs->zz9000_int2;
 	data->card_size = z3 ? ZZ9000_Z3_SIZE : ZZ9000_Z2_SIZE;
-	data->memory = xcalloc(uae_u8, data->card_size);
-	if (!data->memory) {
-		xfree(data);
+	// AX audio rings live in the top 64 KB of card memory. data->memory
+	// starts at card offset ZZ9000_MEMORY_BASE, so their host pointers subtract it.
+	// The 8-slot ring is 8 x 3840 B; the legacy aperture (FW_CAPS = 0)
+	// places them here for both Z2 and Z3.
+	data->audio_tx_ring_off = data->card_size - 0x10000;
+	data->audio_rx_ring_off = data->card_size - 0x8000;
+	data->vram_bank = zz9000_vram_bank_template;
+	data->io_memory = xcalloc(uae_u8, ZZ9000_MEMORY_BASE);
+	if (!data->io_memory) {
+		delete data;
 		return false;
 	}
+	data->net = new (std::nothrow) zz9000_net_engine;
+	if (!data->net) {
+		xfree(data->io_memory);
+		delete data;
+		return false;
+	}
+	zz_net_reset(data);
 	data->sprite_colors[0] = 0x00ff00ff;
 	data->sprite_visible = false;
 	data->modified = true;
 	zz9000_boards[data->devnum] = data;
-	aci->addrbank = &zz9000_bank;
+	aci->addrbank = &zz9000_io_bank;
 	aci->userdata = data;
 	return true;
 }

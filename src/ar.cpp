@@ -1685,7 +1685,7 @@ int action_replay_load (void)
 #endif
 
 	struct romdata *rd = getromdatabypath(currprefs.cartfile);
-	TCHAR *ident = currprefs.cartident;
+	const TCHAR *ident = currprefs.cartident;
 	if (ident[0] == ':') {
 		ident++;
 	} else {
@@ -2081,6 +2081,15 @@ void action_replay_memory_reset (void)
 	hrtmon_configure ();
 	if (armodel == 1)
 		action_replay_flag = ACTION_REPLAY_ACTIVE;
+	// m68k_run() keeps a freezer on the main-thread CPU loops. A cartridge that
+	// appears while the CPU thread runs needs a restart of the CPU loop.
+	if (cpu_threaded_run && action_replay_freezer_active())
+		set_special(SPCFLAG_MODE_CHANGE);
+}
+
+bool action_replay_freezer_active(void)
+{
+	return action_replay_flag != ACTION_REPLAY_INACTIVE || hrtmon_flag != ACTION_REPLAY_INACTIVE;
 }
 
 uae_u8 *save_hrtmon(size_t *len, uae_u8 *dstptr)
@@ -2248,6 +2257,10 @@ uae_u8 *restore_action_replay (uae_u8 *src)
 
 void restore_ar_finish(void)
 {
+	// No cartridge: a state without one must not make the freezer look
+	// present (action_replay_freezer_active() keeps the CPU thread off).
+	if (!armemory_rom)
+		return;
 	if (ar_state2 < 0) {
 		if (m68k_getpc () >= arrom_start && m68k_getpc () <= arrom_start + arrom_size) {
 			action_replay_flag = ACTION_REPLAY_ACTIVE;

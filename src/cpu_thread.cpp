@@ -9,312 +9,164 @@
 #include "sysconfig.h"
 #include "sysdeps.h"
 #include "options.h"
-#include "uae.h"
-#include "cpu_thread.h"
-#include "memory.h"
 #include "events.h"
-#include "newcpu.h"
-#include "custom.h"
+#include "cpu_thread.h"
 
-#ifdef WITH_THREADED_CPU
-/* Global diagnostics structure */
-cpu_thread_diagnostics cpu_thread_diag = {0};
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <string>
+#include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
-/* Lock-free IO operation queue */
-static cpu_io_operation io_queue[CPU_THREAD_IO_QUEUE_SIZE];
-static volatile uae_atomic io_queue_write_pos = 0;
-static volatile uae_atomic io_queue_read_pos = 0;
+#if defined(__linux__)
+// A cgroup v2 CPU quota (cpu.max "<quota> <period>"), rounded up, or 0.
+static int cgroup_cpu_quota(void)
+{
+	FILE *f = fopen("/proc/self/cgroup", "r");
+	if (!f)
+		return 0;
+	char line[512];
+	std::string path;
+	while (fgets(line, sizeof line, f)) {
+		if (strncmp(line, "0::", 3) == 0) {
+			path = line + 3;
+			while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
+				path.pop_back();
+			break;
+		}
+	}
+	fclose(f);
+	if (path.empty())
+		return 0;
+	f = fopen(("/sys/fs/cgroup" + path + "/cpu.max").c_str(), "r");
+	if (!f)
+		return 0;
+	char quota[32] = {0};
+	long long period = 0;
+	const int got = fscanf(f, "%31s %lld", quota, &period);
+	fclose(f);
+	if (got != 2 || period <= 0 || strcmp(quota, "max") == 0)
+		return 0;
+	const long long q = atoll(quota);
+	return q > 0 ? (int)((q + period - 1) / period) : 0;
+}
+#endif
 
-/* Phase 2: Register batch queue for chipset/CIA operations
- * Allows CPU thread to queue register operations instead of stalling
- * Batch size 64 = proven optimal balance (10.36% improvement)
- */
-#define CPU_THREAD_REGISTER_BATCH_SIZE 64
+int cpu_thread_usable_host_cpus(void)
+{
+	int cpus = (int)std::thread::hardware_concurrency();
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0)
+		cpus = CPU_COUNT(&set);
+	const int quota = cgroup_cpu_quota();
+	if (quota > 0 && quota < cpus)
+		cpus = quota;
+#elif defined(_WIN32)
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) && process_mask) {
+		int n = 0;
+		for (DWORD_PTR m = process_mask; m; m &= m - 1)
+			n++;
+		cpus = n;
+	}
+#endif
+	return cpus > 0 ? cpus : 1;
+}
 
-typedef struct {
-	uaecptr address;
-	uae_u32 value;
-	int size;        // 1, 2, or 4 bytes
-	int is_write;    // 1 = write, 0 = read
-} cpu_register_op;
-
-static cpu_register_op register_batch[CPU_THREAD_REGISTER_BATCH_SIZE];
-static volatile uae_atomic register_batch_count = 0;
+cpu_thread_diagnostics cpu_thread_diag = {};
 
 void cpu_thread_diag_init(void)
 {
-	memset(&cpu_thread_diag, 0, sizeof(cpu_thread_diag));
-	cpu_thread_diag.enable_diagnostics = 0;
-	cpu_thread_diag.queue_strategy = 1;  // Default: immediate processing
+	cpu_thread_diag.enable_diagnostics.store(false, std::memory_order_relaxed);
+	cpu_thread_diag_reset();
+	const char *value = std::getenv("AMIBERRY_CPU_THREAD_DIAGNOSTICS");
+	if (!value)
+		return;
+	if (!std::strcmp(value, "1") || !std::strcmp(value, "true") ||
+		!std::strcmp(value, "yes") || !std::strcmp(value, "on")) {
+		cpu_thread_diag.enable_diagnostics.store(true, std::memory_order_relaxed);
+		write_log(_T("CPU thread diagnostics enabled (host waits and skipped guest cycles reported separately).\n"));
+	} else if (std::strcmp(value, "0") && std::strcmp(value, "false") &&
+		std::strcmp(value, "no") && std::strcmp(value, "off")) {
+		write_log(_T("Invalid AMIBERRY_CPU_THREAD_DIAGNOSTICS='%s'; expected 0/1, false/true, no/yes or off/on; diagnostics disabled.\n"), value);
+	}
 }
 
 void cpu_thread_diag_reset(void)
 {
-	atomic_set(&cpu_thread_diag.stall_count, 0);
-	atomic_set(&cpu_thread_diag.stall_cycles_lost, 0);
-	atomic_set(&cpu_thread_diag.io_queue_ops, 0);
-	atomic_set(&cpu_thread_diag.io_queue_flushes, 0);
-	atomic_set(&cpu_thread_diag.sync_point_count, 0);
-	atomic_set(&cpu_thread_diag.longest_stall, 0);
-	atomic_set(&cpu_thread_diag.is_stalled, 0);
-	cpu_thread_diag.stall_start_cycle = 0;
+	__atomic_store_n(&cpu_thread_diag.wait_count, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&cpu_thread_diag.total_wait_ns, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&cpu_thread_diag.longest_wait_ns, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&cpu_thread_diag.skipped_cycle_count, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&cpu_thread_diag.total_skipped_cycles, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&cpu_thread_diag.longest_skipped_cycles, 0, __ATOMIC_RELAXED);
+}
 
-	atomic_set(&io_queue_write_pos, 0);
-	atomic_set(&io_queue_read_pos, 0);
+static void cpu_thread_diag_max(uae_u64 *counter, uae_u64 duration)
+{
+	uae_u64 longest = __atomic_load_n(counter, __ATOMIC_RELAXED);
+	while (duration > longest &&
+		!__atomic_compare_exchange_n(counter, &longest, duration, true,
+			__ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+	}
+}
+
+void cpu_thread_diag_log_wait(uae_u64 nanoseconds)
+{
+	if (!cpu_thread_diag_enabled())
+		return;
+	__atomic_fetch_add(&cpu_thread_diag.wait_count, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&cpu_thread_diag.total_wait_ns, nanoseconds, __ATOMIC_RELAXED);
+	cpu_thread_diag_max(&cpu_thread_diag.longest_wait_ns, nanoseconds);
 }
 
 void cpu_thread_diag_log_stall(evt_t duration)
 {
-	if (!cpu_thread_diag.enable_diagnostics)
+	if (!cpu_thread_diag_enabled() || duration <= 0)
 		return;
-
-	atomic_inc(&cpu_thread_diag.stall_count);
-	atomic_add(&cpu_thread_diag.stall_cycles_lost, duration);
-
-	evt_t longest = atomic_read(&cpu_thread_diag.longest_stall);
-	while (duration > longest) {
-		if (atomic_cas(&cpu_thread_diag.longest_stall, longest, duration)) {
-			break;
-		}
-		longest = atomic_read(&cpu_thread_diag.longest_stall);
-	}
-}
-
-void cpu_thread_diag_log_io_op(cpu_io_op_type op)
-{
-	if (!cpu_thread_diag.enable_diagnostics)
-		return;
-	atomic_inc(&cpu_thread_diag.io_queue_ops);
+	__atomic_fetch_add(&cpu_thread_diag.skipped_cycle_count, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&cpu_thread_diag.total_skipped_cycles, duration, __ATOMIC_RELAXED);
+	cpu_thread_diag_max(&cpu_thread_diag.longest_skipped_cycles, duration);
 }
 
 void cpu_thread_diag_print_stats(void)
 {
-	if (!cpu_thread_diag.enable_diagnostics)
+	if (!cpu_thread_diag_enabled())
 		return;
 
-	uae_u32 stalls = atomic_read(&cpu_thread_diag.stall_count);
-	uae_u32 cycles = atomic_read(&cpu_thread_diag.stall_cycles_lost);
-	uae_u32 ops = atomic_read(&cpu_thread_diag.io_queue_ops);
-	uae_u32 syncs = atomic_read(&cpu_thread_diag.sync_point_count);
-	uae_u32 longest = atomic_read(&cpu_thread_diag.longest_stall);
+	const uae_u64 waits = __atomic_load_n(&cpu_thread_diag.wait_count, __ATOMIC_RELAXED);
+	const uae_u64 nanoseconds = __atomic_load_n(&cpu_thread_diag.total_wait_ns, __ATOMIC_RELAXED);
+	const uae_u64 longest = __atomic_load_n(&cpu_thread_diag.longest_wait_ns, __ATOMIC_RELAXED);
+	const uae_u64 skips = __atomic_load_n(&cpu_thread_diag.skipped_cycle_count, __ATOMIC_RELAXED);
+	const uae_u64 cycles = __atomic_load_n(&cpu_thread_diag.total_skipped_cycles, __ATOMIC_RELAXED);
+	const uae_u64 longest_skip = __atomic_load_n(&cpu_thread_diag.longest_skipped_cycles, __ATOMIC_RELAXED);
 
-	write_log(_T("\n"));
-	write_log(_T("================= CPU THREAD DIAGNOSTICS REPORT =================\n"));
-	write_log(_T("Configuration:\n"));
-	write_log(_T("  CPU Threading Enabled: %s\n"), currprefs.cpu_thread ? _T("Yes") : _T("No"));
-	write_log(_T("  CPU Model: %d\n"), currprefs.cpu_model);
-	write_log(_T("  Cycle Exact: %s\n"), currprefs.cpu_cycle_exact ? _T("Yes") : _T("No"));
-	write_log(_T("  Memory Cycle Exact: %s\n"), currprefs.cpu_memory_cycle_exact ? _T("Yes") : _T("No"));
-	write_log(_T("\n"));
-	write_log(_T("Synchronization Stalls:\n"));
-	write_log(_T("  Total stalls: %u\n"), stalls);
-	write_log(_T("  Total cycles lost to stalls: %u\n"), cycles);
-	if (stalls > 0) {
-		write_log(_T("  Average cycles/stall: %.2f\n"), (float)cycles / stalls);
-	}
-	write_log(_T("  Longest single stall: %u cycles\n"), longest);
-	write_log(_T("\n"));
-	write_log(_T("IO Queue Operations:\n"));
-	write_log(_T("  Operations queued: %u\n"), ops);
-	write_log(_T("  Queue flushes: %u\n"), atomic_read(&cpu_thread_diag.io_queue_flushes));
-	write_log(_T("\n"));
-	write_log(_T("Synchronization Points:\n"));
-	write_log(_T("  Total sync points: %u\n"), syncs);
-	write_log(_T("\n"));
-
-	if (stalls > 0) {
-		write_log(_T("ANALYSIS:\n"));
-		if (cycles > (stalls * 1000)) {
-			write_log(_T("  WARNING: Significant cycle loss due to thread synchronization.\n"));
-			write_log(_T("  Consider increasing CPU_THREAD_IO_QUEUE_SIZE or using batched IO processing.\n"));
-		}
-		if (longest > 5000) {
-			write_log(_T("  WARNING: Very long stall detected (%u cycles).\n"), longest);
-			write_log(_T("  This may indicate main thread contention or IO bottleneck.\n"));
-		}
-	} else {
-		write_log(_T("  No synchronization stalls detected - CPU threading working well.\n"));
-	}
-	write_log(_T("================= END DIAGNOSTICS REPORT =================\n"));
-	write_log(_T("\n"));
+	write_log(_T("\n================= CPU THREAD DIAGNOSTICS REPORT =================\n"));
+	write_log(_T("  CPU threading: %s; CPU model: %d; cycle exact: %s; memory cycle exact: %s\n"),
+		cpu_threaded_run ? _T("Yes") : _T("No"), currprefs.cpu_model,
+		currprefs.cpu_cycle_exact ? _T("Yes") : _T("No"),
+		currprefs.cpu_memory_cycle_exact ? _T("Yes") : _T("No"));
+	write_log(_T("Mailbox waits (elapsed host time):\n"));
+	write_log(_T("  Count: %llu; total: %llu ns (%.3f ms); longest: %llu ns\n"),
+		static_cast<unsigned long long>(waits), static_cast<unsigned long long>(nanoseconds),
+		(double)nanoseconds / 1000000.0, static_cast<unsigned long long>(longest));
+	if (waits)
+		write_log(_T("  Average: %.3f us/wait\n"), (double)nanoseconds / waits / 1000.0);
+	write_log(_T("Skipped guest cycles (not host wait time):\n"));
+	write_log(_T("  Events: %llu; total: %llu cycles; longest: %llu cycles\n"),
+		static_cast<unsigned long long>(skips), static_cast<unsigned long long>(cycles),
+		static_cast<unsigned long long>(longest_skip));
+	write_log(_T("================= END DIAGNOSTICS REPORT =================\n\n"));
 }
 
-/* Lock-free queue operations using atomic CAS */
-int cpu_thread_queue_io_op(cpu_io_operation *op)
-{
-	if (!currprefs.cpu_thread || is_mainthread()) {
-		return 0;  // No queueing needed if on main thread
-	}
-
-	uae_u32 write_pos = atomic_read(&io_queue_write_pos);
-	uae_u32 next_pos = (write_pos + 1) % CPU_THREAD_IO_QUEUE_SIZE;
-	uae_u32 read_pos = atomic_read(&io_queue_read_pos);
-
-	/* Check if queue is full */
-	if (next_pos == read_pos) {
-		cpu_thread_diag_log_stall(0);  // Queue full, count as stall
-		return 0;
-	}
-
-	io_queue[write_pos] = *op;
-	op->cpu_cycle = get_cycles();
-
-	/* CAS to update write position atomically */
-	if (atomic_cas(&io_queue_write_pos, write_pos, next_pos)) {
-		cpu_thread_diag_log_io_op(op->op_type);
-		return 1;
-	}
-
-	return 0;
-}
-
-int cpu_thread_flush_io_queue(void)
-{
-	int ops_processed = 0;
-
-	while (atomic_read(&io_queue_read_pos) != atomic_read(&io_queue_write_pos)) {
-		cpu_io_operation *op = cpu_thread_dequeue_io_op();
-		if (!op) break;
-
-		/* Process operation - placeholder for actual implementation */
-		ops_processed++;
-	}
-
-	if (ops_processed > 0) {
-		atomic_inc(&cpu_thread_diag.io_queue_flushes);
-	}
-
-	return ops_processed;
-}
-
-cpu_io_operation* cpu_thread_peek_io_queue(void)
-{
-	uae_u32 read_pos = atomic_read(&io_queue_read_pos);
-	uae_u32 write_pos = atomic_read(&io_queue_write_pos);
-
-	if (read_pos == write_pos) {
-		return NULL;
-	}
-
-	return &io_queue[read_pos];
-}
-
-cpu_io_operation* cpu_thread_dequeue_io_op(void)
-{
-	uae_u32 read_pos = atomic_read(&io_queue_read_pos);
-	uae_u32 write_pos = atomic_read(&io_queue_write_pos);
-
-	if (read_pos == write_pos) {
-		return NULL;
-	}
-
-	cpu_io_operation *op = &io_queue[read_pos];
-	uae_u32 next_pos = (read_pos + 1) % CPU_THREAD_IO_QUEUE_SIZE;
-
-	if (atomic_cas(&io_queue_read_pos, read_pos, next_pos)) {
-		return op;
-	}
-
-	return NULL;
-}
-
-void cpu_thread_sync_point(int reason)
-{
-	if (!currprefs.cpu_thread) {
-		return;
-	}
-
-	atomic_inc(&cpu_thread_diag.sync_point_count);
-
-	/* Main thread should process queued IO operations here */
-	if (is_mainthread()) {
-		cpu_thread_flush_io_queue();
-	}
-}
-
-void cpu_thread_stall_start(void)
-{
-	if (!cpu_thread_diag.enable_diagnostics) {
-		return;
-	}
-
-	atomic_set(&cpu_thread_diag.is_stalled, 1);
-	cpu_thread_diag.stall_start_cycle = get_cycles();
-}
-
-void cpu_thread_stall_end(evt_t duration)
-{
-	if (!cpu_thread_diag.enable_diagnostics) {
-		return;
-	}
-
-	atomic_set(&cpu_thread_diag.is_stalled, 0);
-	cpu_thread_diag_log_stall(duration);
-}
-
-/* Phase 2: Register batching implementation
- * Queues chipset/CIA register operations to reduce stalls
- */
-
-int cpu_thread_register_batch_full(void)
-{
-	/* Check if batch buffer is full */
-	return atomic_read(&register_batch_count) >= CPU_THREAD_REGISTER_BATCH_SIZE;
-}
-
-int cpu_thread_queue_register_op(uaecptr addr, uae_u32 value, int size, int is_write)
-{
-	if (!currprefs.cpu_thread || is_mainthread()) {
-		return 0;  /* Not applicable for main thread or threading disabled */
-	}
-
-	/* Check current batch count */
-	uae_u32 count = atomic_read(&register_batch_count);
-	if (count >= CPU_THREAD_REGISTER_BATCH_SIZE) {
-		/* Batch is full - don't queue, let stall happen */
-		return 0;
-	}
-
-	/* Queue operation in batch */
-	register_batch[count].address = addr;
-	register_batch[count].value = value;
-	register_batch[count].size = size;
-	register_batch[count].is_write = is_write;
-
-	/* Increment batch count atomically */
-	atomic_inc(&register_batch_count);
-	atomic_inc(&cpu_thread_diag.batch_ops);
-
-	return 1;  /* Successfully queued */
-}
-
-void cpu_thread_flush_register_batch(void)
-{
-	uae_u32 count = atomic_read(&register_batch_count);
-
-	if (count == 0 || !is_mainthread()) {
-		return;  /* Nothing to flush or wrong thread */
-	}
-
-	/* Process all queued operations */
-	for (uae_u32 i = 0; i < count; i++) {
-		if (register_batch[i].is_write) {
-			switch (register_batch[i].size) {
-				case 1:
-					custom_bput(register_batch[i].address, (uae_u8)register_batch[i].value);
-					break;
-				case 2:
-					custom_wput(register_batch[i].address, (uae_u16)register_batch[i].value);
-					break;
-				case 4:
-					custom_lput(register_batch[i].address, register_batch[i].value);
-					break;
-			}
-		}
-	}
-
-	atomic_set(&register_batch_count, 0);
-	atomic_inc(&cpu_thread_diag.batch_flushes);
-}
-
-#endif

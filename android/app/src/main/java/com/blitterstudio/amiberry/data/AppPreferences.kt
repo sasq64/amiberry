@@ -5,12 +5,35 @@ import android.content.SharedPreferences
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.edit
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
+import com.blitterstudio.amiberry.data.model.EmulatorSettingsConstraints
+import com.blitterstudio.amiberry.data.model.SettingsSchema
+import com.blitterstudio.amiberry.ui.isTvDevice
 import org.json.JSONObject
 
 class AppPreferences private constructor(context: Context) {
 
+	private val appContext = context.applicationContext
+
 	private val prefs: SharedPreferences =
-		context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+		appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+	private val controlDefaults = AndroidControlSettings.defaults(isTv = isTvDevice(appContext))
+
+	/**
+	 * The port devices amiberry.conf's defaults give a fresh configuration
+	 * (default_mouse1/default_controller1): what the remembered controls
+	 * fall back to before this device's own defaults, so the "Defaults for
+	 * new machines" rows reach a machine the launcher builds.
+	 */
+	private fun hostPortDefaults(): Map<String, String> =
+		HostSettingsStore.machineOptionDefaults(
+			ShaderCatalog.findSettingsFile(appContext.filesDir, appContext.getExternalFilesDir(null)),
+			SettingsSchema.bundled(appContext)
+		).filterKeys { it == "joyport0" || it == "joyport1" }
+
+	init {
+		migrateLegacyKeyboardSwitch()
+	}
 
 	var useDynamicColor = mutableStateOf(prefs.getBoolean(KEY_DYNAMIC_COLOR, true))
 		private set
@@ -30,14 +53,23 @@ class AppPreferences private constructor(context: Context) {
 		get() = prefs.getString(KEY_LAST_WHDLOAD, "") ?: ""
 		set(value) { prefs.edit { putString(KEY_LAST_WHDLOAD, value) } }
 
-	fun rememberedAndroidControls(): EmulatorSettings =
-		EmulatorSettings(
-			joyport0 = prefs.getString(KEY_LAST_JOYPORT0, DEFAULT_JOYPORT0) ?: DEFAULT_JOYPORT0,
-			joyport1 = prefs.getString(KEY_LAST_JOYPORT1, DEFAULT_JOYPORT1) ?: DEFAULT_JOYPORT1,
-			onScreenJoystick = prefs.getBoolean(KEY_LAST_ON_SCREEN_JOYSTICK, DEFAULT_ON_SCREEN_JOYSTICK),
-			onScreenKeyboard = prefs.getBoolean(KEY_LAST_ON_SCREEN_KEYBOARD, DEFAULT_ON_SCREEN_KEYBOARD),
-			onScreenKeyboardNumpad = prefs.getBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_NUMPAD, false)
+	fun rememberedAndroidControls(): EmulatorSettings {
+		// A port nothing remembered takes amiberry.conf's default, else this device's.
+		val hostDefaults = hostPortDefaults()
+		fun port(key: String, option: String, fallback: String): String =
+			prefs.getString(key, null) ?: hostDefaults[option] ?: fallback
+		return EmulatorSettings(
+			joyport0 = port(KEY_LAST_JOYPORT0, "joyport0", controlDefaults.joyport0),
+			joyport1 = port(KEY_LAST_JOYPORT1, "joyport1", controlDefaults.joyport1),
+			onScreenJoystick = prefs.getBoolean(KEY_LAST_ON_SCREEN_JOYSTICK, controlDefaults.onScreenJoystick),
+			onScreenKeyboardButton = prefs.getBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_BUTTON, controlDefaults.onScreenKeyboardButton),
+			onScreenKeyboardNumpad = prefs.getBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_NUMPAD, false),
+			onScreenKeyboardToggle = prefs.getString(KEY_LAST_ON_SCREEN_KEYBOARD_TOGGLE, null),
+			joyport0MouseMap = prefs.getBoolean(KEY_LAST_JOYPORT0_MOUSEMAP, false),
+			joyport1MouseMap = prefs.getBoolean(KEY_LAST_JOYPORT1_MOUSEMAP, false),
+			analogMouseSpeed = prefs.getInt(KEY_LAST_ANALOG_MOUSE_SPEED, EmulatorSettingsConstraints.DEFAULT_ANALOG_MOUSE_SPEED)
 		)
+	}
 
 	fun applyRememberedAndroidControls(settings: EmulatorSettings, explicitKeys: Set<String>): EmulatorSettings =
 		AndroidControlSettings.withFallback(
@@ -51,8 +83,42 @@ class AppPreferences private constructor(context: Context) {
 			putString(KEY_LAST_JOYPORT0, settings.joyport0)
 			putString(KEY_LAST_JOYPORT1, settings.joyport1)
 			putBoolean(KEY_LAST_ON_SCREEN_JOYSTICK, settings.onScreenJoystick)
-			putBoolean(KEY_LAST_ON_SCREEN_KEYBOARD, settings.onScreenKeyboard)
+			putBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_BUTTON, settings.onScreenKeyboardButton)
 			putBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_NUMPAD, settings.onScreenKeyboardNumpad)
+			putString(KEY_LAST_ON_SCREEN_KEYBOARD_TOGGLE, settings.onScreenKeyboardToggle)
+			putBoolean(KEY_LAST_JOYPORT0_MOUSEMAP, settings.joyport0MouseMap)
+			putBoolean(KEY_LAST_JOYPORT1_MOUSEMAP, settings.joyport1MouseMap)
+			putInt(KEY_LAST_ANALOG_MOUSE_SPEED, settings.analogMouseSpeed)
+		}
+	}
+
+	/** Drops what the machines edited since filled in: new machines start from the device's defaults. */
+	fun resetRememberedControls() {
+		prefs.edit {
+			remove(KEY_LAST_JOYPORT0)
+			remove(KEY_LAST_JOYPORT1)
+			remove(KEY_LAST_ON_SCREEN_JOYSTICK)
+			remove(KEY_LAST_ON_SCREEN_KEYBOARD_BUTTON)
+			remove(KEY_LAST_ON_SCREEN_KEYBOARD_NUMPAD)
+			remove(KEY_LAST_ON_SCREEN_KEYBOARD_TOGGLE)
+			remove(KEY_LAST_JOYPORT0_MOUSEMAP)
+			remove(KEY_LAST_JOYPORT1_MOUSEMAP)
+			remove(KEY_LAST_ANALOG_MOUSE_SPEED)
+		}
+	}
+
+	/**
+	 * [KEY_LAST_ON_SCREEN_KEYBOARD] used to hold the keyboard master switch. Off meant
+	 * no keyboard at all, so carry it over as button off plus a disabled gamepad toggle;
+	 * otherwise the default toggle would re-enable the keyboard after an upgrade.
+	 */
+	private fun migrateLegacyKeyboardSwitch() {
+		if (!prefs.contains(KEY_LAST_ON_SCREEN_KEYBOARD)) return
+		val keyboardEnabled = prefs.getBoolean(KEY_LAST_ON_SCREEN_KEYBOARD, DEFAULT_ON_SCREEN_KEYBOARD)
+		prefs.edit {
+			putBoolean(KEY_LAST_ON_SCREEN_KEYBOARD_BUTTON, keyboardEnabled)
+			if (!keyboardEnabled) putString(KEY_LAST_ON_SCREEN_KEYBOARD_TOGGLE, "")
+			remove(KEY_LAST_ON_SCREEN_KEYBOARD)
 		}
 	}
 
@@ -72,13 +138,35 @@ class AppPreferences private constructor(context: Context) {
 		return RecentLaunches.parse(raw)
 	}
 
-	fun getRecentLaunches(): List<JSONObject> = recentLaunches.value
-
 	fun addRecentLaunch(entry: JSONObject) {
 		replaceRecentLaunches(RecentLaunches.add(recentLaunches.value, entry))
 	}
 
-	fun replaceRecentLaunches(entries: List<JSONObject>) {
+	fun removeRecentLaunch(entry: JSONObject) {
+		replaceRecentLaunches(RecentLaunches.remove(recentLaunches.value, entry))
+	}
+
+	fun clearRecentLaunches() {
+		replaceRecentLaunches(emptyList())
+	}
+
+	/** Keep Recent pointing at a configuration after it is renamed. */
+	fun renameRecentConfig(oldPath: String, newPath: String) {
+		val updated = RecentLaunches.replaceConfigPath(recentLaunches.value, oldPath, newPath)
+		if (updated.map { it.toString() } != recentLaunches.value.map { it.toString() }) {
+			replaceRecentLaunches(updated)
+		}
+	}
+
+	/** Take a configuration the user deleted in the app out of Recent. */
+	fun forgetRecentConfig(path: String) {
+		val updated = RecentLaunches.removeConfigPath(recentLaunches.value, path)
+		if (updated.size != recentLaunches.value.size) {
+			replaceRecentLaunches(updated)
+		}
+	}
+
+	private fun replaceRecentLaunches(entries: List<JSONObject>) {
 		val trimmed = entries.take(RecentLaunches.MAX_ITEMS)
 		prefs.edit { putString(KEY_RECENT_LAUNCHES, RecentLaunches.serialize(trimmed)) }
 		recentLaunches.value = trimmed
@@ -110,25 +198,54 @@ class AppPreferences private constructor(context: Context) {
 		prefs.edit { putBoolean(KEY_HAS_SEEN_WELCOME, seen) }
 	}
 
+	/** The optional All Files Access card in Files was dismissed ("Not now"). */
+	var storageAccessCardDismissed = mutableStateOf(prefs.getBoolean(KEY_STORAGE_ACCESS_CARD_DISMISSED, false))
+		private set
+
+	fun dismissStorageAccessCard() {
+		storageAccessCardDismissed.value = true
+		prefs.edit { putBoolean(KEY_STORAGE_ACCESS_CARD_DISMISSED, true) }
+	}
+
+	/** The Library's "No Kickstart ROMs" advice was closed: machines run on AROS by choice. */
+	var romAdviceDismissed = mutableStateOf(prefs.getBoolean(KEY_ROM_ADVICE_DISMISSED, false))
+		private set
+
+	/** The Library's Kickstart ROM advice again, for a user who closed it while it still applies. */
+	fun showRomAdviceAgain() {
+		romAdviceDismissed.value = false
+		prefs.edit { putBoolean(KEY_ROM_ADVICE_DISMISSED, false) }
+	}
+
+	fun dismissRomAdvice() {
+		romAdviceDismissed.value = true
+		prefs.edit { putBoolean(KEY_ROM_ADVICE_DISMISSED, true) }
+	}
+
 	companion object {
 		private const val PREFS_NAME = "amiberry_prefs"
 		private const val KEY_DYNAMIC_COLOR = "use_dynamic_color"
 		private const val KEY_THEME_MODE = "theme_mode"
 		private const val KEY_HAS_SEEN_WELCOME = "has_seen_welcome"
 		private const val KEY_STORAGE_PERMISSION_REQUESTED = "storage_permission_requested"
+		private const val KEY_STORAGE_ACCESS_CARD_DISMISSED = "storage_access_card_dismissed"
+		private const val KEY_ROM_ADVICE_DISMISSED = "rom_advice_dismissed"
 		private const val KEY_LAST_WHDLOAD = "last_whdload_path"
 		private const val KEY_LAST_JOYPORT0 = "last_joyport0"
 		private const val KEY_LAST_JOYPORT1 = "last_joyport1"
 		private const val KEY_LAST_ON_SCREEN_JOYSTICK = "last_on_screen_joystick"
+		/** Legacy keyboard master switch; migrated by [migrateLegacyKeyboardSwitch]. */
 		private const val KEY_LAST_ON_SCREEN_KEYBOARD = "last_on_screen_keyboard"
+		private const val KEY_LAST_ON_SCREEN_KEYBOARD_BUTTON = "last_on_screen_keyboard_button"
 		private const val KEY_LAST_ON_SCREEN_KEYBOARD_NUMPAD = "last_on_screen_keyboard_numpad"
+		private const val KEY_LAST_ON_SCREEN_KEYBOARD_TOGGLE = "last_on_screen_keyboard_toggle"
+		private const val KEY_LAST_JOYPORT0_MOUSEMAP = "last_joyport0_mousemap"
+		private const val KEY_LAST_JOYPORT1_MOUSEMAP = "last_joyport1_mousemap"
+		private const val KEY_LAST_ANALOG_MOUSE_SPEED = "last_analog_mouse_speed"
 		private const val KEY_RECENT_LAUNCHES = "recent_launches"
 		private const val KEY_LAUNCH_COUNT = "emulator_launch_count"
 		private const val FIRST_REVIEW_LAUNCH = 5
 		private const val REVIEW_INTERVAL = 20
-		private const val DEFAULT_JOYPORT0 = "mouse"
-		private const val DEFAULT_JOYPORT1 = "onscreen_joy"
-		private const val DEFAULT_ON_SCREEN_JOYSTICK = true
 		private const val DEFAULT_ON_SCREEN_KEYBOARD = true
 
 		@Volatile

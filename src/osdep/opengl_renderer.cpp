@@ -32,6 +32,15 @@
 #include "target.h"
 #include "statusline.h"
 #include "imgui_overlay.h"
+#include "minigl_display.h"
+#include "dmabuf_surface.h"
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <cstring>
+#endif
 #include "imgui_osk.h"
 #include "on_screen_joystick.h"
 #include "on_screen_joystick_layout.h"
@@ -140,12 +149,28 @@ bool OpenGLRenderer::init_context(SDL_Window* window)
 		return false;
 	}
 
+	const char* gl_vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
 	const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
 	const char* version  = reinterpret_cast<const char*>(glGetString(GL_VERSION));
 	const char* sl_ver   = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+	m_gl_info.vendor = gl_vendor ? gl_vendor : "";
+	m_gl_info.renderer = renderer ? renderer : "";
+	m_gl_info.version = version ? version : "";
+	m_gl_info.glsl_version = sl_ver ? sl_ver : "";
+	m_gl_info.valid = (renderer != nullptr && version != nullptr);
 	write_log(_T("OpenGL Renderer: %hs\n"), renderer ? renderer : "unknown");
 	write_log(_T("OpenGL Version:  %hs\n"), version ? version : "unknown");
 	write_log(_T("GLSL Version:    %hs\n"), sl_ver ? sl_ver : "unknown");
+#ifdef AMIBERRY_IOS
+	// ARGB8888 frames (Picasso96 B8G8R8A8 modes and hardware boards) upload
+	// as GL_BGRA, which OpenGL ES accepts on iOS through
+	// APPLE_texture_format_BGRA8888 (every iOS device and the simulator).
+	{
+		const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+		const bool bgra = extensions && strstr(extensions, "GL_APPLE_texture_format_BGRA8888");
+		write_log(_T("OpenGL ES BGRA uploads: %hs\n"), bgra ? "supported" : "NOT supported");
+	}
+#endif
 
 	// Initialize GL upload format from current SDL pixel format.
 	resolve_gl_pixel_format(pixel_format, m_gl_format.fmt, m_gl_format.type, m_gl_format.bpp);
@@ -155,9 +180,20 @@ bool OpenGLRenderer::init_context(SDL_Window* window)
 
 void OpenGLRenderer::destroy_context()
 {
+	destroy_minigl_import();
+	destroy_frame_import();
+	m_frame_failed_generation = 0;  // a recreated context gets one import attempt
+	if (m_minigl_importer_ref) {
+		minigl_display_release_importer();
+		m_minigl_importer_ref = false;
+	}
+	m_minigl_probed = false;  // a recreated context must re-publish capability
+
 	amiberry_hw_vsync_pacing_set_blocking(false);
 	if (m_gl_context != nullptr)
 	{
+		on_screen_joystick_gl_context_destroyed(m_gl_context);
+		m_external_upload = {};
 		SDL_GL_DestroyContext(m_gl_context);
 		m_gl_context = nullptr;
 		m_vsync.current_interval = INVALID_SWAP_INTERVAL;
@@ -377,7 +413,8 @@ void OpenGLRenderer::update_vsync(int monid)
 
 	const AmigaMonitor* mon = &AMonitors[monid];
 	const auto idx = mon->screen_is_picasso ? APMODE_RTG : APMODE_NATIVE;
-	const int vsync_mode = currprefs.gfx_apmode[idx].gfx_vsync;
+	// Warp mode must never be limited by the display refresh rate.
+	const int vsync_mode = currprefs.turbo_emulation ? 0 : currprefs.gfx_apmode[idx].gfx_vsync;
 	int interval = 0;
 
 	if (currprefs.gfx_variable_sync && vsync_mode > 0) {
@@ -408,11 +445,14 @@ void OpenGLRenderer::update_vsync(int monid)
 	// KMSDRM has no Adaptive/VRR presentation mode. SDL 3.2.x maps interval 0
 	// to an asynchronous DRM page flip and retains its default triple-buffered
 	// path, with software timing pacing the emulator. SDL 3.4+ retains the
-	// double-buffered blocking atomic path, so use interval 1 there and let
-	// matched-refresh hardware pacing account for it.
-	// Mismatched-refresh atomic presentation needs a separate scheduler.
+	// double-buffered blocking atomic path: use interval 1 there only when the
+	// display refresh matches the chipset, and let hardware pacing account
+	// for it. On a mismatched display (a 60 Hz console and a 50 Hz PAL game)
+	// the emulator paces itself in software, and a flip blocking at the
+	// display's rate added up to a display frame of waiting to every emulated
+	// frame: a busy PAL screen fell to 40 FPS on a 60 Hz Raspberry Pi console.
 	if (kmsdrm_detected) {
-		interval = SDL_GetVersion() < SDL_VERSIONNUM(3, 4, 0) ? 0 : 1;
+		interval = SDL_GetVersion() < SDL_VERSIONNUM(3, 4, 0) || !amiberry_hw_vsync_refresh_matches() ? 0 : 1;
 	}
 
 	if (m_vsync.current_interval != interval) {
@@ -445,6 +485,395 @@ void OpenGLRenderer::update_vsync(int monid)
 }
 
 // --- Frame rendering ---
+
+#if defined(__linux__)
+// --- MiniGL zero-copy display ---------------------------------------------
+// Imports the plugin's exported dma-buf on this renderer's EGLDisplay and
+// composites it. EGL entry points are resolved from libEGL at runtime so no
+// build-time EGL dependency appears on platforms that never take this path.
+namespace {
+struct EglDmabufApi {
+	void* library = nullptr;
+	EGLDisplay (*current_display)() = nullptr;
+	const char* (*query_string)(EGLDisplay, EGLint) = nullptr;
+	EGLImageKHR (*create_image)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*) = nullptr;
+	EGLBoolean (*destroy_image)(EGLDisplay, EGLImageKHR) = nullptr;
+	void (*image_target_texture)(GLenum, EGLImageKHR) = nullptr;
+	bool ok = false, tried = false;
+	bool available() {
+		if (tried) return ok;
+		tried = true;
+		library = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_NOLOAD);
+		if (!library) library = dlopen("libEGL.so.1", RTLD_LAZY);
+		if (!library) return false;
+		current_display = reinterpret_cast<EGLDisplay (*)()>(dlsym(library, "eglGetCurrentDisplay"));
+		query_string = reinterpret_cast<const char* (*)(EGLDisplay, EGLint)>(dlsym(library, "eglQueryString"));
+		if (!current_display) return false;
+		using GetProc = void* (*)(const char*);
+		const auto get_proc = reinterpret_cast<GetProc>(dlsym(library, "eglGetProcAddress"));
+		if (!get_proc) return false;
+		create_image = reinterpret_cast<EGLImageKHR (*)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*)>(get_proc("eglCreateImageKHR"));
+		destroy_image = reinterpret_cast<EGLBoolean (*)(EGLDisplay, EGLImageKHR)>(get_proc("eglDestroyImageKHR"));
+		image_target_texture = reinterpret_cast<void (*)(GLenum, EGLImageKHR)>(get_proc("glEGLImageTargetTexture2DOES"));
+		ok = create_image && destroy_image && image_target_texture && query_string;
+		return ok;
+	}
+};
+EglDmabufApi& egl_dmabuf_api() { static EglDmabufApi api; return api; }
+}
+#endif
+
+// Defined on every platform: destroy_context() calls it unconditionally.
+void OpenGLRenderer::destroy_minigl_import()
+{
+#if defined(__linux__)
+	if (m_minigl_texture != 0) {
+		glDeleteTextures(1, &m_minigl_texture);
+		m_minigl_texture = 0;
+	}
+	if (m_minigl_egl_image != nullptr && m_minigl_egl_display != nullptr) {
+		if (auto& egl = egl_dmabuf_api(); egl.destroy_image)
+			egl.destroy_image(static_cast<EGLDisplay>(m_minigl_egl_display),
+				static_cast<EGLImageKHR>(m_minigl_egl_image));
+		m_minigl_egl_image = nullptr;
+	}
+	m_minigl_egl_display = nullptr;
+	m_minigl_seq = 0;
+#endif
+}
+
+
+
+#if defined(__linux__)
+bool OpenGLRenderer::render_minigl_dmabuf(const int viewport_x, const int viewport_y,
+	const int viewport_width, const int viewport_height, const GLuint target_framebuffer)
+{
+	const MiniglDisplayImage image = minigl_display_current();
+	// The snapshot owns its descriptor; every exit must give it back.
+	const int owned_fd = image.fd;
+	const auto bail = [owned_fd] {
+		if (owned_fd >= 0) close(owned_fd);
+		return false;
+	};
+	if (image.fd < 0 || image.width == 0 || image.height == 0)
+		return bail();
+	auto& egl = egl_dmabuf_api();
+	if (!egl.available())
+		return bail();
+
+	if (image.seq != 0 && image.seq == m_minigl_failed_seq)
+		return bail();  // this export was already rejected; the span path stays
+	if (image.seq != m_minigl_seq) {
+		// Drop the previous import before re-importing the new frame.
+		if (m_minigl_texture != 0) {
+			glDeleteTextures(1, &m_minigl_texture);
+			m_minigl_texture = 0;
+		}
+		if (m_minigl_egl_image != nullptr && egl.destroy_image) {
+			egl.destroy_image(egl.current_display(), static_cast<EGLImageKHR>(m_minigl_egl_image));
+			m_minigl_egl_image = nullptr;
+		}
+		const EGLint attribs[] = {
+			EGL_WIDTH, EGLint(image.width),
+			EGL_HEIGHT, EGLint(image.height),
+			EGL_LINUX_DRM_FOURCC_EXT, EGLint(image.fourcc),
+			EGL_DMA_BUF_PLANE0_FD_EXT, image.fd,
+			EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGLint(image.offset),
+			EGL_DMA_BUF_PLANE0_PITCH_EXT, EGLint(image.stride),
+			EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGLint(image.modifier & 0xffffffffu),
+			EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGLint(image.modifier >> 32),
+			EGL_NONE
+		};
+		const EGLImageKHR handle = egl.create_image(egl.current_display(), EGL_NO_CONTEXT,
+			EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+		if (handle == EGL_NO_IMAGE_KHR) {
+			write_log("MiniGL dmabuf import failed (fourcc 0x%x, %ux%u stride %u); staying on the span path for this export\n",
+				image.fourcc, image.width, image.height, image.stride);
+			m_minigl_failed_seq = image.seq;  // do not retry or re-log this export
+			m_minigl_seq = 0;
+			return bail();
+		}
+		write_log("MiniGL dmabuf imported %ux%u fourcc 0x%x stride %u modifier 0x%llx\n",
+			image.width, image.height, image.fourcc, image.stride,
+			static_cast<unsigned long long>(image.modifier));
+		m_minigl_egl_image = handle;
+		m_minigl_egl_display = egl.current_display();
+		glGenTextures(1, &m_minigl_texture);
+		glBindTexture(GL_TEXTURE_2D, m_minigl_texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		egl.image_target_texture(GL_TEXTURE_2D, handle);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		m_minigl_seq = image.seq;
+	}
+#if defined(__linux__)
+	close(owned_fd);  // the snapshot's duplicate: EGL holds its own reference
+#endif
+
+	// The attachment is a GL-side (bottom-up) image, so like the shader
+	// resolve pass this quad samples without the Y-flip used for surfaces.
+	static const GLfloat vertices[] = {
+		-1.0f, -1.0f, 0.0f, 0.0f,
+		 1.0f, -1.0f, 1.0f, 0.0f,
+		 1.0f,  1.0f, 1.0f, 1.0f,
+		-1.0f,  1.0f, 0.0f, 1.0f,
+	};
+
+	glBindFramebuffer(GL_FRAMEBUFFER, target_framebuffer);
+	if (!init_osd_shader())
+		return false;
+	glViewport(viewport_x, viewport_y, viewport_width, viewport_height);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glUseProgram(m_overlay.osd_program);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_minigl_texture);
+	if (m_overlay.osd_tex_loc != -1) glUniform1i(m_overlay.osd_tex_loc, 0);
+
+	glBindVertexArray(m_overlay.osd_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, m_overlay.osd_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
+	glEnableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glDisableVertexAttribArray(2);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+	glDisableVertexAttribArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
+	return true;
+}
+#else
+bool OpenGLRenderer::render_minigl_dmabuf(const int, const int, const int, const int, const GLuint)
+{
+	return false;
+}
+#endif
+
+// Defined on every platform: destroy_context() calls it unconditionally.
+void OpenGLRenderer::destroy_frame_import()
+{
+#if defined(__linux__)
+	if (m_frame_fbo != 0) {
+		glDeleteFramebuffers(1, &m_frame_fbo);
+		m_frame_fbo = 0;
+	}
+	if (m_frame_texture != 0) {
+		if (m_shader.crtemu)
+			crtemu_texture_deleted(m_shader.crtemu, m_frame_texture);
+		glDeleteTextures(1, &m_frame_texture);
+		m_frame_texture = 0;
+	}
+	m_frame_texture_w = m_frame_texture_h = 0;
+	destroy_frame_image();
+#endif
+}
+
+void OpenGLRenderer::destroy_frame_image()
+{
+#if defined(__linux__)
+	if (m_frame_import_texture != 0) {
+		if (m_shader.crtemu)
+			crtemu_texture_deleted(m_shader.crtemu, m_frame_import_texture);
+		glDeleteTextures(1, &m_frame_import_texture);
+		m_frame_import_texture = 0;
+	}
+	if (m_frame_egl_image != nullptr && m_frame_egl_display != nullptr) {
+		if (auto& egl = egl_dmabuf_api(); egl.destroy_image)
+			egl.destroy_image(static_cast<EGLDisplay>(m_frame_egl_display),
+				static_cast<EGLImageKHR>(m_frame_egl_image));
+	}
+	m_frame_egl_image = nullptr;
+	m_frame_egl_display = nullptr;
+	m_frame_generation = 0;
+#endif
+}
+
+#if defined(__linux__)
+bool OpenGLRenderer::import_frame_image(const DmabufSurfaceInfo* info)
+{
+	destroy_frame_image();
+	auto& egl = egl_dmabuf_api();
+	const EGLint attribs[] = {
+		EGL_WIDTH, info->width,
+		EGL_HEIGHT, info->height,
+		EGL_LINUX_DRM_FOURCC_EXT, EGLint(info->drm_fourcc),
+		EGL_DMA_BUF_PLANE0_FD_EXT, info->fd,
+		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+		EGL_DMA_BUF_PLANE0_PITCH_EXT, info->pitch,
+		EGL_NONE
+	};
+	const EGLDisplay display = egl.current_display();
+	const EGLImageKHR image = display != EGL_NO_DISPLAY
+		? egl.create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs)
+		: EGL_NO_IMAGE_KHR;
+	if (image == EGL_NO_IMAGE_KHR)
+		return false;
+	for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+	glGenTextures(1, &m_frame_import_texture);
+	glBindTexture(GL_TEXTURE_2D, m_frame_import_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	egl.image_target_texture(GL_TEXTURE_2D, image);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	m_frame_egl_image = image;
+	m_frame_egl_display = display;
+	if (glGetError() != GL_NO_ERROR) {
+		destroy_frame_image();
+		return false;
+	}
+	m_frame_generation = info->generation;
+	return true;
+}
+
+bool OpenGLRenderer::ensure_frame_copy_target(const int width, const int height)
+{
+	if (!init_osd_shader())
+		return false;
+	if (m_frame_texture != 0 && m_frame_texture_w == width && m_frame_texture_h == height)
+		return true;
+	if (m_frame_texture == 0)
+		glGenTextures(1, &m_frame_texture);
+	else if (m_shader.crtemu)
+		crtemu_texture_deleted(m_shader.crtemu, m_frame_texture);  // filters reset below
+	glBindTexture(GL_TEXTURE_2D, m_frame_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	if (m_frame_fbo == 0)
+		glGenFramebuffers(1, &m_frame_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, m_frame_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_frame_texture, 0);
+	const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (!complete) {
+		write_log("Native frame copy target %dx%d incomplete; using texture uploads\n", width, height);
+		return false;
+	}
+	m_frame_texture_w = width;
+	m_frame_texture_h = height;
+	return true;
+}
+
+void OpenGLRenderer::copy_frame_rect(const SDL_Rect& rect, const int surface_width, const int surface_height)
+{
+	GLint saved_framebuffer = 0;
+	GLint saved_viewport[4] = {};
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_framebuffer);
+	glGetIntegerv(GL_VIEWPORT, saved_viewport);
+	// Copy the presented rectangle 1:1, keeping its top row at t=0 as a
+	// glTexSubImage2D upload would.
+	const float u0 = float(rect.x) / float(surface_width);
+	const float u1 = float(rect.x + rect.w) / float(surface_width);
+	const float v0 = float(rect.y) / float(surface_height);
+	const float v1 = float(rect.y + rect.h) / float(surface_height);
+	const GLfloat vertices[] = {
+		-1.0f, -1.0f, u0, v0,
+		 1.0f, -1.0f, u1, v0,
+		 1.0f,  1.0f, u1, v1,
+		-1.0f,  1.0f, u0, v1,
+	};
+	glBindFramebuffer(GL_FRAMEBUFFER, m_frame_fbo);
+	glViewport(0, 0, rect.w, rect.h);
+	glDisable(GL_BLEND);
+	glUseProgram(m_overlay.osd_program);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_frame_import_texture);
+	if (m_overlay.osd_tex_loc != -1) glUniform1i(m_overlay.osd_tex_loc, 0);
+	glBindVertexArray(m_overlay.osd_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, m_overlay.osd_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+	glDisableVertexAttribArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
+	glBindFramebuffer(GL_FRAMEBUFFER, GLuint(saved_framebuffer));
+	glViewport(saved_viewport[0], saved_viewport[1], saved_viewport[2], saved_viewport[3]);
+}
+
+GLuint OpenGLRenderer::begin_dmabuf_frame(SDL_Surface* surface, const int x, const int y,
+	const int width, const int height)
+{
+	const DmabufSurfaceInfo* info = dmabuf_surface_info(surface);
+	if (!info || width <= 0 || height <= 0 || info->generation == m_frame_failed_generation)
+		return 0;
+	if (!egl_dmabuf_api().available())
+		return 0;
+
+	if (info->generation != m_frame_generation) {
+		if (!import_frame_image(info)) {
+			write_log("Native frame dma-buf import failed (%dx%d pitch %d); using texture uploads\n",
+				info->width, info->height, info->pitch);
+			m_frame_failed_generation = info->generation;
+			return 0;
+		}
+		write_log("Native frames sampled from dma-buf %dx%d pitch %d (no per-frame upload)\n",
+			info->width, info->height, info->pitch);
+	}
+
+	// present runs at the emulated vsync, after the display frame was closed,
+	// so Denise may still be drawing queued lines. Drain them first: no CPU
+	// write may overlap the cache flush and GPU read below (the main thread
+	// queues nothing while it presents, so the buffer stays idle until the
+	// next frame writer reclaims it).
+	draw_denise_line_queue_flush();
+
+	// Uncropped frames are sampled straight from the import; a crop is copied
+	// 1:1 on the GPU so the shader stack sees exactly the presented area.
+	// Everything that can fail happens while the CPU still owns the pixels,
+	// so a failure falls back to uploads without a GPU read in flight.
+	const bool cropped = x != 0 || y != 0 || width != info->width || height != info->height;
+	if (cropped && !ensure_frame_copy_target(width, height)) {
+		m_frame_failed_generation = info->generation;
+		destroy_frame_import();
+		return 0;
+	}
+
+	// The GPU reads the frame from here on: publish the CPU's writes first.
+	if (!dmabuf_surface_end_cpu_access(info)) {
+		write_log("Native frame dma-buf sync failed; using texture uploads\n");
+		m_frame_failed_generation = info->generation;
+		destroy_frame_import();
+		return 0;
+	}
+	if (!cropped)
+		return m_frame_import_texture;
+	copy_frame_rect(SDL_Rect{ x, y, width, height }, info->width, info->height);
+	return m_frame_texture;
+}
+
+void OpenGLRenderer::end_dmabuf_frame(SDL_Surface* surface)
+{
+	// Submit the GPU's read; frame writers reclaim the pixels (waiting for
+	// that read) before drawing the next frame, so it overlaps emulation.
+	glFlush();
+	dmabuf_surface_release_to_gpu(dmabuf_surface_info(surface));
+}
+#else
+GLuint OpenGLRenderer::begin_dmabuf_frame(SDL_Surface*, const int, const int, const int, const int)
+{
+	return 0;
+}
+
+void OpenGLRenderer::end_dmabuf_frame(SDL_Surface*)
+{
+}
+#endif
 
 bool OpenGLRenderer::render_frame(int monid, int mode, int immediate)
 {
@@ -505,11 +934,12 @@ void OpenGLRenderer::destroy_shader_resolve_target()
 }
 
 void OpenGLRenderer::render_shader_resolve(
-	const int x, const int y, const int width, const int height)
+	const int x, const int y, const int width, const int height,
+	const GLuint target_framebuffer)
 {
 	if (m_shader.resolve_texture == 0 || width <= 0 || height <= 0)
 		return;
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, target_framebuffer);
 	if (!init_osd_shader())
 		return;
 
@@ -549,6 +979,10 @@ void OpenGLRenderer::render_shader_resolve(
 
 void OpenGLRenderer::present_frame(int monid, int mode)
 {
+	// Headless mode has no window or GL context to present to.
+	if (currprefs.headless)
+		return;
+
 	AmigaMonitor* mon = &AMonitors[monid];
 	SDL_Surface* surface = get_amiga_surface(monid);
 
@@ -560,6 +994,69 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 			write_log("SDL_GL_MakeCurrent failed: %s\n", SDL_GetError());
 		}
 	}
+	// The window's own framebuffer. It is 0 everywhere except iOS, where GL
+	// contexts have no default framebuffer and SDL's UIKit view renders into
+	// a per-window FBO that SDL exposes as a window property. Every final
+	// pass below must target it instead of a hardcoded 0, or the whole
+	// present draws nowhere (the ImGui GUI is unaffected because its
+	// SDL_Renderer captures the same binding internally).
+	GLuint window_framebuffer = 0;
+#ifdef AMIBERRY_IOS
+	if (mon->amiga_window) {
+		const SDL_PropertiesID props = SDL_GetWindowProperties(mon->amiga_window);
+		window_framebuffer = static_cast<GLuint>(SDL_GetNumberProperty(props,
+			SDL_PROP_WINDOW_UIKIT_OPENGL_FRAMEBUFFER_NUMBER, 0));
+	}
+	if (window_framebuffer == 0) {
+		GLint bound = 0;
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+		window_framebuffer = static_cast<GLuint>(bound);
+	}
+#endif
+
+#if defined(__linux__)
+	// Probe only now that this renderer's context is current: earlier, the
+	// EGL and GL capability queries could describe another context - or none
+	// - and the one-shot verdict would stick until context destruction.
+	// Only a renderer presenting the Picasso96 screen holds an importer
+	// reference, so a capable native-screen monitor cannot keep the sink
+	// installed while the RTG display falls back to SDL.
+	if (!m_minigl_probed && mon->screen_is_picasso) {
+		m_minigl_probed = true;
+		bool capable = false;
+		auto& egl = egl_dmabuf_api();
+		if (egl.available()) {
+			const EGLDisplay display = egl.current_display();
+			if (display != EGL_NO_DISPLAY) {
+				// The import attributes carry a format modifier, and the
+				// imported image is bound through glEGLImageTargetTexture2DOES,
+				// which needs the GL-side extension as well.
+				const char* extensions = egl.query_string(display, EGL_EXTENSIONS);
+				capable = extensions && strstr(extensions, "EGL_EXT_image_dma_buf_import")
+					&& strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
+				if (capable) {
+					// glGetStringi is GL 3.0+; resolve it the way the rest of
+					// the GL entry points reach this context.
+					using GetStringi = const GLubyte* (*)(GLenum, GLuint);
+					static const auto get_stringi = reinterpret_cast<GetStringi>(
+						SDL_GL_GetProcAddress("glGetStringi"));
+					GLint count = 0;
+					glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+					bool gl_image = false;
+					for (GLint i = 0; i < count && !gl_image && get_stringi; ++i) {
+						const char* extension = reinterpret_cast<const char*>(
+							get_stringi(GL_EXTENSIONS, GLuint(i)));
+						gl_image = extension && strcmp(extension, "GL_OES_EGL_image") == 0;
+					}
+					capable = gl_image;
+				}
+			}
+		}
+		minigl_display_note_importer(capable);
+		m_minigl_importer_ref = capable;
+		write_log("MiniGL dmabuf importer %s\n", capable ? "ready" : "unavailable");
+	}
+#endif
 
 	// Handle VSync options after making the emulation context current.
 	update_vsync(monid);
@@ -732,15 +1229,29 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	const float bounded_fallback_aspect = use_integer_scaling
 		&& !mon->screen_is_picasso && currprefs.gfx_correct_aspect
 		? integer_target_aspect : desired_aspect;
-	const AmiberryGfxRect final_rect = amiberry_gfx_final_presentation_rect(
+	const AmiberryGfxRect drawable_area{0, 0, drawableWidth, drawableHeight};
+	AmiberryGfxRect final_rect = amiberry_gfx_final_presentation_rect(
 		available_area, destW, destH, bounded_fallback_aspect,
 		has_bounded_bezel_area && use_integer_scaling && !use_center);
+	// Android portrait: the on-screen keyboard docks over the bottom of the
+	// window, so move the picture up into the free space above it. Not with a
+	// custom bezel, whose screen hole is fixed. render_quad and the published
+	// GUI geometry below take this rect, so pointer mapping follows the move.
+	if (vkbd_allowed(monid)
+		&& !(filter_prefs.use_custom_bezel && m_overlay.bezel_texture != 0)) {
+		const float osk_inset = imgui_osk_bottom_inset_fraction(drawableWidth, drawableHeight);
+		if (osk_inset > 0.0f) {
+			final_rect = amiberry_gfx_lift_above_bottom_inset(final_rect, drawable_area,
+				static_cast<int>(static_cast<float>(drawableHeight) * osk_inset + 0.5f));
+		}
+	}
 
 	// Flip Y for GL viewport: OpenGL has y=0 at bottom, bezel hole Y is y=0 at top
 	const int glDestY = drawableHeight - final_rect.y - final_rect.h;
 
 	// Clear whenever the presentation leaves any part of the drawable uncovered.
-	const AmiberryGfxRect drawable_area{0, 0, drawableWidth, drawableHeight};
+	glBindFramebuffer(GL_FRAMEBUFFER, window_framebuffer);
+
 	if (!amiberry_gfx_rect_covers_area(final_rect, drawable_area)) {
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
@@ -784,7 +1295,7 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	const int shader_viewport_y = use_shader_resolve
 		? 0 : glDestY;
 	const GLuint shader_framebuffer = use_shader_resolve
-		? m_shader.resolve_framebuffer : 0;
+		? m_shader.resolve_framebuffer : window_framebuffer;
 	if (use_shader_resolve) {
 		glBindFramebuffer(GL_FRAMEBUFFER, shader_framebuffer);
 		glViewport(0, 0, shader_viewport_w, shader_viewport_h);
@@ -792,8 +1303,26 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		glClear(GL_COLOR_BUFFER_BIT);
 	}
 
+	// Zero-copy MiniGL frames replace the surface upload entirely; the
+	// shader stacks below still run for non-RTG screens and for RTG screens
+	// without a live export.
+	// One composite owner: on hosts with several Picasso96 monitors only
+	// the claiming renderer shows the plugin's image; the others keep their
+	// own span content instead of getting the plugin's frame.
+	static bool s_composite_owner = false;
+	static bool s_composite_decided = false;
+	if (!s_composite_decided) {
+		s_composite_decided = true;
+		s_composite_owner = minigl_display_claim_composite();
+		if (!s_composite_owner)
+			write_log("MiniGL dmabuf composite claimed by another monitor\n");
+	}
+	const bool minigl_frame = mon->screen_is_picasso && !is_cropped && s_composite_owner
+		&& render_minigl_dmabuf(shader_viewport_x, shader_viewport_y,
+			shader_viewport_w, shader_viewport_h, shader_framebuffer);
+
 	// Handle shader preset rendering (multi-pass .glslp)
-	if (m_shader.preset && m_shader.preset->is_valid()) {
+	if (!minigl_frame && m_shader.preset && m_shader.preset->is_valid()) {
 		glDisableVertexAttribArray(0);
 		glDisableVertexAttribArray(1);
 		glDisableVertexAttribArray(2);
@@ -815,7 +1344,7 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 
 	}
 	// Handle external shader rendering (simplified single-pass)
-	else if (m_shader.external && m_shader.external->is_valid()) {
+	else if (!minigl_frame && m_shader.external && m_shader.external->is_valid()) {
 		// Explicitly disable attributes to avoid leakage from previous passes
 		glDisableVertexAttribArray(0);
 		glDisableVertexAttribArray(1);
@@ -840,7 +1369,16 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 				shader_framebuffer);
 		}
 
-	} else if (m_shader.crtemu) {
+	} else if (!minigl_frame && m_shader.crtemu) {
+		// Native frames in a dma-buf backed surface reach the GPU without an upload.
+		const GLuint frame_texture = surface && !mon->screen_is_picasso
+			? begin_dmabuf_frame(surface, is_cropped ? crop_x : 0, is_cropped ? crop_y : 0, src_w, src_h)
+			: 0;
+
+		// The final CRT pass must land in the window's framebuffer (0 on
+		// desktop GL, SDL's UIKit view FBO on iOS).
+		m_shader.crtemu->default_framebuffer = window_framebuffer;
+
 		// crtemu_present expects attribute 0 to be enabled.
 		glEnableVertexAttribArray(0);
 		// Disable other attributes that might have been enabled by OSD or other passes
@@ -852,7 +1390,10 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		m_shader.crtemu->skip_aspect_correction = true;
 		m_shader.crtemu->desired_aspect = desired_aspect;
 
-		if (is_cropped && surface) {
+		if (frame_texture) {
+			crtemu_present_texture(m_shader.crtemu, time * 1000, frame_texture, src_w, src_h, 0xffffffff, 0x000000);
+			end_dmabuf_frame(surface);
+		} else if (is_cropped && surface) {
 			uae_u8* crop_ptr = static_cast<uae_u8*>(surface->pixels) + (crop_y * surface->pitch) + (crop_x * m_gl_format.bpp);
 
 			crtemu_present(m_shader.crtemu, time * 1000, reinterpret_cast<const CRTEMU_U32*>(crop_ptr),
@@ -864,7 +1405,8 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	}
 
 	if (use_shader_resolve) {
-		render_shader_resolve(final_rect.x, glDestY, final_rect.w, final_rect.h);
+		render_shader_resolve(final_rect.x, glDestY, final_rect.w, final_rect.h,
+			window_framebuffer);
 	}
 
 	render_software_cursor(monid, final_rect.x, glDestY, final_rect.w, final_rect.h);
@@ -930,12 +1472,15 @@ void OpenGLRenderer::render_external_shader(ExternalShader* shader, const int mo
 	// Per-shader frame counter — only ticks while this shader actually renders.
 	static int frame_count = 0;
 
-	// Per-shader texture upload cache. last_w/last_h/last_texture track whether
-	// we need a full glTexImage2D allocation or just a glTexSubImage2D upload.
-	// Reset when the shader program changes (i.e. user picked a different shader).
-	static GLuint last_shader_program = 0;
-	static int last_w = 0, last_h = 0;
-	static GLuint last_texture = 0;
+	// Per-shader texture upload cache: whether the texture needs a full
+	// glTexImage2D allocation or just a glTexSubImage2D upload. Reset when the
+	// shader program changes (another shader), and with the shaders and the
+	// context: a new context can hand out the same program and texture names,
+	// which would skip the allocation its texture needs.
+	GLuint& last_shader_program = m_external_upload.program;
+	int& last_w = m_external_upload.width;
+	int& last_h = m_external_upload.height;
+	GLuint& last_texture = m_external_upload.texture;
 	const GLuint current_program = shader->get_program();
 	if (current_program != last_shader_program) {
 		last_shader_program = current_program;
@@ -1069,6 +1614,7 @@ void OpenGLRenderer::destroy_shaders()
 
 	// Clear tracked name so next alloc_texture call will recreate
 	m_shader.loaded_name.clear();
+	m_external_upload = {};
 
 	// Early exit if no GL context exists (e.g., quitting before emulation started)
 	if (!has_context())
@@ -1278,23 +1824,17 @@ BezelHoleInfo OpenGLRenderer::get_bezel_hole_info() const
 void OpenGLRenderer::get_gfx_offset(int monid, float src_w, float src_h, float src_x, float src_y,
 	float* dx, float* dy, float* mx, float* my)
 {
-	const amigadisplay* ad = &adisplays[monid];
-	SDL_Surface* surface = get_amiga_surface(monid);
-
 	*dx = 0; *dy = 0; *mx = 1.0f; *my = 1.0f;
+	if (!get_amiga_surface(monid))
+		return;
 
-	if (surface && render_quad.w > 0 && render_quad.h > 0) {
-		if (src_w > 0) *mx = static_cast<float>(render_quad.w) / src_w;
-		if (src_h > 0) *my = static_cast<float>(render_quad.h) / src_h;
-
-		if (ad->picasso_on) {
-			*dx = -static_cast<float>(render_quad.x) + src_x * (*mx);
-			*dy = -static_cast<float>(render_quad.y) + src_y * (*my);
-		} else {
-			*dx = static_cast<float>(render_quad.x) / (*mx) - src_x;
-			*dy = static_cast<float>(render_quad.y) / (*my) - src_y;
-		}
-	}
+	const AmiberryGfxInputOffset offset = amiberry_gfx_input_offset(
+		{ render_quad.x, render_quad.y, render_quad.w, render_quad.h },
+		src_x, src_y, src_w, src_h, adisplays[monid].picasso_on);
+	*dx = offset.dx;
+	*dy = offset.dy;
+	*mx = offset.mx;
+	*my = offset.my;
 }
 
 void OpenGLRenderer::get_drawable_size(SDL_Window* w, int* width, int* height)

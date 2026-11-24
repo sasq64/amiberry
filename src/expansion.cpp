@@ -23,7 +23,6 @@
 #endif
 #include "cdtv.h"
 #include "cdtvcr.h"
-#include "threaddep/thread.h"
 #ifdef A2091
 #include "a2091.h"
 #endif
@@ -1049,28 +1048,28 @@ addrbank romboardmem_bank[MAX_ROM_BOARDS] =
 	{
 		romboardmem0_lget, romboardmem0_wget, romboardmem0_bget,
 		empty_put, empty_put, empty_put,
-		romboardmem0_xlate, romboardmem0_check, NULL, _T("*"), _T("ROM board"),
+		romboardmem0_xlate, romboardmem0_check, NULL, _T("*"), _T("Custom ROM board #1"),
 		romboardmem0_lget, romboardmem0_wget,
 		ABFLAG_ROM | ABFLAG_THREADSAFE | ABFLAG_CACHE_ENABLE_ALL | ABFLAG_DIRECTACCESS, 0, 0
 	},
 	{
 		romboardmem1_lget, romboardmem1_wget, romboardmem1_bget,
 		empty_put, empty_put, empty_put,
-		romboardmem1_xlate, romboardmem1_check, NULL, _T("*"), _T("ROM board"),
+		romboardmem1_xlate, romboardmem1_check, NULL, _T("*"), _T("Custom ROM board #2"),
 		romboardmem1_lget, romboardmem1_wget,
 		ABFLAG_ROM | ABFLAG_THREADSAFE | ABFLAG_CACHE_ENABLE_ALL | ABFLAG_DIRECTACCESS, 0, 0
 	},
 	{
 		romboardmem2_lget, romboardmem2_wget, romboardmem2_bget,
 		empty_put, empty_put, empty_put,
-		romboardmem2_xlate, romboardmem2_check, NULL, _T("*"), _T("ROM board"),
+		romboardmem2_xlate, romboardmem2_check, NULL, _T("*"), _T("Custom ROM board #3"),
 		romboardmem2_lget, romboardmem2_wget,
 		ABFLAG_ROM | ABFLAG_THREADSAFE | ABFLAG_CACHE_ENABLE_ALL | ABFLAG_DIRECTACCESS, 0, 0
 	},
 	{
 		romboardmem3_lget, romboardmem3_wget, romboardmem3_bget,
 		empty_put, empty_put, empty_put,
-		romboardmem3_xlate, romboardmem3_check, NULL, _T("*"), _T("ROM board"),
+		romboardmem3_xlate, romboardmem3_check, NULL, _T("*"), _T("Custom ROM board #4"),
 		romboardmem3_lget, romboardmem3_wget,
 		ABFLAG_ROM | ABFLAG_THREADSAFE | ABFLAG_CACHE_ENABLE_ALL | ABFLAG_DIRECTACCESS, 0, 0
 	}
@@ -2274,6 +2273,25 @@ uaecptr expansion_startaddress(struct uae_prefs *p, uaecptr addr, uae_u32 size)
 	return addr;
 }
 
+#ifdef AMIBERRY
+// What allocate_expamem() copies from changed_prefs before allocating the
+// boards, for a reset to call before it lays memory out (init_shm). Laid out
+// for the running boards, a board the reset brought in had no address yet,
+// or its old one: an RTG board that moved between Zorro III and Zorro II
+// kept its memory at the old address (a crash at the first access), and a
+// Zorro III RAM board turned on got the memory of chip RAM.
+void expamem_bring_in_boards(void)
+{
+	for (int i = 0; i < MAX_RTG_BOARDS; i++)
+		currprefs.rtgboards[i] = changed_prefs.rtgboards[i];
+	currprefs.z3chipmem.size = changed_prefs.z3chipmem.size;
+	for (int i = 0; i < MAX_RAM_BOARDS; i++) {
+		currprefs.fastmem[i].size = changed_prefs.fastmem[i].size;
+		currprefs.z3fastmem[i].size = changed_prefs.z3fastmem[i].size;
+	}
+}
+#endif
+
 static void allocate_expamem (void)
 {
 	for (int i = 0; i < MAX_RTG_BOARDS; i++) {
@@ -2380,7 +2398,11 @@ static void allocate_expamem (void)
 		mapped_free (gfxmem_banks[0]);
 		if (rbc->rtgmem_type < GFXBOARD_HARDWARE)
 			mapped_malloc_dynamic (&rbc->rtgmem_size, &changed_prefs.rtgboards[0].rtgmem_size, gfxmem_banks[0], 1, NULL);
-		memory_hardreset (1);
+		// These framebuffer boards allocate private VRAM, so this bank stays empty.
+		// Configuration changes are handled by init_shm() before memory_reset().
+		if (rbc->rtgmem_type != GFXBOARD_ID_ZZ9000_Z2 && rbc->rtgmem_type != GFXBOARD_ID_ZZ9000_Z3 &&
+			rbc->rtgmem_type != GFXBOARD_ID_HARLEQUIN && rbc->rtgmem_type != GFXBOARD_ID_RAINBOWII)
+			memory_hardreset (1);
 	}
 #endif
 
@@ -4577,6 +4599,10 @@ static const struct expansionboardsettings mediator_settings[] = {
 		_T("swapconfig")
 	},
 	{
+		_T("Bus error on master abort"),
+		_T("masterabort")
+	},
+	{
 		NULL
 	}
 };
@@ -4584,6 +4610,10 @@ static const struct expansionboardsettings bridge_settings[] = {
 	{
 		_T("Full PCI DMA"),
 		_T("fulldma")
+	},
+	{
+		_T("Bus error on master abort"),
+		_T("masterabort")
 	},
 	{
 		NULL

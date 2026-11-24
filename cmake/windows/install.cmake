@@ -1,8 +1,19 @@
+# Native builds start with the current content-folder names rather than
+# triggering the legacy casing migration on every fresh portable install.
+set(_AMIBERRY_WINDOWS_CONTROLLERS_DIR controllers)
+set(_AMIBERRY_WINDOWS_ROMS_DIR roms)
+set(_AMIBERRY_WINDOWS_WHDBOOT_DIR whdboot)
+if(AMIBERRY_NATIVE_WINDOWS_UI)
+    set(_AMIBERRY_WINDOWS_CONTROLLERS_DIR Controllers)
+    set(_AMIBERRY_WINDOWS_ROMS_DIR ROMs)
+    set(_AMIBERRY_WINDOWS_WHDBOOT_DIR WHDBoot)
+endif()
+
 # Copy dirs to the build directory so we can debug locally
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/controllers
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>/controllers)
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/${_AMIBERRY_WINDOWS_CONTROLLERS_DIR})
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -12,12 +23,12 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/roms
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>/roms)
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/${_AMIBERRY_WINDOWS_ROMS_DIR})
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/whdboot
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>/whdboot)
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/${_AMIBERRY_WINDOWS_WHDBOOT_DIR})
 
 # Copy plugin DLLs to plugins/ subdirectory in build dir for local debugging
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -62,27 +73,48 @@ if(QEMU_UAE_PLUGIN)
     endif()
 endif()
 
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/controllers
-        DESTINATION ${CMAKE_INSTALL_BINDIR}
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/controllers/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/${_AMIBERRY_WINDOWS_CONTROLLERS_DIR}
         ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/data
         DESTINATION ${CMAKE_INSTALL_BINDIR}
         ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/roms
-        DESTINATION ${CMAKE_INSTALL_BINDIR}
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/roms/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/${_AMIBERRY_WINDOWS_ROMS_DIR}
         ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/whdboot
-        DESTINATION ${CMAKE_INSTALL_BINDIR}
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/whdboot/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/${_AMIBERRY_WINDOWS_WHDBOOT_DIR}
         ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
 
-# Bundle vcpkg runtime DLLs into the install directory using applocal.ps1
-# (same mechanism vcpkg uses at build time to copy DLLs next to the executable).
-# The x_vcpkg_install_local_dependencies function gates on "windows|uwp|xbox" platform
-# and excludes "mingw-dynamic", so we invoke applocal.ps1 directly.
+if(AMIBERRY_NATIVE_WINDOWS_UI)
+    # Keep the complete self-contained .NET / Windows App SDK deployment:
+    # individual DLL selection misses WinUI resources and runtime subfolders.
+    install(DIRECTORY "$<TARGET_FILE_DIR:${PROJECT_NAME}>/native-ui"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            ${AMIBERRY_PACKAGE_METADATA_EXCLUDES})
+endif()
+
+# Bundle vcpkg runtime DLLs beside the build and installed executables using
+# applocal.ps1. vcpkg's standard helper excludes mingw-dynamic, so invoke it
+# directly for both layouts.
 cmake_policy(SET CMP0087 NEW)
 
 z_vcpkg_set_powershell_path()
 
+set(_AMIBERRY_VCPKG_APPLOCAL "${Z_VCPKG_TOOLCHAIN_DIR}/msbuild/applocal.ps1")
+set(_AMIBERRY_VCPKG_INSTALLED_BIN "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_AMIBERRY_VCPKG_INSTALLED_BIN "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin")
+endif()
+
+if(EXISTS "${_AMIBERRY_VCPKG_APPLOCAL}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND "${Z_VCPKG_POWERSHELL_PATH}" -noprofile -executionpolicy Bypass
+            -file "${_AMIBERRY_VCPKG_APPLOCAL}"
+            -targetBinary "$<TARGET_FILE:${PROJECT_NAME}>"
+            -installedDir "${_AMIBERRY_VCPKG_INSTALLED_BIN}"
+        COMMENT "Copying vcpkg runtime DLLs beside ${PROJECT_NAME}")
+endif()
 install(CODE "
     set(_applocal \"${Z_VCPKG_TOOLCHAIN_DIR}/msbuild/applocal.ps1\")
     set(_target \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/$<TARGET_FILE_NAME:${PROJECT_NAME}>\")

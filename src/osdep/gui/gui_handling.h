@@ -4,6 +4,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <vector>
 #include "amiberry_gfx.h"
 #include "amiberry_input.h"
 #include "filesys.h"
@@ -26,129 +27,6 @@ extern float TITLEBAR_HEIGHT;
 extern float SELECTOR_WIDTH;
 extern float SELECTOR_HEIGHT;
 extern float SCROLLBAR_WIDTH;
-
-struct amigamodels
-{
-	int compalevels;
-	char name[32];
-	char configs[8][128];
-};
-
-static amigamodels amodels[] = {
-	{
-		4, "Amiga 500", {
-			"1.3 ROM, OCS, 512 KB Chip + 512 KB Slow RAM (most common)",
-			"1.3 ROM, ECS Agnus, 512 KB Chip RAM + 512 KB Slow RAM",
-			"1.3 ROM, ECS Agnus, 1 MB Chip RAM",
-			"1.3 ROM, OCS Agnus, 512 KB Chip RAM",
-			"1.2 ROM, OCS Agnus, 512 KB Chip RAM",
-			"1.2 ROM, OCS Agnus, 512 KB Chip RAM + 512 KB Slow RAM",
-			"\0"
-		}
-	},
-	{
-		4, "Amiga 500+", {
-			"Basic non-expanded configuration",
-			"2 MB Chip RAM expanded configuration",
-			"4 MB Fast RAM expanded configuration",
-			"\0"
-		}
-	},
-	{
-		4, "Amiga 600", {
-			"Basic non-expanded configuration",
-			"2 MB Chip RAM expanded configuration",
-			"4 MB Fast RAM expanded configuration",
-			"8 MB Fast RAM expanded configuration"
-			"\0"
-		}
-	},
-	{
-		4, "Amiga 1000", {
-			"512 KB Chip RAM",
-			"ICS Denise without EHB support",
-			"256 KB Chip RAM",
-			"A1000 Velvet prototype",
-			"\0"
-		}
-	},
-	{
-		5, "Amiga 1200", {
-			"Basic non-expanded configuration",
-			"4 MB Fast RAM expanded configuration",
-#ifdef WITH_CPUBOARD
-			"Blizzard 1230 IV",
-			"Blizzard 1240",
-			"Blizzard 1260",
-#ifdef WITH_PPC
-			"Blizzard PPC",
-#endif
-#else
-			"8 MB Fast RAM expanded configuration"
-#endif
-			"\0"
-		}
-	},
-	{
-		2, "Amiga 3000", {
-			"1.4 ROM, 2MB Chip + 8MB Fast",
-			"2.04 ROM, 2MB Chip + 8MB Fast",
-			"3.1 ROM, 2MB Chip + 8MB Fast",
-			"\0"
-		}
-	},
-	{
-		1, "Amiga 4000", {
-			"68030, 3.1 ROM, 2MB Chip + 8MB Fast",
-			"68040, 3.1 ROM, 2MB Chip + 8MB Fast",
-#ifdef WITH_PPC
-			"CyberStorm PPC",
-#endif
-			"\0"
-		}
-	},
-	{
-		1, "Amiga 4000T", {
-			"68030, 3.1 ROM, 2MB Chip + 8MB Fast",
-			"68040, 3.1 ROM, 2MB Chip + 8MB Fast",
-			"\0"
-		}
-	},
-	{
-		4, "CD32", {
-			"CD32",
-			"CD32 with Full Motion Video cartridge",
-			"Cubo CD32",
-			"CD32, 8MB Fast"
-			"\0"
-		}
-	},
-	{
-		4, "CDTV", {
-			"CDTV",
-			"Floppy drive and 64KB SRAM card expanded",
-			"CDTV-CR",
-			"\0"
-		}
-	},
-	{4, "American Laser Games / Picmatic", {
-			"\0"
-		}
-	},
-	{
-		4, "Arcadia Multi Select system", {
-			"\0"
-		}
-	},
-	{
-		1, "Macrosystem", {
-			"DraCo",
-			"Casablanca",
-			"\0"
-		}
-	},
-	{-1}
-};
 
 inline const char* floppy_drive_types[] = {
 	"Disabled", "3.5\" DD", "3.5\" HD", "5.25\" (40)",
@@ -373,6 +251,7 @@ PANEL(about,              "About",              "amigainfo.png",  ICON_FA_CIRCLE
 PANEL(paths,              "Paths",              "paths.png",      ICON_FA_FOLDER_OPEN,  "General",    false, 4) \
 PANEL(quickstart,         "Quickstart",         "quickstart.png", ICON_FA_ROCKET,       "General",    true, -1) \
 PANEL(configurations,     "Configurations",     "file.png",       ICON_FA_FILE_LINES,   "General",    false, 1) \
+PANEL(whdload,            "WHDLoad",            "drive.png",      ICON_FA_DOWNLOAD,     "General",    true, -1) \
 PANEL(cpu,                "CPU and FPU",        "cpu.png",        ICON_FA_MICROCHIP,    "Hardware",   true, -1) \
 PANEL(chipset,            "Chipset",            "cpu.png",        ICON_FA_MICROCHIP,    "Hardware",   true, -1) \
 PANEL(adv_chipset,        "Adv. Chipset",       "cpu.png",        ICON_FA_GEARS,        "Hardware",   true, -1) \
@@ -389,14 +268,13 @@ PANEL(sound,              "Sound",              "sound.png",      ICON_FA_VOLUME
 PANEL(input,              "Input",              "joystick.png",   ICON_FA_GAMEPAD,      "Input / IO", false, 3) \
 PANEL(io,                 "IO Ports",           "port.png",       ICON_FA_PLUG,         "Input / IO", true, -1) \
 PANEL(custom,             "Custom controls",    "controller.png", ICON_FA_GEARS,        "Input / IO", true, -1) \
+PANEL(onscreen,             "On-Screen",          "keyboard.png",   ICON_FA_KEYBOARD,     "Input / IO", true, -1) \
 PANEL(diskswapper,        "Disk swapper",       "35floppy.png",   ICON_FA_SHUFFLE,      "Utility",    true, -1) \
 PANEL(misc,               "Miscellaneous",      "misc.png",       ICON_FA_WRENCH,       "Utility",    true, -1) \
 PANEL(global_settings,    "Global Settings",    "misc.png",       ICON_FA_SLIDERS,      "Utility",    true, -1) \
 PANEL(themes,             "Themes",             "misc.png",       ICON_FA_GEAR,         "Utility",    true, -1) \
 PANEL(prio,               "Priority",           "misc.png",       ICON_FA_GAUGE_HIGH,   "Utility",    true, -1) \
-PANEL(savestates,         "Savestates",         "savestate.png",  ICON_FA_BOOKMARK,     "Utility",    true, -1) \
-PANEL(virtual_keyboard,   "On-Screen",          "keyboard.png",   ICON_FA_KEYBOARD,     "Utility",    true, -1) \
-PANEL(whdload,            "WHDLoad",            "drive.png",      ICON_FA_DOWNLOAD,     "Storage",    true, -1)
+PANEL(savestates,         "Savestates",         "savestate.png",  ICON_FA_BOOKMARK,     "Utility",    true, -1)
 
 #endif
 
@@ -495,7 +373,10 @@ enum class whdboot_download_outcome
 	success,
 	partial_failure,
 	failed,
-	cancelled
+	cancelled,
+	// Another download is running, or a machine is running that the
+	// extraction must not touch.
+	busy
 };
 
 struct whdboot_download_progress
@@ -518,6 +399,20 @@ extern whdboot_download_result download_whdboot_assets(
 	const std::function<bool(const whdboot_download_progress&)>& progress_cb,
 	std::atomic<bool>* cancel_flag);
 
+// WHDLoad (whdload.de), the kickstart RTB files (Aminet skick346), JST
+// (Aminet) and the optional Amiga libraries (XPK, MMULib's 68040.library,
+// explode.library, medplayer.library) are not bundled with Amiberry and
+// are fetched on demand.
+extern bool whdboot_can_download();
+extern const std::vector<std::string>& whdboot_skick_rtb_files();
+// True once every optional Amiga library above is installed in the supplied
+// WHDBoot folder's Libs drawer.
+extern bool whdboot_optional_libraries_installed(const std::string& root);
+extern bool whdboot_optional_libraries_installed();
+// True while a machine runs unpaused (the built-in GUI or the native
+// settings window hold a paused one): downloads wait until it does not.
+extern bool whdboot_emulation_blocks_downloads();
+
 extern int fromdfxtype(int num, int dfx, int subtype);
 extern int todfxtype(int num, int dfx, int* subtype);
 extern void DisplayDiskInfo(int num);
@@ -539,8 +434,12 @@ extern void invalidate_gui_window_size_init();
 extern void SetLastLoadedConfig(const char* filename);
 extern void set_last_active_config(const char* filename);
 extern void set_last_active_config_from_media(const char* filename);
-extern void disk_selection(const int shortcut, uae_prefs* prefs);
-extern int disk_swap(int entry, int mode);
+// Asks for the file of a media or state hotkey (gui_display(0..6): DF0-DF3,
+// load state, save state, CD) with the GUI's requester and uses it;
+// close_gui leaves the GUI afterwards, unless the file could not be used
+// (the GUI stays to show why). after runs once the file was used.
+extern void request_disk_selection(int shortcut, bool close_gui, std::function<void()> after = nullptr);
+extern int disk_swap(int entry);
 extern int disk_in_drive(int entry);
 extern int populate_diskswapper_from_archive(const TCHAR *path, struct uae_prefs *prefs);
 

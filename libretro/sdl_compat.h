@@ -253,6 +253,17 @@ typedef int SDL_TimerID;
 typedef Sint64 SDL_TouchID;
 typedef Sint64 SDL_FingerID;
 
+/* Synthetic touch IDs SDL reports for mouse- and pen-generated touches. */
+#define SDL_MOUSE_TOUCHID ((SDL_TouchID)-1)
+#define SDL_PEN_TOUCHID ((SDL_TouchID)-2)
+
+typedef enum SDL_TouchDeviceType {
+	SDL_TOUCH_DEVICE_INVALID = -1,
+	SDL_TOUCH_DEVICE_DIRECT,
+	SDL_TOUCH_DEVICE_INDIRECT_ABSOLUTE,
+	SDL_TOUCH_DEVICE_INDIRECT_RELATIVE
+} SDL_TouchDeviceType;
+
 typedef enum SDL_Scancode {
 	SDL_SCANCODE_UNKNOWN = 0,
 	SDL_SCANCODE_A = 4,
@@ -371,7 +382,8 @@ typedef enum SDL_Scancode {
 	SDL_SCANCODE_AUDIOSTOP = 258,
 	SDL_SCANCODE_AUDIOPLAY = 259,
 	SDL_SCANCODE_AUDIOPREV = 260,
-	SDL_SCANCODE_AUDIONEXT = 261
+	SDL_SCANCODE_AUDIONEXT = 261,
+	SDL_SCANCODE_AC_BACK = 270
 } SDL_Scancode;
 
 #define SDL_SCANCODE_MEDIA_STOP SDL_SCANCODE_AUDIOSTOP
@@ -587,6 +599,8 @@ typedef enum SDL_GamepadAxis {
 	SDL_GAMEPAD_AXIS_COUNT
 } SDL_GamepadAxis;
 
+#define SDL_JOYSTICK_AXIS_MAX 32767
+
 typedef SDL_GamepadAxis SDL_GameControllerAxis;
 
 typedef enum SDL_GamepadBindingType {
@@ -692,6 +706,7 @@ enum {
 #define SDL_BUTTON_X1 4
 #define SDL_BUTTON_X2 5
 
+#define SDL_HAT_CENTERED 0x00
 #define SDL_HAT_UP 0x01
 #define SDL_HAT_RIGHT 0x02
 #define SDL_HAT_DOWN 0x04
@@ -852,11 +867,17 @@ void SDL_free(void* p);
 Uint64 SDL_GetPerformanceCounter(void);
 Uint64 SDL_GetPerformanceFrequency(void);
 Uint64 SDL_GetTicks(void);
+Uint64 SDL_GetTicksNS(void);
 void SDL_Delay(Uint32 ms);
+void SDL_DelayNS(Uint64 ns);
 
 int SDL_GetVersion(void);
 const char* SDL_GetPlatform(void);
 const char* SDL_GetBasePath(void);
+char* SDL_GetPrefPath(const char* org, const char* app);
+const char* SDL_GetAndroidExternalStoragePath(void);
+SDL_TouchDeviceType SDL_GetTouchDeviceType(SDL_TouchID touchID);
+bool SDL_HasJoystick(void);
 const char* SDL_GetCurrentVideoDriver(void);
 int SDL_GetNumVideoDisplays(void);
 SDL_DisplayID* SDL_GetDisplays(int* count);
@@ -953,6 +974,7 @@ const SDL_DisplayMode* SDL_GetWindowFullscreenMode(SDL_Window* window);
 bool SDL_SetWindowFullscreen(SDL_Window* window, bool fullscreen);
 bool SDL_SyncWindow(SDL_Window* window);
 bool SDL_GetWindowSizeInPixels(SDL_Window* window, int* w, int* h);
+float SDL_GetWindowPixelDensity(SDL_Window* window);
 bool SDL_SetWindowSize(SDL_Window* window, int w, int h);
 bool SDL_SetWindowPosition(SDL_Window* window, int x, int y);
 bool SDL_RaiseWindow(SDL_Window* window);
@@ -970,6 +992,7 @@ SDL_Cursor* SDL_GetCursor(void);
 bool SDL_ShowCursor(void);
 bool SDL_HideCursor(void);
 SDL_Cursor* SDL_CreateColorCursor(SDL_Surface* surface, int hot_x, int hot_y);
+bool SDL_AddSurfaceAlternateImage(SDL_Surface* surface, SDL_Surface* image);
 SDL_Cursor* SDL_CreateSystemCursor(SDL_SystemCursor id);
 void SDL_DestroyCursor(SDL_Cursor* cursor);
 bool SDL_SetCursor(SDL_Cursor* cursor);
@@ -1026,6 +1049,7 @@ int SDL_GetNumJoystickBalls(SDL_Joystick* joystick);
 int SDL_GetNumJoystickButtons(SDL_Joystick* joystick);
 int SDL_GetNumJoystickHats(SDL_Joystick* joystick);
 Sint16 SDL_GetJoystickAxis(SDL_Joystick* joystick, int axis);
+Uint8 SDL_GetJoystickHat(SDL_Joystick* joystick, int hat);
 Uint8 SDL_GetJoystickButton(SDL_Joystick* joystick, int button);
 int SDL_GetJoysticks(int** joysticks);
 int SDL_NumJoysticks(void);

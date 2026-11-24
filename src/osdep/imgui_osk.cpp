@@ -14,6 +14,22 @@
 #include "keyboard.h"
 #include "inputdevice.h"
 #include "on_screen_joystick.h"
+#ifdef LIBRETRO
+#include "imgui_osk_font.h"
+#endif
+
+// Touch-first keyboard chrome for the Android app: a visible Hide key (the
+// only other way out is the undiscoverable Back button) and docking under the
+// picture in portrait, see imgui_osk_bottom_inset_fraction(). Desktop and
+// libretro keep the original keyboard. Tests may predefine it to exercise
+// either variant.
+#ifndef AMIBERRY_OSK_TOUCH_CHROME
+#if defined(__ANDROID__) && !defined(LIBRETRO)
+#define AMIBERRY_OSK_TOUCH_CHROME 1
+#else
+#define AMIBERRY_OSK_TOUCH_CHROME 0
+#endif
+#endif
 
 // Font accessors declared in imgui_overlay.h
 
@@ -30,7 +46,12 @@ enum OskKeyType {
 	KEY_RETURN,
 	KEY_ARROW,
 	KEY_NUMPAD,
+	KEY_HIDE,       // hides the keyboard; sends nothing to the guest
 };
+
+// Key code of the Hide key: not an AK_* code, so press_key()/release_key()
+// ignore it and the release hides the keyboard instead.
+static constexpr int OSK_ACTION_HIDE = -2;
 
 // ============================================================
 // Key definition structure
@@ -161,6 +182,12 @@ static const OskKeyDef s_keys_us[] = {
 	{AR_X,       ROW_SPACE, 1.0f, KEY_H, AK_LF, "<", nullptr, KEY_ARROW},
 	{AR_X + 1.0f,ROW_SPACE, 1.0f, KEY_H, AK_DN, "v", nullptr, KEY_ARROW},
 	{AR_X + 2.0f,ROW_SPACE, 1.0f, KEY_H, AK_RT, ">", nullptr, KEY_ARROW},
+#if AMIBERRY_OSK_TOUCH_CHROME
+	// Hide key above the arrow cluster: the free top-right corner in both the
+	// compact and the numpad layout, reachable by touch and by D-pad (Up from
+	// Bksp, Right from Help).
+	{AR_X + 1.0f, ROW_FUNC, 1.0f, FUNC_H, OSK_ACTION_HIDE, "Hide", nullptr, KEY_HIDE},
+#endif
 
 	// ---- Optional numpad ----
 	// Row 0: ( ) / *
@@ -192,7 +219,7 @@ static const OskKeyDef s_keys_us[] = {
 	{NP_X + 2.0f,ROW_SHIFT, 1.0f, KEY_H, AK_NPDEL, ".", nullptr, KEY_NUMPAD},
 };
 
-static constexpr int NUM_MAIN_KEYS = 78;
+static constexpr int NUM_MAIN_KEYS = 78 + AMIBERRY_OSK_TOUCH_CHROME;
 static constexpr int NUM_NUMPAD_KEYS = 18;
 static constexpr int NUM_KEYS = sizeof(s_keys_us) / sizeof(s_keys_us[0]);
 static_assert(NUM_MAIN_KEYS + NUM_NUMPAD_KEYS == NUM_KEYS, "Unexpected on-screen keyboard layout size");
@@ -311,6 +338,7 @@ static ImU32 col_key_arrow;
 static ImU32 col_key_numpad;
 static ImU32 col_key_space;
 static ImU32 col_key_return;
+static ImU32 col_key_hide;
 
 static void init_colors()
 {
@@ -332,6 +360,7 @@ static void init_colors()
 	col_key_numpad     = IM_COL32(206, 192, 168, 255);   // slightly cooler beige
 	col_key_space      = IM_COL32(236, 224, 200, 255);   // space bar (lighter)
 	col_key_return     = IM_COL32(206, 192, 168, 255);   // return key
+	col_key_hide       = IM_COL32(150, 56, 44, 255);     // muted red (Hide)
 }
 
 // ============================================================
@@ -348,6 +377,10 @@ static float s_transparency = 0.85f; // configurable alpha
 static bool s_numpad_enabled = false;
 
 static int s_focused_key = -1; // currently focused key (for D-pad navigation)
+
+// Directions whose rising edges were suppressed while a key was held; only
+// these are replayed on the key's release.
+static int s_suppressed_dirs = 0;
 static std::set<int> s_sticky_keys; // set of AK_* codes for active sticky modifiers
 static std::map<int, int> s_finger_keys; // finger_id -> key index mapping
 static std::set<int> s_pressed_keys; // set of key indices currently pressed (touch)
@@ -394,6 +427,7 @@ static void reset_navigation_state()
 {
 	s_prev_joy_state = 0;
 	s_repeat_dir = 0;
+	s_suppressed_dirs = 0;
 	s_repeat_start_time = 0;
 	s_repeat_last_time = 0;
 }
@@ -465,10 +499,52 @@ static ImU32 get_key_color(const OskKeyDef& key)
 	case KEY_RETURN:    return col_key_return;
 	case KEY_ARROW:     return col_key_arrow;
 	case KEY_NUMPAD:    return col_key_numpad;
+	case KEY_HIDE:      return col_key_hide;
 	default:            return col_key_normal;
 	}
 }
 
+// Advance the slide animation and compute the current plate offset and
+// opacity. Shared by the native ImGui overlay and the libretro framebuffer
+// renderer. Returns false when nothing should be drawn.
+static bool osk_render_prepare(float& anim_offset, float& alpha)
+{
+	float offset = 0.0f;
+	if (s_animating) {
+		float elapsed = static_cast<float>(SDL_GetTicks() - s_anim_start_time);
+		float t = elapsed / ANIM_DURATION_MS;
+		if (t >= 1.0f) {
+			t = 1.0f;
+			s_animating = false;
+		}
+		// Ease-out cubic
+		float ease = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+
+		if (s_visible) {
+			s_anim_progress = ease;
+			offset = s_kb_h * (1.0f - ease);
+		} else {
+			s_anim_progress = 1.0f - ease;
+			offset = s_kb_h * ease;
+			if (!s_animating) {
+				s_anim_progress = 0.0f;
+				return false;
+			}
+		}
+	} else if (!s_visible) {
+		return false;
+	}
+
+	const float a = s_transparency * s_anim_progress;
+	if (a <= 0.0f)
+		return false;
+
+	anim_offset = offset;
+	alpha = a;
+	return true;
+}
+
+#ifndef LIBRETRO
 static void draw_key(ImDrawList* dl, const OskKeyDef& key, int key_index,
 	float kx, float ky, float kw, float kh, float alpha, ImFont* font, ImFont* font_small)
 {
@@ -556,7 +632,7 @@ static void draw_key(ImDrawList* dl, const OskKeyDef& key, int key_index,
 	if (is_pressed)
 		// Pressed keys now glow bright amber — dark text reads better.
 		label_col = apply_alpha(col_key_label, alpha);
-	else if (is_sticky || key.type == KEY_FUNCTION)
+	else if (is_sticky || key.type == KEY_FUNCTION || key.type == KEY_HIDE)
 		label_col = apply_alpha(col_key_label_dark, alpha);
 	else
 		label_col = apply_alpha(col_key_label, alpha);
@@ -613,6 +689,364 @@ static void draw_key(ImDrawList* dl, const OskKeyDef& key, int key_index,
 		}
 	}
 }
+#endif // LIBRETRO
+
+// ============================================================
+// Framebuffer renderer (LIBRETRO builds only)
+//
+// rasterised into a presentation-only copy of the Amiga surface, which the
+// frontend receives through video_cb. With no ImGui context available, keys
+// are blitted by a small fixed-function rasteriser using the built-in 8x8
+// bitmap font (imgui_osk_font.h).
+// ============================================================
+#ifdef LIBRETRO
+
+struct FbTarget {
+	uint8_t* base;
+	int w, h, pitch;
+	int rshift, gshift, bshift;
+};
+
+// Begin a blit target for the surface's native pixel format. The libretro
+// surface is 4 bytes per pixel (ARGB8888 or XRGB8888); anything else is
+// rejected. The stubbed SDL_GetPixelFormatDetails returns a static
+// descriptor, so nothing is freed here.
+static bool fb_target_begin(const SDL_Surface* s, FbTarget& t)
+{
+	const SDL_PixelFormatDetails* d = SDL_GetPixelFormatDetails(s->format);
+	if (!d || d->bytes_per_pixel != 4)
+		return false;
+	t.base = static_cast<uint8_t*>(s->pixels);
+	t.w = s->w;
+	t.h = s->h;
+	t.pitch = s->pitch;
+	t.rshift = d->Rshift;
+	t.gshift = d->Gshift;
+	t.bshift = d->Bshift;
+	return true;
+}
+
+// Alpha-blend a solid colour over one pixel-row span:
+// out = src*a + dst*(1-a), per channel. a is 0..255.
+static void fb_blend_row(FbTarget& t, int x0, int x1, int y,
+	int r, int g, int b, int a)
+{
+	if (y < 0 || y >= t.h)
+		return;
+	if (x0 < 0)
+		x0 = 0;
+	if (x1 > t.w)
+		x1 = t.w;
+	if (x1 <= x0)
+		return;
+
+	if (a >= 255) {
+		const uint32_t v = static_cast<uint32_t>(r) << t.rshift
+			| static_cast<uint32_t>(g) << t.gshift
+			| static_cast<uint32_t>(b) << t.bshift;
+		uint32_t* p = reinterpret_cast<uint32_t*>(
+			t.base + static_cast<size_t>(y) * t.pitch
+			+ static_cast<size_t>(x0) * 4);
+		for (int x = x0; x < x1; x++)
+			p[x - x0] = v;
+		return;
+	}
+	if (a <= 0)
+		return;
+
+	const int inv = 255 - a;
+	uint32_t* p = reinterpret_cast<uint32_t*>(
+		t.base + static_cast<size_t>(y) * t.pitch
+		+ static_cast<size_t>(x0) * 4);
+	const uint32_t* const end = p + (x1 - x0);
+	for (; p != end; ++p) {
+		const uint32_t cur = *p;
+		const int nr = (r * a + static_cast<int>((cur >> t.rshift) & 0xFF) * inv) >> 8;
+		const int ng = (g * a + static_cast<int>((cur >> t.gshift) & 0xFF) * inv) >> 8;
+		const int nb = (b * a + static_cast<int>((cur >> t.bshift) & 0xFF) * inv) >> 8;
+		*p = static_cast<uint32_t>(nr) << t.rshift
+			| static_cast<uint32_t>(ng) << t.gshift
+			| static_cast<uint32_t>(nb) << t.bshift;
+	}
+}
+
+// Solid-colour rectangle fill, clipped to the target.
+static void fb_rect(FbTarget& t, int x0, int y0, int x1, int y1,
+	int r, int g, int b, int a)
+{
+	if (y0 < 0)
+		y0 = 0;
+	if (y1 > t.h)
+		y1 = t.h;
+	for (int y = y0; y < y1; y++)
+		fb_blend_row(t, x0, x1, y, r, g, b, a);
+}
+
+// Solid-colour rectangle outline with the given thickness.
+static void fb_rect_outline(FbTarget& t, int x0, int y0, int x1, int y1,
+	int r, int g, int b, int a, int thickness)
+{
+	fb_rect(t, x0, y0, x1, y0 + thickness, r, g, b, a);
+	fb_rect(t, x0, y1 - thickness, x1, y1, r, g, b, a);
+	fb_rect(t, x0, y0, x0 + thickness, y1, r, g, b, a);
+	fb_rect(t, x1 - thickness, y0, x1, y1, r, g, b, a);
+}
+
+// Filled triangle via horizontal scanline spans.
+static void fb_tri(FbTarget& t,
+	int ax, int ay, int bx, int by, int cx, int cy,
+	int r, int g, int b, int a)
+{
+	int ymin = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
+	int ymax = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
+	if (ymin < 0)
+		ymin = 0;
+	if (ymax > t.h)
+		ymax = t.h;
+	for (int y = ymin; y < ymax; y++) {
+		float span[2];
+		int n = 0;
+		auto cross = [&](int x0, int y0, int x1, int y1) {
+			if ((y0 <= y && y < y1) || (y1 <= y && y < y0))
+				span[n++] = static_cast<float>(x0)
+					+ static_cast<float>(x1 - x0)
+						* static_cast<float>(y - y0)
+						/ static_cast<float>(y1 - y0);
+		};
+		cross(ax, ay, bx, by);
+		cross(bx, by, cx, cy);
+		cross(cx, cy, ax, ay);
+		if (n < 2)
+			continue;
+		const int lo = static_cast<int>(span[0] < span[1] ? span[0] : span[1]);
+		const int hi = static_cast<int>(span[0] > span[1] ? span[0] : span[1]) + 1;
+		fb_blend_row(t, lo, hi, y, r, g, b, a);
+	}
+}
+
+// Rasterise a label in the built-in 8x8 bitmap font, scaled by an integer
+// factor and centred at (cx, cy). Characters outside the font range
+// (space, non-ASCII) just advance the pen.
+static void fb_text(FbTarget& t, const char* label, int cx, int cy, int scale,
+	int r, int g, int b, int a)
+{
+	const int tw = static_cast<int>(std::strlen(label)) * 8 * scale;
+	int x = cx - tw / 2;
+	const int y0 = cy - 4 * scale;
+	for (const char* p = label; *p; ++p, x += 8 * scale) {
+		const unsigned char c = static_cast<unsigned char>(*p);
+		if (c < OSK_FONT_FIRST_CHAR
+			|| c >= OSK_FONT_FIRST_CHAR + OSK_FONT_GLYPHS)
+			continue;
+		const uint8_t* glyph = &osk_font_8x8[(c - OSK_FONT_FIRST_CHAR) * 8];
+		for (int row = 0; row < 8; row++) {
+			const uint8_t bits = glyph[row];
+			if (!bits)
+				continue;
+			for (int col = 0; col < 8; col++) {
+				if (!(bits & (1u << col)))
+					continue;
+				fb_rect(t, x + col * scale, y0 + row * scale,
+					x + (col + 1) * scale, y0 + (row + 1) * scale,
+					r, g, b, a);
+			}
+		}
+	}
+}
+
+struct FbCol { int r, g, b, a; };
+
+// Unpack an ImU32 using ImGui's channel packing, after applying opacity.
+static FbCol fb_col(ImU32 c, float alpha)
+{
+	const ImU32 v = apply_alpha(c, alpha);
+	return {
+		static_cast<int>((v >> IM_COL32_R_SHIFT) & 0xFF),
+		static_cast<int>((v >> IM_COL32_G_SHIFT) & 0xFF),
+		static_cast<int>((v >> IM_COL32_B_SHIFT) & 0xFF),
+		static_cast<int>((v >> IM_COL32_A_SHIFT) & 0xFF)
+	};
+}
+
+// Fixed-function equivalent of the native draw_key: shadowed body with
+// bevels, decoration stripe, focus ring and a scaled bitmap label or
+// arrow triangle.
+static void fb_draw_key(FbTarget& t, const OskKeyDef& key, int key_index,
+	int kx, int ky, int kw, int kh, float alpha)
+{
+	const bool is_pressed = s_pressed_keys.count(key_index) > 0;
+	const bool is_sticky = s_sticky_keys.count(key.ak_code) > 0;
+	const bool is_focused = (key_index == s_focused_key);
+
+	ImU32 body_src;
+	if (is_pressed)
+		body_src = col_key_pressed;
+	else if (is_sticky)
+		body_src = col_key_sticky_active;
+	else
+		body_src = get_key_color(key);
+	const FbCol body = fb_col(body_src, alpha);
+
+	// Drop shadow (offset down)
+	const FbCol sh = fb_col(col_key_shadow, alpha);
+	fb_rect(t, kx + 1, ky + 3, kx + kw + 1, ky + kh + 3, sh.r, sh.g, sh.b, sh.a);
+
+	// Key body
+	fb_rect(t, kx, ky, kx + kw, ky + kh, body.r, body.g, body.b, body.a);
+
+	if (is_pressed) {
+		// Glow ring around pressed key for strong feedback
+		const FbCol glow = fb_col(IM_COL32(255, 210, 100, 180), alpha);
+		fb_rect_outline(t, kx - 1, ky - 1, kx + kw + 1, ky + kh + 1,
+			glow.r, glow.g, glow.b, glow.a, 2);
+	} else {
+		// Top highlight strip (subtle gloss)
+		const FbCol bl = fb_col(col_bevel_light, alpha * 0.55f);
+		fb_rect(t, kx + 3, ky + 1, kx + kw - 3, ky + 3, bl.r, bl.g, bl.b, bl.a);
+		// Bottom shadow strip
+		const FbCol bd = fb_col(col_bevel_dark, alpha * 0.45f);
+		fb_rect(t, kx + 3, ky + kh - 3, kx + kw - 3, ky + kh - 1,
+			bd.r, bd.g, bd.b, bd.a);
+		// Outline for crisper definition against the dark plate
+		const FbCol border = fb_col(IM_COL32(40, 32, 24, 120), alpha);
+		fb_rect_outline(t, kx, ky, kx + kw, ky + kh,
+			border.r, border.g, border.b, border.a, 1);
+	}
+
+	// Amiga key decoration: coloured stripe
+	if (key.type == KEY_AMIGA_L || key.type == KEY_AMIGA_R) {
+		const FbCol ac = fb_col(
+			key.type == KEY_AMIGA_L ? col_amiga_l : col_amiga_r, alpha);
+		const int stripe_h = kh / 6;
+		fb_rect(t, kx + 4, ky + kh - stripe_h - 4, kx + kw - 4, ky + kh - 4,
+			ac.r, ac.g, ac.b, ac.a);
+	}
+
+	// Focus border (for D-pad navigation)
+	if (is_focused) {
+		const FbCol fc = fb_col(col_focus_border, alpha);
+		fb_rect_outline(t, kx - 1, ky - 1, kx + kw + 1, ky + kh + 1,
+			fc.r, fc.g, fc.b, fc.a, 3);
+	}
+
+	// Label colour
+	ImU32 label_src;
+	if (is_pressed)
+		label_src = col_key_label;
+	else if (is_sticky || key.type == KEY_FUNCTION)
+		label_src = col_key_label_dark;
+	else
+		label_src = col_key_label;
+	const FbCol lc = fb_col(label_src, alpha);
+
+	// Arrow keys: draw triangle shapes instead of text
+	if (key.type == KEY_ARROW) {
+		const int cx = kx + kw / 2;
+		const int cy = ky + kh / 2;
+		const int sz = (kw < kh ? kw : kh) / 4;
+		switch (key.ak_code) {
+		case AK_UP:
+			fb_tri(t, cx, cy - sz, cx - sz, cy + sz, cx + sz, cy + sz,
+				lc.r, lc.g, lc.b, lc.a);
+			break;
+		case AK_DN:
+			fb_tri(t, cx - sz, cy - sz, cx + sz, cy - sz, cx, cy + sz,
+				lc.r, lc.g, lc.b, lc.a);
+			break;
+		case AK_LF:
+			fb_tri(t, cx - sz, cy, cx + sz, cy - sz, cx + sz, cy + sz,
+				lc.r, lc.g, lc.b, lc.a);
+			break;
+		case AK_RT:
+			fb_tri(t, cx + sz, cy, cx - sz, cy - sz, cx - sz, cy + sz,
+				lc.r, lc.g, lc.b, lc.a);
+			break;
+		default:
+			break;
+		}
+		return;
+	}
+
+	// Text label — apply language overrides if active
+	const bool show_shifted = s_sticky_keys.count(AK_LSH) > 0
+		|| s_sticky_keys.count(AK_RSH) > 0;
+	const char* base_label = key.label;
+	const char* base_shift = key.shift_label;
+	const OskLabelOverride* ovr = find_override(key.ak_code);
+	if (ovr) {
+		base_label = ovr->label;
+		base_shift = ovr->shift_label;
+	}
+	const char* label = (show_shifted && base_shift) ? base_shift : base_label;
+	if (!label || !label[0])
+		return;
+
+	// Integer font scale from key height, shrunk while the label overflows
+	// the key width.
+	int scale = static_cast<int>(kh * 0.55f / 8.0f + 0.5f);
+	if (scale < 1)
+		scale = 1;
+	if (scale > 4)
+		scale = 4;
+	while (scale > 1
+		&& static_cast<int>(std::strlen(label)) * 8 * scale > kw * 11 / 12)
+		scale--;
+
+	fb_text(t, label, kx + kw / 2, ky + kh / 2, scale,
+		lc.r, lc.g, lc.b, lc.a);
+}
+
+// Libretro render entry point: rasterise the keyboard into the caller-owned
+// presentation surface. The emulation surface must remain untouched.
+static void render_framebuffer(SDL_Surface* surface)
+{
+	if (!surface)
+		return;
+
+	FbTarget t;
+	if (!fb_target_begin(surface, t))
+		return;
+
+	compute_geometry(t.w, t.h);
+
+	float anim_offset, alpha;
+	if (!osk_render_prepare(anim_offset, alpha))
+		return;
+
+	const int kb_x = static_cast<int>(s_kb_x);
+	const int kb_y = static_cast<int>(s_kb_y + anim_offset);
+	const int kb_w = static_cast<int>(s_kb_w);
+	const int kb_h = static_cast<int>(s_kb_h);
+
+	// Soft drop shadow above the keyboard to blend with the emulation view
+	const int shadow_h = 8;
+	for (int i = shadow_h; i >= 1; i--) {
+		const int a = static_cast<int>(
+			120.0f * alpha * (shadow_h - i + 1) / shadow_h + 0.5f);
+		fb_rect(t, kb_x, kb_y - i, kb_x + kb_w, kb_y - i + 1, 0, 0, 0, a);
+	}
+
+	// Keyboard plate
+	const FbCol plate = fb_col(col_kb_bg, alpha);
+	fb_rect(t, kb_x, kb_y, kb_x + kb_w, kb_y + kb_h,
+		plate.r, plate.g, plate.b, plate.a);
+
+	// Thin highlight along top edge
+	const FbCol hl = fb_col(IM_COL32(200, 180, 150, 220), alpha);
+	fb_rect(t, kb_x + 12, kb_y + 1, kb_x + kb_w - 12, kb_y + 2,
+		hl.r, hl.g, hl.b, hl.a);
+
+	// Draw all keys
+	for (int i = 0; i < active_key_count(); i++) {
+		float kx, ky, kw, kh;
+		key_to_screen(s_keys_us[i], anim_offset, &kx, &ky, &kw, &kh);
+		fb_draw_key(t, s_keys_us[i], i,
+			static_cast<int>(kx), static_cast<int>(ky),
+			static_cast<int>(kw), static_cast<int>(kh), alpha);
+	}
+}
+
+#endif // LIBRETRO
 
 // ============================================================
 // Public API
@@ -644,15 +1078,30 @@ void imgui_osk_shutdown()
 	s_initialized = false;
 	s_visible = false;
 	s_animating = false;
+	// Release every guest key the keyboard still owns before dropping the
+	// ownership sets: a key held down (or a sticky modifier left engaged,
+	// Caps Lock included) must not stay asserted in the guest after shutdown.
+	release_pressed_keys();
+	for (int mod : s_sticky_keys)
+		inputdevice_do_keyboard(mod, 0);
 	s_sticky_keys.clear();
-	s_finger_keys.clear();
-	s_pressed_keys.clear();
+	reset_navigation_state();
+	osk_control(0, 0, 0, 0, OskInputSource::Gamepad); // drop accumulated input-layer joystick state
+	osk_clear_controller_holds(); // clear navigation while retaining held gesture ownership
 }
 
 void imgui_osk_toggle()
 {
+#if defined(__ANDROID__) && !defined(LIBRETRO)
+	// The Android app's on-screen keyboard is the native Compose one
+	// (android_osk_toggle); the ImGui keyboard is never shown there. The
+	// AMIBERRY_NO_IMGUI build will drop this file's keyboard from Android
+	// entirely.
+	return;
+#else
 	if (!s_initialized)
 		return;
+#endif
 
 	if (s_visible) {
 		imgui_osk_hide();
@@ -674,6 +1123,23 @@ bool imgui_osk_is_active()
 bool imgui_osk_should_render()
 {
 	return s_visible || s_animating;
+}
+
+float imgui_osk_bottom_inset_fraction(const int width, const int height)
+{
+#if AMIBERRY_OSK_TOUCH_CHROME
+	// Portrait only: in landscape the picture is pillarboxed to the full
+	// height, so there is no free space above the keyboard to move it into.
+	if (!s_initialized || !imgui_osk_should_render() || width <= 0 || height <= width)
+		return 0.0f;
+	// The plate spans KB_HEIGHT_FRAC of the window and is s_anim_progress
+	// of the way in, so the picture follows the slide animation both ways.
+	return KB_HEIGHT_FRAC * s_anim_progress;
+#else
+	(void)width;
+	(void)height;
+	return 0.0f;
+#endif
 }
 
 void imgui_osk_set_transparency(float alpha)
@@ -708,9 +1174,25 @@ void imgui_osk_set_numpad(const bool enabled)
 		s_focused_key = 0;
 }
 
+#ifdef LIBRETRO
+// Native renderer objects are linked into the libretro core but are not used
+// by its platform path. Only the presentation-surface overload may rasterise.
+void imgui_osk_render() {}
+#endif
+
+#ifdef LIBRETRO
+void imgui_osk_render(SDL_Surface* surface)
+#else
 void imgui_osk_render()
+#endif
 {
-	if (!s_initialized || !imgui_overlay_is_initialized())
+	if (!s_initialized)
+		return;
+
+#ifdef LIBRETRO
+	render_framebuffer(surface);
+#else
+	if (!imgui_overlay_is_initialized())
 		return;
 
 	const ImVec2 display_size = ImGui::GetIO().DisplaySize;
@@ -718,35 +1200,8 @@ void imgui_osk_render()
 		return;
 	compute_geometry(static_cast<int>(display_size.x), static_cast<int>(display_size.y));
 
-	// Update animation
-	float anim_offset = 0.0f;
-	if (s_animating) {
-		float elapsed = static_cast<float>(SDL_GetTicks() - s_anim_start_time);
-		float t = elapsed / ANIM_DURATION_MS;
-		if (t >= 1.0f) {
-			t = 1.0f;
-			s_animating = false;
-		}
-		// Ease-out cubic
-		float ease = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
-
-		if (s_visible) {
-			s_anim_progress = ease;
-			anim_offset = s_kb_h * (1.0f - ease);
-		} else {
-			s_anim_progress = 1.0f - ease;
-			anim_offset = s_kb_h * ease;
-			if (!s_animating) {
-				s_anim_progress = 0.0f;
-				return;
-			}
-		}
-	} else if (!s_visible) {
-		return;
-	}
-
-	float alpha = s_transparency * s_anim_progress;
-	if (alpha <= 0.0f)
+	float anim_offset, alpha;
+	if (!osk_render_prepare(anim_offset, alpha))
 		return;
 
 	ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -784,7 +1239,7 @@ void imgui_osk_render()
 		key_to_screen(s_keys_us[i], anim_offset, &kx, &ky, &kw, &kh);
 		draw_key(dl, s_keys_us[i], i, kx, ky, kw, kh, alpha, font, font_small);
 	}
-
+#endif
 }
 
 // ============================================================
@@ -833,6 +1288,8 @@ bool imgui_osk_hit_test(float screen_x, float screen_y)
 
 static void press_key(int ak_code)
 {
+	if (ak_code == OSK_ACTION_HIDE)
+		return; // acts on release, never reaches the guest
 	if (is_modifier_key(ak_code)) {
 		// Toggle sticky modifier
 		if (s_sticky_keys.count(ak_code)) {
@@ -849,6 +1306,8 @@ static void press_key(int ak_code)
 
 static void release_key(int ak_code)
 {
+	if (ak_code == OSK_ACTION_HIDE)
+		return; // the caller hides the keyboard
 	if (!is_modifier_key(ak_code)) {
 		inputdevice_do_keyboard(ak_code, 0);
 
@@ -887,6 +1346,11 @@ void imgui_osk_hide()
 	s_animating = true;
 	s_anim_start_time = SDL_GetTicks();
 	reset_navigation_state();
+	// Drop any accumulated joystick state from the input layer: osk_control()
+	// only clears it when invoked while the keyboard is inactive, and callers
+	// may stop calling it the moment s_visible goes false.
+	osk_control(0, 0, 0, 0, OskInputSource::Gamepad);
+	osk_clear_controller_holds(); // clear navigation while retaining held gesture ownership
 }
 
 bool imgui_osk_handle_finger_down(float screen_x, float screen_y, int finger_id)
@@ -915,7 +1379,11 @@ bool imgui_osk_handle_finger_up(float screen_x, float screen_y, int finger_id)
 	s_pressed_keys.erase(key_idx);
 
 	if (key_idx >= 0 && key_idx < active_key_count()) {
-		release_key(s_keys_us[key_idx].ak_code);
+		const int ak_code = s_keys_us[key_idx].ak_code;
+		release_key(ak_code);
+		// Lifting the finger on Hide hides the keyboard, exactly like Back.
+		if (ak_code == OSK_ACTION_HIDE)
+			imgui_osk_hide();
 	}
 	return true;
 }
@@ -1064,6 +1532,50 @@ static int find_nearest_key(int from_idx, int direction)
 	return (best >= 0) ? best : from_idx;
 }
 
+// Advance key repeat while a direction is held. Called from
+// imgui_osk_process() on state changes and from imgui_osk_update() on the
+// input thread, because a held analog axis or D-pad produces no further
+// events until its value changes.
+static void osk_repeat_tick(const int dir_state, const bool suppress)
+{
+	// Suppress directional repeat while a key is held (or is being released):
+	// moving the focus under a pressed key would make the eventual release
+	// free the newly focused key instead of the one that was pressed.
+	if (suppress)
+		return;
+	if (!dir_state || dir_state != s_repeat_dir)
+		return;
+	const Uint64 now = SDL_GetTicks();
+	const Uint64 held = now - s_repeat_start_time;
+	if (held < REPEAT_DELAY_MS)
+		return;
+	const Uint64 since_last = now - s_repeat_last_time;
+	if (since_last >= REPEAT_RATE_MS) {
+		if (dir_state & OSK_UP)    s_focused_key = find_nearest_key(s_focused_key, OSK_UP);
+		if (dir_state & OSK_DOWN)  s_focused_key = find_nearest_key(s_focused_key, OSK_DOWN);
+		if (dir_state & OSK_LEFT)  s_focused_key = find_nearest_key(s_focused_key, OSK_LEFT);
+		if (dir_state & OSK_RIGHT) s_focused_key = find_nearest_key(s_focused_key, OSK_RIGHT);
+		s_repeat_last_time = now;
+	}
+}
+
+void imgui_osk_update()
+{
+	if (!s_initialized || !s_visible)
+		return;
+
+	// Drive key repeat while a direction is held: a stable analog axis or
+	// D-pad generates no further events, so the repeat timers must be polled
+	// here — on the input thread that owns imgui_osk_process(), never from
+	// rendering. The render thread must stay read-only with respect to
+	// focus/repeat state: advancing s_focused_key concurrently with a South
+	// release would free the newly focused key instead of the pressed one.
+	// Paused while a key is held (s_prev_joy_state holds the latest state).
+	osk_repeat_tick(s_prev_joy_state & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT),
+		(s_prev_joy_state & OSK_BUTTON) != 0);
+}
+
+
 bool imgui_osk_process(int state, int* keycode, int* pressed)
 {
 	if (!s_visible || !s_initialized)
@@ -1082,10 +1594,13 @@ bool imgui_osk_process(int state, int* keycode, int* pressed)
 
 	int dir_state = state & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT);
 	Uint64 now = SDL_GetTicks();
+	// Navigation is frozen while a key is held or being released this call:
+	// the release frees s_focused_key, which must not have moved since the
+	// corresponding press.
+	const bool button_held = (state & OSK_BUTTON) || (prev & OSK_BUTTON);
 
 	// Navigation on rising edge
-	bool moved = false;
-	if (rising & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT)) {
+	if (!button_held && (rising & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT))) {
 		if (rising & OSK_UP)    s_focused_key = find_nearest_key(s_focused_key, OSK_UP);
 		if (rising & OSK_DOWN)  s_focused_key = find_nearest_key(s_focused_key, OSK_DOWN);
 		if (rising & OSK_LEFT)  s_focused_key = find_nearest_key(s_focused_key, OSK_LEFT);
@@ -1093,37 +1608,41 @@ bool imgui_osk_process(int state, int* keycode, int* pressed)
 		s_repeat_dir = dir_state;
 		s_repeat_start_time = now;
 		s_repeat_last_time = now;
-		moved = true;
+	}
+	else if (button_held && (rising & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT))) {
+		// Remember suppressed rising edges: only these are replayed on the key
+		// release — directions held since before the press merely resume repeat.
+		s_suppressed_dirs |= rising & (OSK_UP | OSK_DOWN | OSK_LEFT | OSK_RIGHT);
+	}
+	// Partial release: the held-direction mask changed while a direction is
+	// still held (e.g. Right+Down -> Down released). Re-arm repeat for the
+	// remaining mask, or the tick's equality guard would stall it until every
+	// direction is re-pressed.
+	if (dir_state && dir_state != s_repeat_dir) {
+		s_repeat_dir = dir_state;
+		s_repeat_start_time = now;
+		s_repeat_last_time = now;
 	}
 
 	// Key repeat while direction held
-	if (!moved && dir_state && dir_state == s_repeat_dir) {
-		Uint64 held = now - s_repeat_start_time;
-		if (held >= REPEAT_DELAY_MS) {
-			Uint64 since_last = now - s_repeat_last_time;
-			if (since_last >= REPEAT_RATE_MS) {
-				if (dir_state & OSK_UP)    s_focused_key = find_nearest_key(s_focused_key, OSK_UP);
-				if (dir_state & OSK_DOWN)  s_focused_key = find_nearest_key(s_focused_key, OSK_DOWN);
-				if (dir_state & OSK_LEFT)  s_focused_key = find_nearest_key(s_focused_key, OSK_LEFT);
-				if (dir_state & OSK_RIGHT) s_focused_key = find_nearest_key(s_focused_key, OSK_RIGHT);
-				s_repeat_last_time = now;
-			}
-		}
-	}
+	osk_repeat_tick(dir_state, button_held);
 
-	// Direction released: reset repeat
+	// Direction released: reset repeat and drop its replay candidacy
 	if (!dir_state) {
 		s_repeat_dir = 0;
+		s_suppressed_dirs = 0;
 	}
 
 	// Button press/release
 	if (s_focused_key >= 0 && s_focused_key < active_key_count()) {
 		int ak = s_keys_us[s_focused_key].ak_code;
+		// The Hide key sends no guest key, so it reports none either.
+		const int reported = ak == OSK_ACTION_HIDE ? 0 : ak;
 
 		if (rising & OSK_BUTTON) {
 			s_pressed_keys.insert(s_focused_key);
 			press_key(ak);
-			*keycode = ak;
+			*keycode = reported;
 			*pressed = 1;
 			return true;
 		}
@@ -1131,8 +1650,34 @@ bool imgui_osk_process(int state, int* keycode, int* pressed)
 		if (falling & OSK_BUTTON) {
 			s_pressed_keys.erase(s_focused_key);
 			release_key(ak);
-			*keycode = ak;
+			*keycode = reported;
 			*pressed = 0;
+
+			if (ak == OSK_ACTION_HIDE) {
+				// Hide like Back. Focus returns to the first key so the next
+				// South after reopening types instead of hiding again.
+				s_focused_key = 0;
+				imgui_osk_hide();
+				return true;
+			}
+
+			// Directions whose rising edges were suppressed while the key was
+			// held are replayed now — one step, then armed repeat; directions
+			// held since before the press merely resume repeat without moving.
+			if (dir_state) {
+				const int replay = s_suppressed_dirs & dir_state;
+				// Replay once, then clear entirely: a direction released mid-hold
+				// leaves its bit behind otherwise, and any future suppression
+				// needs a fresh rising edge during a new hold.
+				s_suppressed_dirs = 0;
+				if (replay & OSK_UP)    s_focused_key = find_nearest_key(s_focused_key, OSK_UP);
+				if (replay & OSK_DOWN)  s_focused_key = find_nearest_key(s_focused_key, OSK_DOWN);
+				if (replay & OSK_LEFT)  s_focused_key = find_nearest_key(s_focused_key, OSK_LEFT);
+				if (replay & OSK_RIGHT) s_focused_key = find_nearest_key(s_focused_key, OSK_RIGHT);
+				s_repeat_dir = dir_state;
+				s_repeat_start_time = now;
+				s_repeat_last_time = now;
+			}
 			return true;
 		}
 	}

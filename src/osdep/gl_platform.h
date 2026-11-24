@@ -117,6 +117,12 @@ extern PFNGLGENERATEMIPMAPPROC glp_GenerateMipmap;
 #endif // __ANDROID__
 
 // GL format constants that may not be defined on all platforms
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER 0x812D
+#endif
 #ifndef GL_RGBA16F
 #define GL_RGBA16F 0x881A
 #endif
@@ -151,6 +157,24 @@ struct GlShaderPreambles {
 // profile (macOS) and GLES 3.0 (Android/RPi). Must be called after GL context
 // creation. Thread-safe for reads after first call.
 const GlShaderPreambles& get_gl_shader_preambles();
+
+// Runtime GL capability snapshot for the current context. Detected once per
+// process from GL_VERSION and the ES extension string, so feature
+// gates (float framebuffers, border-color wrap, sRGB write toggles) follow
+// the actual driver instead of platform compile-time guesses. Must be called
+// after GL context creation. Thread-safe for reads after first call.
+// The GlCapabilities struct and its pure classifier live in
+// gl_capability_classify.h so they are unit-testable without a GL context.
+#include "gl_capability_classify.h"
+
+const GlCapabilities& get_gl_capabilities();
+
+// GLSL #version string for ImGui_ImplOpenGL3_Init() on the current GL
+// context (per-context cached like the capabilities themselves), or nullptr
+// where the backend's own default is correct. Covers the tiers the backend's
+// default gets wrong: desktop GL 2.x needs "#version 120", GLES < 3 needs
+// "#version 100". Must be called with the context current.
+const char* get_imgui_glsl_version();
 
 #endif // USE_OPENGL
 

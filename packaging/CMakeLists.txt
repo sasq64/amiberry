@@ -57,9 +57,6 @@ set(CPACK_DMG_DS_STORE_SETUP_SCRIPT "${CMAKE_SOURCE_DIR}/packaging/dmg/AppDMGSet
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     set(_deb_arch "arm64")
     set(_rpm_arch "aarch64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    set(_deb_arch "armhf")
-    set(_rpm_arch "armhf")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     set(_deb_arch "riscv64")
     set(_rpm_arch "riscv64")
@@ -122,6 +119,18 @@ if(_deb_shlib_private_dirs)
     list(REMOVE_DUPLICATES _deb_shlib_private_dirs)
     list(JOIN _deb_shlib_private_dirs ";" CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS)
 endif()
+# FFmpeg libraries with a Debian/Ubuntu -extra flavour, as "<library>:<soversion>".
+# cmake/package_deb_shlibs_local.cmake turns these into "libfooNN | libfoo-extraNN"
+# dependencies so .deb installers keep an installed -extra flavour (issue #2423).
+set(CPACK_AMIBERRY_DEB_EXTRA_FLAVOUR_LIBS "")
+if(AMIBERRY_WITH_FFMPEG)
+    foreach(_ffmpeg_lib IN ITEMS avcodec avformat)
+        string(REGEX MATCH "^[0-9]+" _ffmpeg_soversion "${FFMPEG_lib${_ffmpeg_lib}_VERSION}")
+        if(_ffmpeg_soversion)
+            list(APPEND CPACK_AMIBERRY_DEB_EXTRA_FLAVOUR_LIBS "lib${_ffmpeg_lib}:${_ffmpeg_soversion}")
+        endif()
+    endforeach()
+endif()
 set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${_deb_arch}")
 set(CPACK_DEBIAN_PACKAGE_SECTION "otherosfs")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://amiberry.com")
@@ -156,6 +165,12 @@ endif()
 if(USE_LIBMPEG2)
     string(APPEND _rpm_deps ", libmpeg2")
 endif()
+# FFmpeg needs no package-name Requires: rpmbuild's automatic soname dependencies
+# (libavcodec.so.NN()(64bit), ...) are met by Fedora's *-free libraries and by
+# RPM Fusion's ffmpeg-libs, which conflicts with them (issue #2568).
+if(AMIBERRY_WITH_WEBP)
+    string(APPEND _rpm_deps ", libwebp")
+endif()
 set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 set(CPACK_RPM_PACKAGE_REQUIRES "${_rpm_deps}")
 set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-or-later")
@@ -172,7 +187,8 @@ set(CPACK_STRIP_FILES TRUE)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.19)
     set(CPACK_PRE_BUILD_SCRIPTS
-            "${CMAKE_SOURCE_DIR}/cmake/package_strip_macos_metadata.cmake")
+            "${CMAKE_SOURCE_DIR}/cmake/package_strip_macos_metadata.cmake"
+            "${CMAKE_SOURCE_DIR}/cmake/package_deb_shlibs_local.cmake")
 endif()
 
 # Generator selection per platform
@@ -192,16 +208,13 @@ elseif (WIN32)
 	if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
 		set(CPACK_INNOSETUP_ARCHITECTURE arm64)
 		set(_innosetup_arch_suffix "arm64")
-	elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
+	else()
 		set(CPACK_INNOSETUP_ARCHITECTURE x64)
 		# Allow the x64 installer to run on Windows 11 ARM64 under x64
 		# emulation. Plain "x64" excludes ARM64 machines.
 		set(CPACK_INNOSETUP_SETUP_ArchitecturesAllowed "x64compatible")
 		set(CPACK_INNOSETUP_SETUP_ArchitecturesInstallIn64BitMode "x64compatible")
 		set(_innosetup_arch_suffix "win64")
-	else()
-		set(CPACK_INNOSETUP_ARCHITECTURE x86)
-		set(_innosetup_arch_suffix "win32")
 	endif()
 	# Override CPack's default "<name>-<version>-win64.exe" so the ARM64
 	# installer doesn't get the misleading win64 suffix when produced on

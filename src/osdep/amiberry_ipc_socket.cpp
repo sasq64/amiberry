@@ -1,11 +1,16 @@
 //
-// Unix domain socket IPC implementation for Amiberry
-// Cross-platform: Linux, macOS, FreeBSD
+// IPC control transport for Amiberry
+// Unix domain socket (Linux, macOS, FreeBSD) or named pipe (Windows)
 //
 
 #ifdef USE_IPC_SOCKET
 
 #include "amiberry_ipc.h"
+#include "amiberry_ipc_joystick.h"
+#include "settings/amiberry_actions.h"
+#include "settings/amiberry_media.h"
+#include "settings/amiberry_settings.h"
+#include "settings/settings_definitions.h"
 #include "sysdeps.h"
 #include "amiberry_gfx.h"
 #include "options.h"
@@ -20,42 +25,62 @@
 #include "filesys.h"
 #include "gui.h"
 #include "custom.h"
+#include "amiga_constants.h"
 #include "gui/gui_handling.h"
 #include "newcpu.h"
 #include "blitter.h"
 #ifdef DEBUGGER
 #include "debug.h"
+#include "gdb_server.h"
 #endif
 #include <dirent.h>
 
+#include <array>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <chrono>
 #include <mutex>
+#include <vector>
 
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <cerrno>
+
+#ifdef _WIN32
+#include <sddl.h>
+#else
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
 #include <poll.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#endif
 
 using namespace Amiberry::IPC;
 
-// Socket state
+// Listener state. socket_path is the Unix socket path, or the pipe name on
+// Windows.
+#ifndef _WIN32
 static int server_socket = -1;
+#endif
 static std::string socket_path;
+static int socket_instance = 0;
 static bool ipc_active = false;
 static bool ipc_quit_requested = false;
 static std::mutex ipc_handle_mutex;
 static AmiberryGuiInputConfigState gui_input_config_state;
+static uae_u64 joystick_client_id;
+static uae_u64 next_input_client_id;
 
 // Command handler type
 typedef std::function<std::string(const std::vector<std::string>&)> CommandHandler;
@@ -208,33 +233,70 @@ static std::string guarded_input_response(
 		applied, amiberry_gui_guarded_response_fields(response));
 }
 
-// Command handlers - reusing logic from DBus implementation
+// Command handlers. Runtime actions go through the shared actions API: the
+// handler posts the action and runs it at once (IPC handlers already run on
+// the emulator's main thread), so the reply reports what the action did.
+
+static bool run_posted(amiberry_action_id id, std::string* error)
+{
+	char message[512];
+	message[0] = 0;
+	amiberry_actions_run_pending();
+	const amiberry_action_result result =
+		amiberry_actions_poll(id, message, sizeof message);
+	if (error)
+		*error = message;
+	return result == AMIBERRY_ACTION_DONE;
+}
+
+static std::string run_posted_reply(amiberry_action_id id)
+{
+	std::string error;
+	if (id != 0 && run_posted(id, &error))
+		return make_response(true);
+	return make_response(false, {error.empty() ? "Action was not executed" : error});
+}
+
 static std::string HandleQuit(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUIT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUIT" << std::endl;
+	}
+	// Posted now, executed by IPCHandle() after this pass has written the
+	// reply, exactly like the old deferred uae_quit(). A full action queue
+	// rejects the post: this handler runs on the main thread, so drain the
+	// queue and try once more, and never acknowledge a quit that will not
+	// happen.
+	if (!amiberry_actions_quit()) {
+		amiberry_actions_run_pending();
+		if (!amiberry_actions_quit())
+			return make_response(false, {"Quit could not be queued"});
+	}
 	ipc_quit_requested = true;
 	return make_response(true);
 }
 
 static std::string HandlePause(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received PAUSE" << std::endl;
-	setpaused(3);
-	activationtoggle(0, true);
-	return make_response(true);
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received PAUSE" << std::endl;
+	}
+	return run_posted_reply(amiberry_actions_pause());
 }
 
 static std::string HandleResume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RESUME" << std::endl;
-	resumepaused(3);
-	activationtoggle(0, false);
-	return make_response(true);
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RESUME" << std::endl;
+	}
+	return run_posted_reply(amiberry_actions_resume());
 }
 
 static std::string HandleReset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RESET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RESET" << std::endl;
+	}
 	bool hard = false;
 	bool keyboard = true;
 
@@ -250,15 +312,19 @@ static std::string HandleReset(const std::vector<std::string>& args)
 		}
 	}
 
-	uae_reset(hard, keyboard);
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_reset(hard, keyboard));
 }
 
 static std::string HandleScreenshot(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SCREENSHOT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SCREENSHOT" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing filename"});
+	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
 	}
 	if (args.size() > 1) {
 		if (args.size() != 2 || args[1] != "ACTIONABLE") {
@@ -283,13 +349,10 @@ static std::string HandleScreenshot(const std::vector<std::string>& args)
 			amiberry_gui_actionable_fields(args[0], snapshot));
 	}
 
-	if (!create_screenshot()) {
-		return make_response(false, {"Failed to create screenshot"});
-	}
-
-	int ret = save_thumb(args[0]);
-	if (ret == 0) {
-		return make_response(false, {"Failed to save screenshot to: " + args[0]});
+	std::string error;
+	const amiberry_action_id id = amiberry_actions_screenshot(args[0].c_str());
+	if (id == 0 || !run_posted(id, &error)) {
+		return make_response(false, {error.empty() ? "Action was not executed" : error});
 	}
 
 	return make_response(true, {args[0]});
@@ -297,35 +360,58 @@ static std::string HandleScreenshot(const std::vector<std::string>& args)
 
 static std::string HandleSavestate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SAVESTATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SAVESTATE" << std::endl;
+	}
+#ifdef DEBUGGER
+	if (debugger_is_stopped() || gdb_server_halted()) {
+		return make_response(false, {"Cannot save state while the debugger has the CPU stopped; resume or PAUSE first"});
+	}
+#endif
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SAVESTATE <statefile> <configfile>"});
 	}
+	if (args[0].size() >= MAX_DPATH || args[1].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
+	}
 
-	savestate_initsave(args[0].c_str(), 1, true, true);
-	save_state(args[0].c_str(), "...");
+	std::string error;
+	const amiberry_action_id id = amiberry_actions_save_state(args[0].c_str());
+	if (id == 0 || !run_posted(id, &error)) {
+		return make_response(false, {error.empty() ? "Action was not executed" : error});
+	}
 
+	// The companion configuration is described as an autosave; the pending
+	// configuration keeps its own description.
+	TCHAR description[sizeof changed_prefs.description];
+	std::memcpy(description, changed_prefs.description, sizeof description);
 	strncpy(changed_prefs.description, "autosave", sizeof(changed_prefs.description));
 	cfgfile_save(&changed_prefs, args[1].c_str(), 0);
+	std::memcpy(changed_prefs.description, description, sizeof description);
 
 	return make_response(true);
 }
 
 static std::string HandleLoadState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LOADSTATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LOADSTATE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing state file path"});
 	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
+	}
 
-	savestate_state = STATE_DORESTORE;
-	_tcscpy(savestate_fname, args[0].c_str());
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_load_state(args[0].c_str()));
 }
 
 static std::string HandleDiskSwap(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISKSWAP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISKSWAP" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: DISKSWAP <disknum> <drivenum>"});
 	}
@@ -342,19 +428,14 @@ static std::string HandleDiskSwap(const std::vector<std::string>& args)
 		return make_response(false, {"Invalid disk or drive number"});
 	}
 
-	for (int i = 0; i < 4; i++) {
-		if (!_tcscmp(currprefs.floppyslots[i].df, currprefs.dfxlist[disknum]))
-			changed_prefs.floppyslots[i].df[0] = 0;
-	}
-	_tcscpy(changed_prefs.floppyslots[drivenum].df, currprefs.dfxlist[disknum]);
-	set_config_changed();
-
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_insert_swapper_entry(disknum, drivenum));
 }
 
 static std::string HandleQueryDiskSwap(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUERYDISKSWAP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUERYDISKSWAP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: QUERYDISKSWAP <drivenum>"});
 	}
@@ -383,9 +464,14 @@ static std::string HandleQueryDiskSwap(const std::vector<std::string>& args)
 
 static std::string HandleInsertFloppy(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERTFLOPPY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERTFLOPPY" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: INSERTFLOPPY <path> <drivenum>"});
+	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
 	}
 
 	int drivenum;
@@ -399,41 +485,42 @@ static std::string HandleInsertFloppy(const std::vector<std::string>& args)
 		return make_response(false, {"Drive number must be 0-3"});
 	}
 
-	_tcsncpy(changed_prefs.floppyslots[drivenum].df, args[0].c_str(), MAX_DPATH);
-	changed_prefs.floppyslots[drivenum].df[MAX_DPATH - 1] = 0;
-	set_last_active_config_from_media(args[0].c_str());
-	set_config_changed();
-
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_insert_floppy(drivenum, args[0].c_str()));
 }
 
 static std::string HandleInsertCD(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERTCD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERTCD" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing CD image path"});
 	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
+	}
 
-	_tcsncpy(changed_prefs.cdslots[0].name, args[0].c_str(), MAX_DPATH);
-	changed_prefs.cdslots[0].name[MAX_DPATH - 1] = 0;
-	changed_prefs.cdslots[0].inuse = true;
-	set_last_active_config_from_media(args[0].c_str());
-	set_config_changed();
-
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_insert_cd(args[0].c_str()));
 }
 
 static std::string HandleGetStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_STATUS" << std::endl;
+	}
+	// Handlers run on the emulator's main thread; refresh first so the
+	// snapshot reflects earlier commands in this same pass.
+	amiberry_actions_run_pending();
+	amiberry_actions_status status;
+	amiberry_actions_get_status(&status);
 	std::vector<std::string> responses;
 
-	responses.push_back(std::string("Paused=") + (pause_emulation ? "true" : "false"));
-	responses.push_back(std::string("Config=") + changed_prefs.description);
+	responses.push_back(std::string("Paused=") + (status.paused ? "true" : "false"));
+	responses.push_back(std::string("Config=") + status.config_description);
 
-	for (int i = 0; i < 4; ++i) {
-		if (changed_prefs.floppyslots[i].df[0])
-			responses.push_back(std::string("Floppy") + std::to_string(i) + "=" + changed_prefs.floppyslots[i].df);
+	for (int i = 0; i < AMIBERRY_ACTIONS_FLOPPY_DRIVES; ++i) {
+		if (status.floppy[i].media_path[0])
+			responses.push_back(std::string("Floppy") + std::to_string(i) + "=" + status.floppy[i].media_path);
 	}
 
 	return make_response(true, responses);
@@ -441,7 +528,9 @@ static std::string HandleGetStatus(const std::vector<std::string>& args)
 
 static std::string HandleGetConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CONFIG" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing option name"});
 	}
@@ -488,6 +577,20 @@ static std::string HandleGetConfig(const std::vector<std::string>& args)
 		value = std::to_string(changed_prefs.gfx_monitor[0].gfx_size_win.height);
 	} else if (optname == "gfx_fullscreen") {
 		value = changed_prefs.gfx_apmode[0].gfx_fullscreen ? "true" : "false";
+	} else if (optname == "gfx_auto_crop") {
+		value = changed_prefs.gfx_auto_crop ? "true" : "false";
+	} else if (optname == "gfx_manual_crop") {
+		value = changed_prefs.gfx_manual_crop ? "true" : "false";
+	} else if (optname == "gfx_manual_crop_width") {
+		value = std::to_string(changed_prefs.gfx_manual_crop_width);
+	} else if (optname == "gfx_manual_crop_height") {
+		value = std::to_string(changed_prefs.gfx_manual_crop_height);
+	} else if (optname == "gfx_horizontal_offset") {
+		value = std::to_string(changed_prefs.gfx_horizontal_offset);
+	} else if (optname == "gfx_vertical_offset") {
+		value = std::to_string(changed_prefs.gfx_vertical_offset);
+	} else if (optname == "gfx_overscanmode") {
+		value = std::to_string(changed_prefs.gfx_overscanmode);
 	}
 	// Sound options
 	else if (optname == "sound_output") {
@@ -548,7 +651,9 @@ static std::string HandleGetConfig(const std::vector<std::string>& args)
 
 static std::string HandleSetConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CONFIG" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_CONFIG <option> <value>"});
 	}
@@ -576,8 +681,61 @@ static std::string HandleSetConfig(const std::vector<std::string>& args)
 			changed_prefs.gfx_apmode[0].gfx_fullscreen = fullscreen ? GFX_FULLWINDOW : GFX_WINDOW;
 			set_config_changed();
 		}
-		// Sound options
-		else if (optname == "sound_output") {
+		// Crop options — enabling one mode disables the other
+		else if (optname == "gfx_auto_crop") {
+			const bool enable = (optval == "true" || optval == "1");
+			changed_prefs.gfx_auto_crop = enable;
+			if (enable) {
+				changed_prefs.gfx_manual_crop = false;
+			}
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop") {
+			const bool enable = (optval == "true" || optval == "1");
+			changed_prefs.gfx_manual_crop = enable;
+			if (enable) {
+				changed_prefs.gfx_auto_crop = false;
+			}
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop_width") {
+			// Clamp on the parsed long before narrowing and to the same
+			// native bounds the Filter panel uses, so a headless client
+			// cannot set a crop larger than the surface.
+			const long max_w = AMIGA_WIDTH_MAX << changed_prefs.gfx_resolution;
+			changed_prefs.gfx_manual_crop_width = static_cast<int>(
+				std::clamp(std::stol(optval), 0L, max_w));
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop_height") {
+			const long max_h = AMIGA_HEIGHT_MAX << changed_prefs.gfx_vresolution;
+			changed_prefs.gfx_manual_crop_height = static_cast<int>(
+				std::clamp(std::stol(optval), 0L, max_h));
+			set_config_changed();
+		}
+		else if (optname == "gfx_horizontal_offset") {
+			const long max_w = AMIGA_WIDTH_MAX << changed_prefs.gfx_resolution;
+			changed_prefs.gfx_horizontal_offset = static_cast<int>(
+				std::clamp(std::stol(optval), -max_w, max_w));
+			set_config_changed();
+		}
+		else if (optname == "gfx_vertical_offset") {
+			const long max_h = AMIGA_HEIGHT_MAX << changed_prefs.gfx_vresolution;
+			changed_prefs.gfx_vertical_offset = static_cast<int>(
+				std::clamp(std::stol(optval), -max_h, max_h));
+			set_config_changed();
+		}
+		else if (optname == "gfx_overscanmode") {
+			// Validate on the parsed long before narrowing; on LP64 an
+			// out-of-range value would otherwise wrap into a valid mode.
+			const long mode = std::stol(optval);
+			// Keep in sync with the overscan_items table in the Display panel.
+			if (mode < 0 || mode > 8) {
+				return make_response(false, {"Invalid gfx_overscanmode (use 0-8)"});
+			}
+			changed_prefs.gfx_overscanmode = static_cast<int>(mode);
+			set_config_changed();
+		} else if (optname == "sound_output") {
 			changed_prefs.produce_sound = std::stol(optval);
 			set_config_changed();
 		} else if (optname == "sound_stereo") {
@@ -637,23 +795,87 @@ static std::string HandleSetConfig(const std::vector<std::string>& args)
 
 static std::string HandleLoadConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LOAD_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LOAD_CONFIG" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing config file path"});
 	}
-
-	int result = target_cfgfile_load(&changed_prefs, args[0].c_str(), CONFIG_TYPE_DEFAULT, 0);
-	if (result) {
-		set_config_changed();
-		return make_response(true);
-	} else {
-		return make_response(false, {"Failed to load config"});
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
 	}
+
+	return run_posted_reply(amiberry_actions_load_config(args[0].c_str()));
+}
+
+// Host settings (amiberry.conf): process-wide, saved explicitly.
+static std::string HandleHostSettingsList(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging)
+		std::cout << "IPC: Received HOST_SETTINGS_LIST" << std::endl;
+	std::vector<std::string> ids;
+	for (size_t i = 0; i < amiberry_host_settings_count(); ++i)
+		ids.emplace_back(amiberry_host_settings_at(i)->id);
+	return make_response(true, ids);
+}
+
+static std::string HandleHostSettingsGet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging)
+		std::cout << "IPC: Received HOST_SETTINGS_GET" << std::endl;
+	if (args.size() != 1)
+		return make_response(false, {"Usage: HOST_SETTINGS_GET <id>"});
+	char value[4096];
+	const amiberry_settings_status status = amiberry_host_settings_get(args[0].c_str(), value, sizeof value);
+	if (status == AMIBERRY_SETTINGS_UNKNOWN_ID)
+		return make_response(false, {"Unknown host setting: " + args[0]});
+	if (status != AMIBERRY_SETTINGS_OK)
+		return make_response(false, {"Value too long"});
+	return make_response(true, {std::string(args[0]) + "=" + value});
+}
+
+static std::string HandleHostSettingsSet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging)
+		std::cout << "IPC: Received HOST_SETTINGS_SET" << std::endl;
+	if (args.size() != 2)
+		return make_response(false, {"Usage: HOST_SETTINGS_SET <id> <value>"});
+	const amiberry_settings_status status = amiberry_host_settings_set(args[0].c_str(), args[1].c_str());
+	if (status == AMIBERRY_SETTINGS_UNKNOWN_ID)
+		return make_response(false, {"Unknown host setting: " + args[0]});
+	if (status == AMIBERRY_SETTINGS_UNAVAILABLE)
+		return make_response(false, {"Folder could not be accessed: " + args[1]});
+	if (status != AMIBERRY_SETTINGS_OK)
+		return make_response(false, {"Invalid value for " + args[0] + ": " + args[1]});
+	return make_response(true);
+}
+
+static std::string HandleHostSettingsSave(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging)
+		std::cout << "IPC: Received HOST_SETTINGS_SAVE" << std::endl;
+	return amiberry_host_settings_save() ? make_response(true) : make_response(false, {"Failed to save host settings"});
+}
+
+static std::string HandleSaveConfig(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SAVE_CONFIG" << std::endl;
+	}
+	if (args.size() != 1) {
+		return make_response(false, {"Usage: SAVE_CONFIG <configfile>"});
+	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
+	}
+	return run_posted_reply(amiberry_actions_save_config(args[0].c_str()));
 }
 
 static std::string HandleSendKey(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_KEY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_KEY" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SEND_KEY <keycode> <state>"});
 	}
@@ -666,6 +888,11 @@ static std::string HandleSendKey(const std::vector<std::string>& args)
 		return make_response(false, {"Invalid keycode or state"});
 	}
 
+	// Amiga keys go through the key action (a press needs a running
+	// emulation); higher codes are input events (AKS_*), as before.
+	if (keycode >= 0 && keycode <= AMIBERRY_ACTIONS_MAX_AMIGA_KEY)
+		return run_posted_reply(amiberry_actions_key(keycode, state != 0));
+
 	inputdevice_do_keyboard(keycode, state);
 
 	return make_response(true);
@@ -673,7 +900,10 @@ static std::string HandleSendKey(const std::vector<std::string>& args)
 
 static std::string HandleReadMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received READ_MEM" << std::endl;
+	cpu_thread_guard cpu_guard;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received READ_MEM " << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: READ_MEM <address> <width(1,2,4)>"});
 	}
@@ -703,7 +933,10 @@ static std::string HandleReadMem(const std::vector<std::string>& args)
 
 static std::string HandleWriteMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received WRITE_MEM" << std::endl;
+	cpu_thread_guard cpu_guard;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received WRITE_MEM " << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: WRITE_MEM <address> <width(1,2,4)> <value>"});
 	}
@@ -736,7 +969,9 @@ static std::string HandleWriteMem(const std::vector<std::string>& args)
 
 static std::string HandleEjectFloppy(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_FLOPPY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_FLOPPY" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: EJECT_FLOPPY <drivenum>"});
 	}
@@ -752,24 +987,23 @@ static std::string HandleEjectFloppy(const std::vector<std::string>& args)
 		return make_response(false, {"Drive number must be 0-3"});
 	}
 
-	disk_eject(drivenum);
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_eject_floppy(drivenum));
 }
 
 static std::string HandleEjectCD(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_CD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_CD" << std::endl;
+	}
 
-	changed_prefs.cdslots[0].name[0] = 0;
-	changed_prefs.cdslots[0].inuse = false;
-	set_config_changed();
-
-	return make_response(true);
+	return run_posted_reply(amiberry_actions_eject_cd());
 }
 
 static std::string HandleSetVolume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_VOLUME" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_VOLUME" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_VOLUME <0-100>"});
 	}
@@ -793,34 +1027,74 @@ static std::string HandleSetVolume(const std::vector<std::string>& args)
 
 static std::string HandleGetVolume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_VOLUME" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_VOLUME" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.sound_volume_master)});
 }
 
 static std::string HandleMute(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received MUTE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received MUTE" << std::endl;
+	}
 	set_volume(0, 1);
 	return make_response(true);
 }
 
 static std::string HandleUnmute(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received UNMUTE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received UNMUTE" << std::endl;
+	}
 	set_volume(currprefs.sound_volume_master, 0);
 	return make_response(true);
 }
 
 static std::string HandleToggleFullscreen(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_FULLSCREEN" << std::endl;
-	toggle_fullscreen(0, -1);
-	return make_response(true);
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_FULLSCREEN" << std::endl;
+	}
+	return run_posted_reply(amiberry_actions_toggle_fullscreen());
+}
+
+static std::string HandleOpenSettings(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received OPEN_SETTINGS" << std::endl;
+	}
+	return run_posted_reply(amiberry_actions_open_settings());
+}
+
+static std::string HandleChooseMedia(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received CHOOSE_MEDIA" << std::endl;
+	}
+	static const std::pair<const char*, amiberry_media_request> requests[] = {
+		{"DF0", AMIBERRY_REQUEST_FLOPPY0}, {"DF1", AMIBERRY_REQUEST_FLOPPY1},
+		{"DF2", AMIBERRY_REQUEST_FLOPPY2}, {"DF3", AMIBERRY_REQUEST_FLOPPY3},
+		{"LOADSTATE", AMIBERRY_REQUEST_LOAD_STATE}, {"SAVESTATE", AMIBERRY_REQUEST_SAVE_STATE},
+		{"CD", AMIBERRY_REQUEST_CD},
+	};
+	if (args.size() == 1) {
+		std::string name = args[0];
+		std::transform(name.begin(), name.end(), name.begin(),
+			[](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+		for (const auto& [label, request] : requests) {
+			if (name == label)
+				return run_posted_reply(amiberry_actions_choose_media(request));
+		}
+	}
+	return make_response(false, {"Usage: CHOOSE_MEDIA <DF0|DF1|DF2|DF3|LOADSTATE|SAVESTATE|CD>"});
 }
 
 static std::string HandleSetWarp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_WARP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_WARP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_WARP <0|1>"});
 	}
@@ -838,13 +1112,17 @@ static std::string HandleSetWarp(const std::vector<std::string>& args)
 
 static std::string HandleGetWarp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WARP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WARP" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.turbo_emulation ? 1 : 0)});
 }
 
 static std::string HandleGetVersion(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_VERSION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_VERSION" << std::endl;
+	}
 	std::vector<std::string> info;
 	info.push_back("version=" + get_version_string());
 	info.push_back("sdl=" + get_sdl_version_string());
@@ -853,7 +1131,9 @@ static std::string HandleGetVersion(const std::vector<std::string>& args)
 
 static std::string HandleListFloppies(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_FLOPPIES" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_FLOPPIES" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	for (int i = 0; i < 4; ++i) {
@@ -869,35 +1149,150 @@ static std::string HandleListFloppies(const std::vector<std::string>& args)
 	return make_response(true, responses);
 }
 
+// The media lists and folders come from the media API (amiberry_media.h),
+// which native front ends use too.
+struct media_name {
+	const char* name;
+	int value;
+};
+
+static const media_name media_lists[] = {
+	{"RECENT_FLOPPIES", AMIBERRY_MEDIA_RECENT_FLOPPIES},
+	{"RECENT_CDS", AMIBERRY_MEDIA_RECENT_CDS},
+	{"RECENT_WHDLOAD", AMIBERRY_MEDIA_RECENT_WHDLOAD},
+	{"CD_DRIVES", AMIBERRY_MEDIA_CD_DRIVES},
+	{"CONFIGURATIONS", AMIBERRY_MEDIA_CONFIGURATIONS},
+	{"SAVESTATES", AMIBERRY_MEDIA_SAVESTATES},
+};
+
+static const media_name media_folders[] = {
+	{"ROMS", AMIBERRY_FOLDER_ROMS},
+	{"FLOPPIES", AMIBERRY_FOLDER_FLOPPIES},
+	{"CDS", AMIBERRY_FOLDER_CDS},
+	{"HARD_DRIVES", AMIBERRY_FOLDER_HARD_DRIVES},
+	{"CONFIGURATIONS", AMIBERRY_FOLDER_CONFIGURATIONS},
+	{"SAVESTATES", AMIBERRY_FOLDER_SAVESTATES},
+	{"SCREENSHOTS", AMIBERRY_FOLDER_SCREENSHOTS},
+	{"WHDLOAD_ARCHIVES", AMIBERRY_FOLDER_WHDLOAD_ARCHIVES},
+};
+
+template <size_t N>
+static int find_media_name(const media_name (&table)[N], const std::string& name)
+{
+	for (const media_name& entry : table) {
+		const size_t length = std::strlen(entry.name);
+		bool same = name.size() == length;
+		for (size_t i = 0; same && i < length; i++)
+			same = std::toupper(static_cast<unsigned char>(name[i])) == entry.name[i];
+		if (same)
+			return entry.value;
+	}
+	return -1;
+}
+
+// Copies a string the media API reports through get, growing the buffer
+// while it is too small (a folder path gets a trailing separator, so it can
+// exceed the host's path limit by one).
+template <typename Get>
+static bool media_string(Get get, std::string& out)
+{
+	std::vector<char> buffer(MAX_DPATH + 16);
+	for (;;) {
+		const amiberry_settings_status status = get(buffer.data(), buffer.size());
+		if (status == AMIBERRY_SETTINGS_OK) {
+			out = buffer.data();
+			return true;
+		}
+		if (status != AMIBERRY_SETTINGS_BUFFER_TOO_SMALL || buffer.size() >= 65536)
+			return false;
+		buffer.resize(buffer.size() * 2);
+	}
+}
+
+// The entries of a media list: paths, or names when names is set.
+static std::vector<std::string> media_entries(amiberry_media_list list, bool names)
+{
+	std::vector<std::string> entries;
+	const size_t count = amiberry_media_refresh(list);
+	for (size_t i = 0; i < count; i++) {
+		std::string entry;
+		const bool ok = media_string([&](char* buffer, size_t size) {
+			return names ? amiberry_media_entry(list, i, nullptr, 0, buffer, size)
+				: amiberry_media_entry(list, i, buffer, size, nullptr, 0);
+		}, entry);
+		// A tab or line break would split the reply's fields or lines; such
+		// a name cannot be represented in this protocol and is left out.
+		if (ok && entry.find_first_of("\t\r\n") == std::string::npos)
+			entries.push_back(std::move(entry));
+	}
+	return entries;
+}
+
 static std::string HandleListConfigs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_CONFIGS" << std::endl;
-	std::vector<std::string> configs;
-
-	std::string config_path = get_configuration_path();
-	DIR* dir = opendir(config_path.c_str());
-	if (dir) {
-		struct dirent* entry;
-		while ((entry = readdir(dir)) != nullptr) {
-			std::string name = entry->d_name;
-			// Only list .uae files
-			if (name.length() > 4 && name.substr(name.length() - 4) == ".uae") {
-				configs.push_back(name);
-			}
-		}
-		closedir(dir);
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_CONFIGS" << std::endl;
 	}
-
+	const std::vector<std::string> configs = media_entries(AMIBERRY_MEDIA_CONFIGURATIONS, true);
 	if (configs.empty()) {
 		return make_response(true, {"<no configs found>"});
 	}
-
 	return make_response(true, configs);
+}
+
+static std::string HandleListMedia(const std::vector<std::string>& args)
+{
+	if (args.size() != 1) {
+		return make_response(false, {"Usage: LIST_MEDIA <RECENT_FLOPPIES|RECENT_CDS|RECENT_WHDLOAD|CD_DRIVES|CONFIGURATIONS|SAVESTATES>"});
+	}
+	const int list = find_media_name(media_lists, args[0]);
+	if (list < 0) {
+		return make_response(false, {"Unknown media list: " + args[0]});
+	}
+	return make_response(true, media_entries(static_cast<amiberry_media_list>(list), false));
+}
+
+static std::string HandleGetFolder(const std::vector<std::string>& args)
+{
+	const int folder = args.size() == 1 ? find_media_name(media_folders, args[0]) : -1;
+	if (folder < 0) {
+		return make_response(false, {"Usage: GET_FOLDER <ROMS|FLOPPIES|CDS|HARD_DRIVES|CONFIGURATIONS|SAVESTATES|SCREENSHOTS|WHDLOAD_ARCHIVES>"});
+	}
+	std::string path;
+	if (!media_string([&](char* buffer, size_t size) {
+			return amiberry_folder_get(static_cast<amiberry_folder>(folder), buffer, size);
+		}, path)) {
+		return make_response(false, {"Folder path could not be read"});
+	}
+	// A tab or line break would split the reply; such a path cannot be
+	// represented in this protocol.
+	if (path.find_first_of("\t\r\n") != std::string::npos) {
+		return make_response(false, {"Folder path contains a tab or line break"});
+	}
+	return make_response(true, {path});
+}
+
+static std::string HandleSetFolder(const std::vector<std::string>& args)
+{
+	const int folder = args.size() == 2 ? find_media_name(media_folders, args[0]) : -1;
+	if (folder < 0) {
+		return make_response(false, {"Usage: SET_FOLDER <folder> <path>"});
+	}
+	switch (amiberry_folder_set(static_cast<amiberry_folder>(folder), args[1].c_str())) {
+	case AMIBERRY_SETTINGS_OK:
+		return make_response(true);
+	case AMIBERRY_SETTINGS_UNAVAILABLE:
+		return make_response(false, {"Folder could not be stored (access or settings file): " + args[1]});
+	default:
+		return make_response(false, {"Invalid path: " + args[1]});
+	}
 }
 
 static std::string HandleFrameAdvance(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received FRAME_ADVANCE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received FRAME_ADVANCE" << std::endl;
+	}
 	if (!pause_emulation) {
 		return make_response(false, {"Emulation must be paused first"});
 	}
@@ -925,7 +1320,9 @@ static std::string HandleFrameAdvance(const std::vector<std::string>& args)
 
 static std::string HandleSetMouseSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_MOUSE_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_MOUSE_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_MOUSE_SPEED <10-200>"});
 	}
@@ -947,9 +1344,24 @@ static std::string HandleSetMouseSpeed(const std::vector<std::string>& args)
 	return make_response(true);
 }
 
+static std::string HandleSendJoystick(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging)
+		std::cout << "IPC: Received SEND_JOYSTICK" << std::endl;
+	JoystickRequest request;
+	if (const char* error = parse_joystick_request(args, request))
+		return make_response(false, {error});
+	if (request.buttons > 3 && !inputdevice_joystick_is_cd32(request.port))
+		return make_response(false, {"CD32 buttons require a CD32 pad on port 0 or 1"});
+	inputdevice_set_joystick_state(joystick_client_id, request.port, request.directions, request.buttons);
+	return make_response(true);
+}
+
 static std::string HandleSendMouse(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE" << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: SEND_MOUSE <dx> <dy> <buttons>"});
 	}
@@ -977,7 +1389,9 @@ static std::string HandleSendMouse(const std::vector<std::string>& args)
 
 static std::string HandleSendMouseAbs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE_ABS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE_ABS" << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: SEND_MOUSE_ABS <x> <y> <buttons>"});
 	}
@@ -1009,7 +1423,9 @@ static std::string HandleSendMouseAbs(const std::vector<std::string>& args)
 static std::string HandleGetGuiAutomationState(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_GUI_AUTOMATION_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_GUI_AUTOMATION_STATE" << std::endl;
+	}
 	if (!args.empty())
 		return make_response(false, {"Usage: GET_GUI_AUTOMATION_STATE"});
 
@@ -1039,7 +1455,9 @@ static std::string HandleGetGuiAutomationState(
 static std::string HandleSetGuiAutomationConfig(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_GUI_AUTOMATION_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_GUI_AUTOMATION_CONFIG" << std::endl;
+	}
 	if (args.size() != 5) {
 		return make_response(false, {
 			"schema_version=1", "reason=malformed_request",
@@ -1094,7 +1512,9 @@ static std::string HandleSetGuiAutomationConfig(
 static std::string HandleSendMouseAbsGuarded(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE_ABS_GUARDED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE_ABS_GUARDED" << std::endl;
+	}
 	const int active_monitor = amiberry_get_active_input_monitor();
 	const auto geometry = amiberry_gui_geometry_snapshot();
 	const auto input = gui_input_config_snapshot();
@@ -1145,7 +1565,9 @@ static std::string HandleSendMouseAbsGuarded(
 static std::string HandleReleaseMouseButtons(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RELEASE_MOUSE_BUTTONS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RELEASE_MOUSE_BUTTONS" << std::endl;
+	}
 	if (!args.empty())
 		return make_response(false, {"Usage: RELEASE_MOUSE_BUTTONS"});
 	amiberry_gui_release_mouse_buttons(
@@ -1160,13 +1582,22 @@ static std::string HandleReleaseMouseButtons(
 
 static std::string HandlePing(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received PING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received PING" << std::endl;
+	}
 	return make_response(true, {"PONG"});
 }
 
 static std::string HandleQuickSave(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUICKSAVE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUICKSAVE" << std::endl;
+	}
+#ifdef DEBUGGER
+	if (debugger_is_stopped() || gdb_server_halted()) {
+		return make_response(false, {"Cannot save state while the debugger has the CPU stopped; resume or PAUSE first"});
+	}
+#endif
 	int slot = 0;
 	if (!args.empty()) {
 		try {
@@ -1179,13 +1610,19 @@ static std::string HandleQuickSave(const std::vector<std::string>& args)
 		}
 	}
 
-	savestate_quick(slot, 1);  // 1 = save
+	std::string error;
+	const amiberry_action_id id = amiberry_actions_save_state_slot(slot);
+	if (id == 0 || !run_posted(id, &error)) {
+		return make_response(false, {error.empty() ? "Action was not executed" : error});
+	}
 	return make_response(true, {"Saved to slot " + std::to_string(slot)});
 }
 
 static std::string HandleQuickLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUICKLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUICKLOAD" << std::endl;
+	}
 	int slot = 0;
 	if (!args.empty()) {
 		try {
@@ -1198,13 +1635,19 @@ static std::string HandleQuickLoad(const std::vector<std::string>& args)
 		}
 	}
 
-	savestate_quick(slot, 0);  // 0 = load
+	std::string error;
+	const amiberry_action_id id = amiberry_actions_load_state_slot(slot);
+	if (id == 0 || !run_posted(id, &error)) {
+		return make_response(false, {error.empty() ? "Action was not executed" : error});
+	}
 	return make_response(true, {"Loading from slot " + std::to_string(slot)});
 }
 
 static std::string HandleGetJoyportMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_JOYPORT_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_JOYPORT_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_JOYPORT_MODE <port>"});
 	}
@@ -1234,7 +1677,9 @@ static std::string HandleGetJoyportMode(const std::vector<std::string>& args)
 
 static std::string HandleSetJoyportMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_JOYPORT_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_JOYPORT_MODE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_JOYPORT_MODE <port> <mode>"});
 	}
@@ -1263,7 +1708,9 @@ static std::string HandleSetJoyportMode(const std::vector<std::string>& args)
 
 static std::string HandleGetAutofire(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUTOFIRE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUTOFIRE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_AUTOFIRE <port>"});
 	}
@@ -1285,7 +1732,9 @@ static std::string HandleGetAutofire(const std::vector<std::string>& args)
 
 static std::string HandleSetAutofire(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_AUTOFIRE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_AUTOFIRE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_AUTOFIRE <port> <mode>"});
 	}
@@ -1314,41 +1763,50 @@ static std::string HandleSetAutofire(const std::vector<std::string>& args)
 
 static std::string HandleGetLEDStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_LED_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_LED_STATUS" << std::endl;
+	}
+	amiberry_actions_run_pending();
+	amiberry_actions_status snapshot;
+	amiberry_actions_get_status(&snapshot);
 	std::vector<std::string> responses;
 
 	// Power LED
-	responses.push_back("power=" + std::to_string(gui_data.powerled));
+	responses.push_back("power=" + std::to_string(snapshot.power_led ? 1 : 0));
 
 	// Floppy drive LEDs (DF0-DF3)
-	for (int i = 0; i < 4; ++i) {
-		bool motor_on = gui_data.drives[i].drive_motor;
-		bool writing = gui_data.drives[i].drive_writing;
-		std::string status = motor_on ? (writing ? "writing" : "reading") : "off";
+	for (int i = 0; i < AMIBERRY_ACTIONS_FLOPPY_DRIVES; ++i) {
+		const auto& drive = snapshot.floppy[i];
+		std::string status = drive.motor_on ? (drive.writing ? "writing" : "reading") : "off";
 		responses.push_back("df" + std::to_string(i) + "=" + status);
 	}
 
 	// HD LED
-	responses.push_back("hd=" + std::to_string(gui_data.hd));
+	responses.push_back("hd=" + std::to_string(snapshot.hd_activity));
 
 	// CD LED
-	responses.push_back("cd=" + std::to_string(gui_data.cd));
+	responses.push_back("cd=" + std::to_string(snapshot.cd_activity));
 
 	// Caps Lock
-	responses.push_back("caps=" + std::to_string(gui_data.capslock ? 1 : 0));
+	responses.push_back("caps=" + std::to_string(snapshot.caps_lock ? 1 : 0));
 
 	return make_response(true, responses);
 }
 
 static std::string HandleListHarddrives(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_HARDDRIVES" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_HARDDRIVES" << std::endl;
+	}
 	std::vector<std::string> responses;
 
-	// List mounted hardfiles from prefs
-	for (int i = 0; i < MAX_FILESYSTEM_UNITS; ++i) {
+	// List mounted hardfiles from prefs: the entries in use, not what a
+	// removed entry left behind past them.
+	const int count = std::min(currprefs.mountitems, MOUNT_CONFIG_SIZE);
+	for (int i = 0; i < count; ++i) {
 		struct uaedev_config_data *uci = &currprefs.mountconfig[i];
-		if (uci->ci.rootdir[0]) {
+		// A tab or line break would split the reply.
+		if (uci->ci.rootdir[0] && !std::strpbrk(uci->ci.rootdir, "\t\r\n")) {
 			std::string entry = "unit" + std::to_string(i) + "=";
 			if (uci->ci.type == UAEDEV_HDF) {
 				entry += "hdf:";
@@ -1376,7 +1834,9 @@ static std::string HandleListHarddrives(const std::vector<std::string>& args)
 
 static std::string HandleSetDisplayMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_DISPLAY_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_DISPLAY_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_DISPLAY_MODE <mode> (0=window, 1=legacy fullscreen alias, 2=fullwindow)"});
 	}
@@ -1400,7 +1860,9 @@ static std::string HandleSetDisplayMode(const std::vector<std::string>& args)
 
 static std::string HandleGetDisplayMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DISPLAY_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DISPLAY_MODE" << std::endl;
+	}
 	const int mode = amiberry_normalize_gfx_fullscreen_mode(
 		currprefs.gfx_apmode[0].gfx_fullscreen);
 	const char* mode_names[] = {"window", "fullscreen", "fullwindow"};
@@ -1411,7 +1873,9 @@ static std::string HandleGetDisplayMode(const std::vector<std::string>& args)
 
 static std::string HandleSetNTSC(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_NTSC" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_NTSC" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_NTSC <0|1> (0=PAL, 1=NTSC)"});
 	}
@@ -1431,13 +1895,17 @@ static std::string HandleSetNTSC(const std::vector<std::string>& args)
 
 static std::string HandleGetNTSC(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_NTSC" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_NTSC" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.ntscmode ? 1 : 0), currprefs.ntscmode ? "NTSC" : "PAL"});
 }
 
 static std::string HandleSetSoundMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SOUND_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SOUND_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SOUND_MODE <mode> (0=off, 1=normal, 2=stereo, 3=best)"});
 	}
@@ -1461,7 +1929,9 @@ static std::string HandleSetSoundMode(const std::vector<std::string>& args)
 
 static std::string HandleGetSoundMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_SOUND_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_SOUND_MODE" << std::endl;
+	}
 	const int mode = currprefs.produce_sound;
 	const char* mode_names[] = {"off", "normal", "stereo", "best"};
 	std::string mode_name = (mode >= 0 && mode <= 3) ? mode_names[mode] : "unknown";
@@ -1471,20 +1941,26 @@ static std::string HandleGetSoundMode(const std::vector<std::string>& args)
 
 static std::string HandleToggleMouseGrab(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_MOUSE_GRAB" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_MOUSE_GRAB" << std::endl;
+	}
 	toggle_mousegrab();
 	return make_response(true);
 }
 
 static std::string HandleGetMouseSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_MOUSE_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_MOUSE_SPEED" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.input_mouse_speed)});
 }
 
 static std::string HandleSetCPUSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CPU_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CPU_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CPU_SPEED <speed> (-1=max, 0=cycle-exact, >0=percentage)"});
 	}
@@ -1504,7 +1980,9 @@ static std::string HandleSetCPUSpeed(const std::vector<std::string>& args)
 
 static std::string HandleGetCPUSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_SPEED" << std::endl;
+	}
 	const int speed = currprefs.m68k_speed;
 	std::string desc;
 	if (speed == -1) {
@@ -1519,7 +1997,9 @@ static std::string HandleGetCPUSpeed(const std::vector<std::string>& args)
 
 static std::string HandleToggleRTG(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_RTG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_RTG" << std::endl;
+	}
 	int monid = 0;
 	if (!args.empty()) {
 		try {
@@ -1535,7 +2015,9 @@ static std::string HandleToggleRTG(const std::vector<std::string>& args)
 
 static std::string HandleSetFloppySpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_FLOPPY_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_FLOPPY_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_FLOPPY_SPEED <speed> (0=turbo, 100=1x, 200=2x, 400=4x, 800=8x)"});
 	}
@@ -1560,7 +2042,9 @@ static std::string HandleSetFloppySpeed(const std::vector<std::string>& args)
 
 static std::string HandleGetFloppySpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_FLOPPY_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_FLOPPY_SPEED" << std::endl;
+	}
 	const int speed = currprefs.floppy_speed;
 	std::string desc;
 	switch (speed) {
@@ -1576,7 +2060,9 @@ static std::string HandleGetFloppySpeed(const std::vector<std::string>& args)
 
 static std::string HandleDiskWriteProtect(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISK_WRITE_PROTECT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISK_WRITE_PROTECT" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: DISK_WRITE_PROTECT <drive> <0|1>"});
 	}
@@ -1605,7 +2091,9 @@ static std::string HandleDiskWriteProtect(const std::vector<std::string>& args)
 
 static std::string HandleGetDiskWriteProtect(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DISK_WRITE_PROTECT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DISK_WRITE_PROTECT" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_DISK_WRITE_PROTECT <drive>"});
 	}
@@ -1631,7 +2119,9 @@ static std::string HandleGetDiskWriteProtect(const std::vector<std::string>& arg
 
 static std::string HandleToggleStatusLine(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_STATUS_LINE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_STATUS_LINE" << std::endl;
+	}
 	// Cycle through: off -> chipset -> RTG -> both -> off
 	int current = changed_prefs.leds_on_screen;
 	int next;
@@ -1651,7 +2141,9 @@ static std::string HandleToggleStatusLine(const std::vector<std::string>& args)
 
 static std::string HandleSetChipset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CHIPSET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CHIPSET" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CHIPSET <chipset> (OCS, ECS_AGNUS, ECS_DENISE, ECS, AGA)"});
 	}
@@ -1683,7 +2175,9 @@ static std::string HandleSetChipset(const std::vector<std::string>& args)
 
 static std::string HandleGetChipset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CHIPSET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CHIPSET" << std::endl;
+	}
 	unsigned int mask = currprefs.chipset_mask;
 	std::string name;
 
@@ -1704,7 +2198,9 @@ static std::string HandleGetChipset(const std::vector<std::string>& args)
 
 static std::string HandleGetMemoryConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_MEMORY_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_MEMORY_CONFIG" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// All memory sizes in KB
@@ -1719,7 +2215,9 @@ static std::string HandleGetMemoryConfig(const std::vector<std::string>& args)
 
 static std::string HandleGetFPS(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_FPS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_FPS" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// FPS is stored in tenths (e.g., 500 = 50.0 fps)
@@ -1736,7 +2234,9 @@ static std::string HandleGetFPS(const std::vector<std::string>& args)
 
 static std::string HandleSetChipMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CHIP_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CHIP_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CHIP_MEM <size_kb> (0, 256, 512, 1024, 2048, 4096, 8192)"});
 	}
@@ -1782,7 +2282,9 @@ static std::string HandleSetChipMem(const std::vector<std::string>& args)
 
 static std::string HandleSetFastMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_FAST_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_FAST_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_FAST_MEM <size_kb> (0, 64, 128, 256, 512, 1024, 2048, 4096, 8192)"});
 	}
@@ -1823,7 +2325,9 @@ static std::string HandleSetFastMem(const std::vector<std::string>& args)
 
 static std::string HandleSetSlowMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SLOW_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SLOW_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SLOW_MEM <size_kb> (0, 256, 512, 1024, 1536, 1792)"});
 	}
@@ -1858,7 +2362,9 @@ static std::string HandleSetSlowMem(const std::vector<std::string>& args)
 
 static std::string HandleSetZ3Mem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_Z3_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_Z3_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_Z3_MEM <size_mb> (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)"});
 	}
@@ -1893,7 +2399,9 @@ static std::string HandleSetZ3Mem(const std::vector<std::string>& args)
 
 static std::string HandleGetCPUModel(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_MODEL" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_MODEL" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int model = currprefs.cpu_model;
@@ -1911,7 +2419,9 @@ static std::string HandleGetCPUModel(const std::vector<std::string>& args)
 
 static std::string HandleSetCPUModel(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CPU_MODEL" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CPU_MODEL" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CPU_MODEL <model> (68000, 68010, 68020, 68030, 68040, 68060)"});
 	}
@@ -1959,7 +2469,9 @@ static std::string HandleSetCPUModel(const std::vector<std::string>& args)
 
 static std::string HandleSetWindowSize(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_WINDOW_SIZE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_WINDOW_SIZE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_WINDOW_SIZE <width> <height>"});
 	}
@@ -1985,7 +2497,9 @@ static std::string HandleSetWindowSize(const std::vector<std::string>& args)
 
 static std::string HandleGetWindowSize(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WINDOW_SIZE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WINDOW_SIZE" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int width = currprefs.gfx_monitor[0].gfx_size_win.width;
@@ -1999,7 +2513,9 @@ static std::string HandleGetWindowSize(const std::vector<std::string>& args)
 
 static std::string HandleSetScaling(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SCALING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SCALING" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SCALING <method> (-1=auto, 0=nearest, 1=linear, 2=integer, 3=stretch)"});
 	}
@@ -2037,7 +2553,9 @@ static std::string HandleSetScaling(const std::vector<std::string>& args)
 
 static std::string HandleGetScaling(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_SCALING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_SCALING" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int method = currprefs.scaling_method;
@@ -2053,7 +2571,9 @@ static std::string HandleGetScaling(const std::vector<std::string>& args)
 
 static std::string HandleSetLineMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_LINE_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_LINE_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_LINE_MODE <mode> (0=none, 1=double, 2=scanlines)"});
 	}
@@ -2090,6 +2610,8 @@ static std::string HandleSetLineMode(const std::vector<std::string>& args)
 		changed_prefs.gfx_pscanlines = 1;   // Enable scanlines
 		changed_prefs.gfx_iscanlines = 0;
 	}
+	// The manual crop window stays within the frame at the new line mode.
+	amiberry_settings::fit_manual_crop(changed_prefs);
 
 	set_config_changed();
 
@@ -2099,7 +2621,9 @@ static std::string HandleSetLineMode(const std::vector<std::string>& args)
 
 static std::string HandleGetLineMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_LINE_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_LINE_MODE" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int vres = currprefs.gfx_vresolution;
@@ -2130,7 +2654,9 @@ static std::string HandleGetLineMode(const std::vector<std::string>& args)
 
 static std::string HandleSetResolution(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_RESOLUTION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_RESOLUTION" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_RESOLUTION <mode> (0=lores, 1=hires, 2=superhires)"});
 	}
@@ -2155,6 +2681,8 @@ static std::string HandleSetResolution(const std::vector<std::string>& args)
 	}
 
 	changed_prefs.gfx_resolution = res;
+	// The manual crop window stays within the frame at the new resolution.
+	amiberry_settings::fit_manual_crop(changed_prefs);
 	set_config_changed();
 
 	const char* res_names[] = {"lores", "hires", "superhires"};
@@ -2163,7 +2691,9 @@ static std::string HandleSetResolution(const std::vector<std::string>& args)
 
 static std::string HandleGetResolution(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_RESOLUTION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_RESOLUTION" << std::endl;
+	}
 
 	int res = currprefs.gfx_resolution;
 	const char* res_names[] = {"lores", "hires", "superhires"};
@@ -2176,7 +2706,9 @@ static std::string HandleGetResolution(const std::vector<std::string>& args)
 
 static std::string HandleSetAutocrop(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_AUTOCROP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_AUTOCROP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_AUTOCROP <0|1>"});
 	}
@@ -2203,7 +2735,9 @@ static std::string HandleSetAutocrop(const std::vector<std::string>& args)
 
 static std::string HandleGetAutocrop(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUTOCROP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUTOCROP" << std::endl;
+	}
 
 	bool enabled = currprefs.gfx_auto_crop;
 	return make_response(true, {std::to_string(enabled ? 1 : 0), enabled ? "enabled" : "disabled"});
@@ -2211,9 +2745,14 @@ static std::string HandleGetAutocrop(const std::vector<std::string>& args)
 
 static std::string HandleInsertWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERT_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERT_WHDLOAD" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: INSERT_WHDLOAD <path_to_lha_or_directory>"});
+	}
+	if (args[0].size() >= MAX_DPATH) {
+		return make_response(false, {"Path exceeds maximum length"});
 	}
 
 	std::string path = args[0];
@@ -2250,7 +2789,9 @@ static std::string HandleInsertWHDLoad(const std::vector<std::string>& args)
 
 static std::string HandleEjectWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_WHDLOAD" << std::endl;
+	}
 
 	if (whdload_prefs.whdload_filename.empty()) {
 		return make_response(false, {"No WHDLoad game is currently loaded"});
@@ -2265,7 +2806,9 @@ static std::string HandleEjectWHDLoad(const std::vector<std::string>& args)
 
 static std::string HandleGetWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WHDLOAD" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2294,7 +2837,9 @@ static std::string HandleGetWHDLoad(const std::vector<std::string>& args)
 #ifdef DEBUGGER
 static std::string HandleDebugActivate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_ACTIVATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_ACTIVATE" << std::endl;
+	}
 
 	if (debugger_active) {
 		return make_response(true, {"Debugger already active"});
@@ -2306,7 +2851,9 @@ static std::string HandleDebugActivate(const std::vector<std::string>& args)
 
 static std::string HandleDebugDeactivate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_DEACTIVATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_DEACTIVATE" << std::endl;
+	}
 
 	if (!debugger_active) {
 		return make_response(true, {"Debugger not active"});
@@ -2318,20 +2865,28 @@ static std::string HandleDebugDeactivate(const std::vector<std::string>& args)
 
 static std::string HandleDebugStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STATUS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	responses.push_back("active=" + std::to_string(debugger_active ? 1 : 0));
-	responses.push_back("stopped=" + std::to_string(debugger_is_stopped() ? 1 : 0));
+	const bool stopped = debugger_is_stopped();
+	responses.push_back("stopped=" + std::to_string(stopped ? 1 : 0));
 	responses.push_back("debugging=" + std::to_string(debugging ? 1 : 0));
 	responses.push_back("exception_debugging=" + std::to_string(exception_debugging ? 1 : 0));
+	// The saved text belongs to the last stop; any exit from the debugger
+	// (continue, step, DEBUG_DEACTIVATE, the console) makes it historical.
+	responses.push_back(std::string("reason=") + (stopped ? debugger_last_stop_reason() : ""));
 
 	return make_response(true, responses);
 }
 
 static std::string HandleDebugStep(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STEP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STEP" << std::endl;
+	}
 
 	int count = 1;
 	if (!args.empty()) {
@@ -2353,7 +2908,9 @@ static std::string HandleDebugStep(const std::vector<std::string>& args)
 
 static std::string HandleDebugStepOver(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STEP_OVER" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STEP_OVER" << std::endl;
+	}
 
 	if (!debugger_request_step_over()) {
 		return make_response(false, {"Debugger is not stopped"});
@@ -2364,7 +2921,9 @@ static std::string HandleDebugStepOver(const std::vector<std::string>& args)
 
 static std::string HandleDebugContinue(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_CONTINUE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_CONTINUE" << std::endl;
+	}
 
 	if (!debugger_request_continue()) {
 		return make_response(false, {"Debugger is not stopped"});
@@ -2372,11 +2931,114 @@ static std::string HandleDebugContinue(const std::vector<std::string>& args)
 
 	return make_response(true, {"Execution continued"});
 }
+
+#ifdef GDBSERVER
+static bool monitor_prefix(const std::string& text, const char* prefix)
+{
+	const size_t n = strlen(prefix);
+	return text.compare(0, n, prefix) == 0 && (text.size() == n || text[n] == ' ');
+}
+
+static bool monitor_changes_state(const std::string& text)
+{
+	return monitor_prefix(text, "watch add") || monitor_prefix(text, "watch range") ||
+		monitor_prefix(text, "watch remove") || text == "watch clear-events" ||
+		monitor_prefix(text, "dma-watch add") || monitor_prefix(text, "dma-watch remove") ||
+		monitor_prefix(text, "condition add") || monitor_prefix(text, "condition remove") ||
+		monitor_prefix(text, "exception-mask") ||
+		text == "history on" || text == "history off" ||
+		text == "guest-output on" || text == "guest-output off" || text == "guest-output clear" ||
+		monitor_prefix(text, "process-break name") || monitor_prefix(text, "process-break address") ||
+		text == "process-break clear";
+}
+
+static bool monitor_reads_guest(const std::string& text)
+{
+	return monitor_prefix(text, "disasm") || text == "tasks" ||
+		text == "segments" || monitor_prefix(text, "segments");
+}
+
+static std::string monitor_refusal(const std::string& text)
+{
+	if (monitor_prefix(text, "input sequence"))
+		return "input sequence is advanced only while a GDB client is connected; use input event";
+	// A connected GDB client owns the shared monitor object, and its detach
+	// clears all of it, held input included.
+	if (gdb_server_connected() && (monitor_changes_state(text) ||
+		monitor_prefix(text, "input event") || text == "input release"))
+		return "a GDB client is connected; monitor state changes are refused";
+	if (monitor_changes_state(text) && !pause_emulation && !debugger_is_stopped())
+		return "monitor state changes require PAUSE or a stopped debugger";
+	return {};
+}
+
+static std::vector<std::string> monitor_result_fields(const std::string& result)
+{
+	std::vector<std::string> fields;
+	size_t start = 0;
+	while (start < result.size()) {
+		auto end = result.find('\n', start);
+		if (end == std::string::npos)
+			end = result.size();
+		std::string line = result.substr(start, end - start);
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (!line.empty()) {
+			for (char& c : line) {
+				if (c == '\t')
+					c = ' ';
+			}
+			fields.push_back(std::move(line));
+		}
+		if (end == result.size())
+			break;
+		start = end + 1;
+	}
+	return fields;
+}
+
+static std::string HandleMonitor(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received MONITOR" << std::endl;
+	}
+	if (args.empty())
+		return make_response(false, {"Usage: MONITOR <command> [args]"});
+
+	std::string text;
+	for (size_t i = 0; i < args.size(); i++) {
+		if (i)
+			text += ' ';
+		text += args[i];
+	}
+	for (unsigned char c : text) {
+		if (c < 0x20)
+			return make_response(false, {"Invalid control character in monitor command"});
+	}
+	std::string refusal = monitor_refusal(text);
+	if (!refusal.empty())
+		return make_response(false, {refusal});
+
+	std::string result, error;
+	// Debugger state, bank remaps and guest reads must not race a running CPU thread.
+	cpu_thread_guard cpu_guard(monitor_changes_state(text) || monitor_reads_guest(text));
+	if (!gdb_monitor_command(text, result, error))
+		return make_response(false, {error.empty() ? std::string("monitor command failed") : error});
+	// Conditions, history and program-entry breaks all depend on
+	// per-instruction trace checks; recompute them from every source.
+	if (monitor_changes_state(text))
+		debugger_breakpoints_changed();
+	return make_response(true, monitor_result_fields(result));
+}
+#endif
 #endif
 
 static std::string HandleGetCPURegs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_REGS" << std::endl;
+	cpu_thread_guard cpu_guard;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_REGS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2423,7 +3085,9 @@ static std::string HandleGetCPURegs(const std::vector<std::string>& args)
 
 static std::string HandleGetCustomRegs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CUSTOM_REGS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CUSTOM_REGS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2455,7 +3119,10 @@ static std::string HandleGetCustomRegs(const std::vector<std::string>& args)
 
 static std::string HandleDisassemble(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISASSEMBLE" << std::endl;
+	cpu_thread_guard cpu_guard;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISASSEMBLE" << std::endl;
+	}
 
 	uaecptr addr = M68K_GETPC;  // Default to current PC
 	int lines = 10;             // Default lines
@@ -2508,7 +3175,9 @@ static std::string HandleDisassemble(const std::vector<std::string>& args)
 #ifdef DEBUGGER
 static std::string HandleSetBreakpoint(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_BREAKPOINT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_BREAKPOINT" << std::endl;
+	}
 
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_BREAKPOINT <address> [slot]"});
@@ -2536,12 +3205,15 @@ static std::string HandleSetBreakpoint(const std::vector<std::string>& args)
 		} catch (...) {
 			slot = -1;
 		}
+		if (slot >= 0 && gdb_monitor_has_condition(slot)) {
+			return make_response(false, {"Slot " + std::to_string(slot) + " is reserved for a monitor condition"});
+		}
 	}
 
 	// Find a free slot if not specified
 	if (slot < 0) {
 		for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
-			if (!bpnodes[i].enabled) {
+			if (!bpnodes[i].enabled && !gdb_monitor_has_condition(i)) {
 				slot = i;
 				break;
 			}
@@ -2570,14 +3242,18 @@ static std::string HandleSetBreakpoint(const std::vector<std::string>& args)
 
 static std::string HandleClearBreakpoint(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received CLEAR_BREAKPOINT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received CLEAR_BREAKPOINT" << std::endl;
+	}
 
 	std::string selector = args.empty() ? "ALL" : args[0];
 	std::transform(selector.begin(), selector.end(), selector.begin(), ::toupper);
 	if (selector == "ALL") {
 		// Clear all breakpoints
 		for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
-			bpnodes[i].enabled = 0;
+			if (!gdb_monitor_has_condition(i)) {
+				bpnodes[i].enabled = 0;
+			}
 		}
 		debugger_breakpoints_changed();
 		return make_response(true, {"All breakpoints cleared"});
@@ -2592,7 +3268,7 @@ static std::string HandleClearBreakpoint(const std::vector<std::string>& args)
 
 	int cleared = 0;
 	for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
-		if (bpnodes[i].enabled && bpnodes[i].type == BREAKPOINT_REG_PC && bpnodes[i].value1 == addr) {
+		if (bpnodes[i].enabled && bpnodes[i].type == BREAKPOINT_REG_PC && bpnodes[i].value1 == addr && !gdb_monitor_has_condition(i)) {
 			bpnodes[i].enabled = 0;
 			cleared++;
 		}
@@ -2609,13 +3285,15 @@ static std::string HandleClearBreakpoint(const std::vector<std::string>& args)
 
 static std::string HandleListBreakpoints(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_BREAKPOINTS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_BREAKPOINTS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	int count = 0;
 
 	for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
-		if (bpnodes[i].enabled) {
+		if (bpnodes[i].enabled && !gdb_monitor_has_condition(i)) {
 			char buf[128];
 			snprintf(buf, sizeof(buf), "slot=%d address=%08X type=%d enabled=1",
 				i, bpnodes[i].value1, bpnodes[i].type);
@@ -2636,7 +3314,9 @@ static std::string HandleListBreakpoints(const std::vector<std::string>& args)
 
 static std::string HandleGetCopperState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_COPPER_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_COPPER_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2654,7 +3334,9 @@ static std::string HandleGetCopperState(const std::vector<std::string>& args)
 
 static std::string HandleGetBlitterState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_BLITTER_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_BLITTER_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2690,7 +3372,9 @@ static std::string HandleGetBlitterState(const std::vector<std::string>& args)
 
 static std::string HandleGetDriveState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DRIVE_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DRIVE_STATE" << std::endl;
+	}
 
 	int drive = -1;  // All drives by default
 	if (!args.empty()) {
@@ -2738,7 +3422,9 @@ static std::string HandleGetDriveState(const std::vector<std::string>& args)
 
 static std::string HandleGetAudioState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUDIO_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUDIO_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2758,7 +3444,9 @@ static std::string HandleGetAudioState(const std::vector<std::string>& args)
 
 static std::string HandleGetDMAState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DMA_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DMA_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2784,7 +3472,9 @@ static std::string HandleGetDMAState(const std::vector<std::string>& args)
 
 static std::string HandleHelp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received HELP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received HELP" << std::endl;
+	}
 	std::vector<std::string> commands;
 	commands.emplace_back("Available commands:");
 	commands.emplace_back("QUIT, PAUSE, RESUME, RESET [HARD|SOFT]");
@@ -2797,9 +3487,12 @@ static std::string HandleHelp(const std::vector<std::string>& args)
 	commands.emplace_back("LIST_HARDDRIVES");
 	commands.emplace_back("DISKSWAP <disknum> <drive>, QUERYDISKSWAP <drive>");
 	commands.emplace_back("GET_STATUS, GET_CONFIG <opt>, SET_CONFIG <opt> <val>");
-	commands.emplace_back("LOAD_CONFIG <path>, LIST_CONFIGS");
+	commands.emplace_back("LOAD_CONFIG <path>, SAVE_CONFIG <path>, LIST_CONFIGS");
+	commands.emplace_back("HOST_SETTINGS_LIST, HOST_SETTINGS_GET <id>, HOST_SETTINGS_SET <id> <value>, HOST_SETTINGS_SAVE");
+	commands.emplace_back("LIST_MEDIA <list>, GET_FOLDER <folder>, SET_FOLDER <folder> <path>");
 	commands.emplace_back("SET_VOLUME <0-100>, GET_VOLUME, MUTE, UNMUTE");
-	commands.emplace_back("SET_WARP <0|1>, GET_WARP, TOGGLE_FULLSCREEN");
+	commands.emplace_back("SET_WARP <0|1>, GET_WARP, TOGGLE_FULLSCREEN, OPEN_SETTINGS");
+	commands.emplace_back("CHOOSE_MEDIA <DF0-DF3|LOADSTATE|SAVESTATE|CD> (a system file dialog holds IPC until answered)");
 	commands.emplace_back("SET_DISPLAY_MODE <0-2>, GET_DISPLAY_MODE, TOGGLE_RTG");
 	commands.emplace_back("SET_NTSC <0|1>, GET_NTSC, TOGGLE_STATUS_LINE");
 	commands.emplace_back("SET_SOUND_MODE <0-3>, GET_SOUND_MODE");
@@ -2818,6 +3511,7 @@ static std::string HandleHelp(const std::vector<std::string>& args)
 	commands.emplace_back("FRAME_ADVANCE [n], SET_MOUSE_SPEED <10-200>, GET_MOUSE_SPEED");
 	commands.emplace_back("TOGGLE_MOUSE_GRAB");
 	commands.emplace_back("SEND_KEY <code> <state>, SEND_MOUSE <dx> <dy> <buttons>");
+	commands.emplace_back("SEND_JOYSTICK <port 0-3> <directions 0-15> <buttons 0-127>");
 	commands.emplace_back("SEND_MOUSE_ABS <x> <y> <buttons> (requires tablet_mode mousehack or real)");
 	commands.emplace_back("--- GUI automation controller commands (prefer MCP/HTTP) ---");
 	commands.emplace_back("SCREENSHOT <path> ACTIONABLE (SDL/OpenGL; unavailable on Vulkan)");
@@ -2832,6 +3526,9 @@ static std::string HandleHelp(const std::vector<std::string>& args)
 	commands.emplace_back("--- Debugging Commands ---");
 	commands.emplace_back("DEBUG_ACTIVATE, DEBUG_DEACTIVATE, DEBUG_STATUS");
 	commands.emplace_back("DEBUG_STEP [count], DEBUG_STEP_OVER, DEBUG_CONTINUE");
+#ifdef GDBSERVER
+	commands.emplace_back("MONITOR <text> - GDB monitor command; lines returned as fields");
+#endif
 	commands.emplace_back("GET_CPU_REGS, GET_CUSTOM_REGS");
 	commands.emplace_back("DISASSEMBLE <addr> [count] - disassemble instructions");
 	commands.emplace_back("SET_BREAKPOINT <addr>, CLEAR_BREAKPOINT <addr|ALL>, LIST_BREAKPOINTS");
@@ -2839,10 +3536,703 @@ static std::string HandleHelp(const std::vector<std::string>& args)
 	commands.emplace_back("GET_DRIVE_STATE [drive], GET_AUDIO_STATE, GET_DMA_STATE");
 #endif
 	commands.emplace_back("GET_VERSION, PING, HELP");
+	commands.emplace_back("SETTINGS_GET <id>");
+	commands.emplace_back("SETTINGS_SET <id> <value>");
+	commands.emplace_back("SETTINGS_VALIDATE");
+	commands.emplace_back("SETTINGS_COMMIT");
+	commands.emplace_back("SETTINGS_RESET_SESSION");
+	commands.emplace_back("SETTINGS_GET_ACTIVE <id>");
+	commands.emplace_back("SETTINGS_LIST");
+	commands.emplace_back("SETTINGS_DESCRIBE <id>");
+	commands.emplace_back("SETTINGS_APPLY <live|reset|restart>");
+	commands.emplace_back("SETTINGS_MOUNTS");
+	commands.emplace_back("SETTINGS_MOUNT_ADD <uaehf value>");
+	commands.emplace_back("SETTINGS_MOUNT_REPLACE <index> <uaehf value>");
+	commands.emplace_back("SETTINGS_MOUNT_REMOVE <index>");
+	commands.emplace_back("SETTINGS_BOARDS");
+	commands.emplace_back("SETTINGS_BOARD_DESCRIBE <type> [field]");
+	commands.emplace_back("SETTINGS_BOARD_GET <type> <unit> <field>");
+	commands.emplace_back("SETTINGS_BOARD_SET <type> <unit> <field> <value>");
+	commands.emplace_back("SETTINGS_CUSTOM_CONTROLS");
+	commands.emplace_back("SETTINGS_INPUT_EVENTS");
+	commands.emplace_back("SETTINGS_CUSTOM_CONTROL_GET <port> <none|hotkey> <control>");
+	commands.emplace_back("SETTINGS_CUSTOM_CONTROL_SET <port> <none|hotkey> <control> <event>");
 	return make_response(true, commands);
 }
 
 // Initialize command handlers
+// === Settings edit session commands ===
+// One session owned by the IPC server, executed on the main thread like
+// every other handler. Lazily opened; SETTINGS_RESET_SESSION discards it.
+// One session for the whole IPC server (all clients share it). It is
+// reopened whenever it holds no uncommitted SETTINGS_SET edits, so a
+// configuration loaded or changed through any other command (LOAD_CONFIG,
+// SET_CONFIG, the GUI) is what the next SETTINGS_* command sees, and it is
+// closed after SETTINGS_COMMIT and SETTINGS_RESET_SESSION.
+static amiberry_settings_session* ipc_settings_session;
+static bool ipc_settings_dirty;
+
+static void close_settings_session()
+{
+	if (ipc_settings_session) {
+		amiberry_settings_session_close(ipc_settings_session);
+		ipc_settings_session = nullptr;
+	}
+	ipc_settings_dirty = false;
+}
+
+static amiberry_settings_session* settings_session()
+{
+	if (ipc_settings_session && !ipc_settings_dirty)
+		close_settings_session();
+	if (!ipc_settings_session) {
+		ipc_settings_session = amiberry_settings_session_open();
+		ipc_settings_dirty = false;
+	}
+	return ipc_settings_session;
+}
+
+static std::string settings_status_message(amiberry_settings_status status,
+	const std::string& id, const std::string& value)
+{
+	switch (status) {
+	case AMIBERRY_SETTINGS_OK:
+		return "OK";
+	case AMIBERRY_SETTINGS_UNKNOWN_ID:
+		return "Unknown option: " + id;
+	case AMIBERRY_SETTINGS_INVALID_VALUE:
+		return "Invalid value for " + id + ": " + value;
+	case AMIBERRY_SETTINGS_UNAVAILABLE:
+		return "Option unavailable now: " + id;
+	case AMIBERRY_SETTINGS_BUFFER_TOO_SMALL:
+		return "Value too long";
+	}
+	return "Settings error";
+}
+
+// Reads a setting into value with a buffer that grows until it fits: PATH
+// and STRING values can be longer than AMIBERRY_SETTINGS_VALUE_MAX.
+template <typename Get>
+static amiberry_settings_status read_setting(std::string& value, Get&& get)
+{
+	std::vector<char> buffer(AMIBERRY_SETTINGS_VALUE_MAX);
+	for (;;) {
+		const amiberry_settings_status status = get(buffer.data(), buffer.size());
+		if (status != AMIBERRY_SETTINGS_BUFFER_TOO_SMALL || buffer.size() >= 65536) {
+			if (status == AMIBERRY_SETTINGS_OK)
+				value = buffer.data();
+			return status;
+		}
+		buffer.resize(buffer.size() * 4);
+	}
+}
+
+static std::string HandleSettingsGet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_GET" << std::endl;
+	}
+	if (args.size() < 1) {
+		return make_response(false, {"Usage: SETTINGS_GET <id>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	std::string value;
+	const amiberry_settings_status status = read_setting(value, [&](char* buffer, size_t size) {
+		return amiberry_settings_get(session, args[0].c_str(), buffer, size);
+	});
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {settings_status_message(status, args[0], "")});
+	}
+	return make_response(true, {args[0] + "=" + value});
+}
+
+static std::string HandleSettingsSet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_SET" << std::endl;
+	}
+	if (args.size() < 2) {
+		return make_response(false, {"Usage: SETTINGS_SET <id> <value>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status =
+		amiberry_settings_set(session, args[0].c_str(), args[1].c_str());
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {settings_status_message(status, args[0], args[1])});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+static std::string HandleSettingsValidate(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_VALIDATE" << std::endl;
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const size_t option_count = amiberry_settings_count();
+	std::vector<amiberry_settings_adjustment> adjustments(option_count);
+	const size_t found = amiberry_settings_validate(session,
+		adjustments.empty() ? nullptr : adjustments.data(), adjustments.size());
+	if (found == 0) {
+		return make_response(true, {"none"});
+	}
+	std::vector<std::string> fields;
+	for (size_t i = 0; i < found && i < adjustments.size(); ++i) {
+		fields.push_back(std::string(adjustments[i].id)
+			+ "=" + adjustments[i].requested
+			+ "->" + adjustments[i].adjusted
+			+ " (" + (adjustments[i].reason ? adjustments[i].reason : "") + ")");
+	}
+	return make_response(true, fields);
+}
+
+static const char* apply_class_name(amiberry_apply_class apply)
+{
+	switch (apply) {
+	case AMIBERRY_APPLY_LIVE: return "live";
+	case AMIBERRY_APPLY_RESET: return "reset";
+	case AMIBERRY_APPLY_RESTART: return "restart";
+	}
+	return "restart";
+}
+
+static std::string HandleSettingsCommit(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_COMMIT" << std::endl;
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	bool changed = false;
+	const amiberry_apply_class apply = amiberry_settings_commit(session, &changed);
+	close_settings_session();
+	if (changed) {
+		// Like SET_CONFIG: make the running emulation pick up what changed.
+		set_config_changed();
+	}
+	return make_response(true, {
+		std::string("changed=") + (changed ? "true" : "false"),
+		std::string("apply=") + apply_class_name(apply)
+	});
+}
+
+// A mount list index as SETTINGS_MOUNT_REPLACE and SETTINGS_MOUNT_REMOVE
+// take it: decimal digits only.
+static bool parse_mount_index(const std::string& text, size_t& index)
+{
+	if (text.empty() || text.size() > 4
+		|| !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+		return false;
+	index = static_cast<size_t>(std::stoul(text));
+	return true;
+}
+
+static std::string mount_status_message(amiberry_settings_status status, const std::string& subject)
+{
+	switch (status) {
+	case AMIBERRY_SETTINGS_OK:
+		return "OK";
+	case AMIBERRY_SETTINGS_UNKNOWN_ID:
+		return "No mount entry " + subject;
+	case AMIBERRY_SETTINGS_INVALID_VALUE:
+		return "Invalid mount entry: " + subject;
+	case AMIBERRY_SETTINGS_UNAVAILABLE:
+		return "The mount list is full";
+	case AMIBERRY_SETTINGS_BUFFER_TOO_SMALL:
+		return "Mount entry too long";
+	}
+	return "Settings error";
+}
+
+static std::string HandleSettingsMounts(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_MOUNTS" << std::endl;
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	std::vector<std::string> entries;
+	const size_t count = amiberry_settings_mount_count(session);
+	for (size_t i = 0; i < count; ++i) {
+		char value[CONFIG_BLEN];
+		if (amiberry_settings_mount_get(session, i, value, sizeof value) != AMIBERRY_SETTINGS_OK) {
+			return make_response(false, {"Mount entry " + std::to_string(i) + " could not be read"});
+		}
+		const std::string entry = value;
+		// A tab or line break would split the reply; such an entry cannot
+		// be represented in this protocol.
+		if (entry.find_first_of("\t\r\n") != std::string::npos) {
+			return make_response(false, {"Mount entry " + std::to_string(i) + " contains a tab or line break"});
+		}
+		entries.push_back(entry);
+	}
+	if (entries.empty()) {
+		return make_response(true, {"none"});
+	}
+	return make_response(true, entries);
+}
+
+static std::string HandleSettingsMountAdd(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_MOUNT_ADD" << std::endl;
+	}
+	if (args.size() != 1) {
+		return make_response(false, {"Usage: SETTINGS_MOUNT_ADD <uaehf value>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status = amiberry_settings_mount_add(session, args[0].c_str());
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {mount_status_message(status, args[0])});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+static std::string HandleSettingsMountReplace(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_MOUNT_REPLACE" << std::endl;
+	}
+	size_t index = 0;
+	if (args.size() != 2 || !parse_mount_index(args[0], index)) {
+		return make_response(false, {"Usage: SETTINGS_MOUNT_REPLACE <index> <uaehf value>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status = amiberry_settings_mount_replace(session, index, args[1].c_str());
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {mount_status_message(status,
+			status == AMIBERRY_SETTINGS_UNKNOWN_ID ? args[0] : args[1])});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+static std::string HandleSettingsMountRemove(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_MOUNT_REMOVE" << std::endl;
+	}
+	size_t index = 0;
+	if (args.size() != 1 || !parse_mount_index(args[0], index)) {
+		return make_response(false, {"Usage: SETTINGS_MOUNT_REMOVE <index>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status = amiberry_settings_mount_remove(session, index);
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {mount_status_message(status, args[0])});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+static std::string HandleSettingsList(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_LIST" << std::endl;
+	}
+	std::vector<std::string> ids;
+	for (size_t i = 0; i < amiberry_settings_count(); ++i) {
+		ids.emplace_back(amiberry_settings_at(i)->id);
+	}
+	return make_response(true, ids);
+}
+
+static const char* setting_type_name(amiberry_setting_type type)
+{
+	switch (type) {
+	case AMIBERRY_SETTING_BOOL: return "bool";
+	case AMIBERRY_SETTING_INT: return "int";
+	case AMIBERRY_SETTING_REAL: return "real";
+	case AMIBERRY_SETTING_CHOICE: return "choice";
+	case AMIBERRY_SETTING_PATH: return "path";
+	case AMIBERRY_SETTING_FILE: return "file";
+	case AMIBERRY_SETTING_STRING: return "string";
+	case AMIBERRY_SETTING_HOTKEY: return "hotkey";
+	}
+	return "string";
+}
+
+// The shortest spelling that reads back as v, whole numbers without an
+// exponent (60000, 0.1, 1e-05).
+static std::string number_text(double v)
+{
+	char text[64];
+	if (v == std::floor(v) && std::fabs(v) < 1e15) {
+		std::snprintf(text, sizeof text, "%.0f", v);
+		return text;
+	}
+	for (int precision = 1; precision <= 17; ++precision) {
+		std::snprintf(text, sizeof text, "%.*g", precision, v);
+		if (std::strtod(text, nullptr) == v)
+			break;
+	}
+	return text;
+}
+
+// Expansion boards: the board types, and the fields of a unit by type,
+// unit number and field ID (amiberry_settings_board_*).
+static std::string HandleSettingsBoards(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_BOARDS" << std::endl;
+	}
+	std::vector<std::string> ids;
+	for (size_t i = 0; i < amiberry_settings_board_type_count(); ++i) {
+		ids.emplace_back(amiberry_settings_board_type_at(i)->id);
+	}
+	return make_response(true, ids);
+}
+
+// A board unit number as the board commands take it: digits only.
+static bool parse_board_unit(const std::string& text, int& unit)
+{
+	if (text.empty() || text.size() > 2 || text.find_first_not_of("0123456789") != std::string::npos) {
+		return false;
+	}
+	unit = std::stoi(text);
+	return true;
+}
+
+static std::string HandleSettingsBoardDescribe(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_BOARD_DESCRIBE" << std::endl;
+	}
+	if (args.empty() || args.size() > 2) {
+		return make_response(false, {"Usage: SETTINGS_BOARD_DESCRIBE <type> [field]"});
+	}
+	const amiberry_settings_board_type* type = amiberry_settings_board_type_find(args[0].c_str());
+	if (!type) {
+		return make_response(false, {"Unknown board type: " + args[0]});
+	}
+	std::vector<std::string> fields;
+	if (args.size() == 1) {
+		fields.push_back(std::string("label=") + type->label);
+		fields.push_back(std::string("manufacturer=") + (type->manufacturer ? type->manufacturer : ""));
+		fields.push_back("units=" + std::to_string(type->units));
+		char categories[16];
+		std::snprintf(categories, sizeof categories, "0x%x", type->categories);
+		fields.push_back(std::string("categories=") + categories);
+		for (size_t i = 0; i < type->field_count; ++i) {
+			fields.push_back(std::string("field=") + amiberry_settings_board_field_at(type, i)->id);
+		}
+	} else {
+		const amiberry_setting_descriptor* d = nullptr;
+		for (size_t i = 0; i < type->field_count && !d; ++i) {
+			const amiberry_setting_descriptor* f = amiberry_settings_board_field_at(type, i);
+			if (args[1] == f->id) {
+				d = f;
+			}
+		}
+		if (!d) {
+			return make_response(false, {"Unknown field of " + args[0] + ": " + args[1]});
+		}
+		fields.push_back(std::string("type=") + setting_type_name(d->type));
+		fields.push_back(std::string("apply=") + apply_class_name(d->apply));
+		fields.push_back(std::string("label=") + d->label);
+		fields.push_back(std::string("default=") + (d->default_value ? d->default_value : ""));
+		for (size_t i = 0; i < d->choice_count; ++i) {
+			fields.push_back(std::string("choice=") + d->choices[i].value);
+		}
+	}
+	for (const std::string& field : fields) {
+		if (field.find_first_of("\t\r\n") != std::string::npos) {
+			return make_response(false, {"Description of " + args[0] + " contains a tab or line break"});
+		}
+	}
+	return make_response(true, fields);
+}
+
+static std::string HandleSettingsBoardGet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_BOARD_GET" << std::endl;
+	}
+	int unit = 0;
+	if (args.size() != 3 || !parse_board_unit(args[1], unit)) {
+		return make_response(false, {"Usage: SETTINGS_BOARD_GET <type> <unit> <field>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	std::string value;
+	amiberry_settings_status status = AMIBERRY_SETTINGS_OK;
+	const bool read = media_string([&](char* buffer, size_t size) {
+		status = amiberry_settings_board_get(session, args[0].c_str(), unit, args[2].c_str(), buffer, size);
+		return status;
+	}, value);
+	if (!read) {
+		return make_response(false, {status == AMIBERRY_SETTINGS_UNKNOWN_ID
+			? "Unknown board field: " + args[0] + " " + args[1] + " " + args[2] : "Value too long"});
+	}
+	if (value.find_first_of("\t\r\n") != std::string::npos) {
+		return make_response(false, {"Value of " + args[2] + " contains a tab or line break"});
+	}
+	const bool available = amiberry_settings_board_field_available(session, args[0].c_str(), unit, args[2].c_str());
+	return make_response(true, {args[2] + "=" + value, std::string("available=") + (available ? "true" : "false")});
+}
+
+static std::string HandleSettingsBoardSet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_BOARD_SET" << std::endl;
+	}
+	int unit = 0;
+	if (args.size() != 4 || !parse_board_unit(args[1], unit)) {
+		return make_response(false, {"Usage: SETTINGS_BOARD_SET <type> <unit> <field> <value>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status =
+		amiberry_settings_board_set(session, args[0].c_str(), unit, args[2].c_str(), args[3].c_str());
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {status == AMIBERRY_SETTINGS_UNKNOWN_ID
+			? "Unknown board field: " + args[0] + " " + args[1] + " " + args[2]
+			: settings_status_message(status, args[2], args[3])});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+// Custom controls (amiberry_settings_custom_control_*): the event each
+// button and axis of the joystick on a port triggers, alone ("none") or
+// with the hotkey button held ("hotkey").
+static std::string HandleSettingsCustomControls(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_CUSTOM_CONTROLS" << std::endl;
+	}
+	std::vector<std::string> controls;
+	for (size_t i = 0; i < amiberry_settings_custom_control_count(); ++i) {
+		const amiberry_settings_custom_control* c = amiberry_settings_custom_control_at(i);
+		controls.push_back(std::string(c->id) + (c->axis ? "=axis" : "=button"));
+	}
+	return make_response(true, controls);
+}
+
+static std::string HandleSettingsInputEvents(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_INPUT_EVENTS" << std::endl;
+	}
+	std::vector<std::string> events;
+	for (size_t i = 0; i < amiberry_settings_input_event_count(); ++i) {
+		events.emplace_back(amiberry_settings_input_event_at(i)->value);
+	}
+	return make_response(true, events);
+}
+
+// A custom control's port and mode as the commands take them.
+static bool parse_custom_control(const std::vector<std::string>& args, int& port, bool& hotkey)
+{
+	if (args[0].size() != 1 || args[0][0] < '0' || args[0][0] > '9' || (args[1] != "none" && args[1] != "hotkey")) {
+		return false;
+	}
+	port = args[0][0] - '0';
+	hotkey = args[1] == "hotkey";
+	return true;
+}
+
+static std::string HandleSettingsCustomControlGet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_CUSTOM_CONTROL_GET" << std::endl;
+	}
+	int port = 0;
+	bool hotkey = false;
+	if (args.size() != 3 || !parse_custom_control(args, port, hotkey)) {
+		return make_response(false, {"Usage: SETTINGS_CUSTOM_CONTROL_GET <port> <none|hotkey> <control>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	char value[AMIBERRY_SETTINGS_VALUE_MAX];
+	const amiberry_settings_status status =
+		amiberry_settings_custom_control_get(session, port, hotkey, args[2].c_str(), value, sizeof value);
+	if (status == AMIBERRY_SETTINGS_UNKNOWN_ID) {
+		return make_response(false, {"Unknown custom control: " + args[0] + " " + args[2]});
+	}
+	if (status == AMIBERRY_SETTINGS_UNAVAILABLE) {
+		return make_response(false, {"Port " + args[0] + " has no joystick"});
+	}
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {"Value too long"});
+	}
+	const bool available = amiberry_settings_custom_control_available(session, port, hotkey, args[2].c_str());
+	const char* use = amiberry_settings_custom_control_use(session, port, hotkey, args[2].c_str());
+	return make_response(true, {args[2] + "=" + value, std::string("available=") + (available ? "true" : "false"),
+		std::string("use=") + (use ? use : "")});
+}
+
+static std::string HandleSettingsCustomControlSet(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_CUSTOM_CONTROL_SET" << std::endl;
+	}
+	int port = 0;
+	bool hotkey = false;
+	if (args.size() != 4 || !parse_custom_control(args, port, hotkey)) {
+		return make_response(false, {"Usage: SETTINGS_CUSTOM_CONTROL_SET <port> <none|hotkey> <control> <event>"});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	const amiberry_settings_status status =
+		amiberry_settings_custom_control_set(session, port, hotkey, args[2].c_str(), args[3].c_str());
+	if (status == AMIBERRY_SETTINGS_UNKNOWN_ID) {
+		return make_response(false, {"Unknown custom control: " + args[0] + " " + args[2]});
+	}
+	if (status == AMIBERRY_SETTINGS_INVALID_VALUE) {
+		return make_response(false, {"Unknown input event: " + args[3]});
+	}
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {"Control " + args[2] + " is not available on port " + args[0]});
+	}
+	ipc_settings_dirty = true;
+	return make_response(true);
+}
+
+static std::string HandleSettingsDescribe(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_DESCRIBE" << std::endl;
+	}
+	if (args.size() != 1) {
+		return make_response(false, {"Usage: SETTINGS_DESCRIBE <id>"});
+	}
+	const amiberry_setting_descriptor* d = amiberry_settings_find(args[0].c_str());
+	if (!d) {
+		return make_response(false, {"Unknown option: " + args[0]});
+	}
+	amiberry_settings_session* session = settings_session();
+	if (!session) {
+		return make_response(false, {"Out of memory"});
+	}
+	std::vector<std::string> fields;
+	fields.push_back(std::string("type=") + setting_type_name(d->type));
+	fields.push_back(std::string("apply=") + apply_class_name(d->apply));
+	fields.push_back(std::string("group=") + d->group);
+	fields.push_back(std::string("default=") + (d->default_value ? d->default_value : ""));
+	fields.push_back(std::string("available=")
+		+ (amiberry_settings_is_available(session, d->id) ? "true" : "false"));
+	double min = 0, max = 0;
+	if (amiberry_settings_get_range(session, d->id, &min, &max)) {
+		fields.push_back("min=" + number_text(min));
+		fields.push_back("max=" + number_text(max));
+		fields.push_back("step=" + number_text(d->step));
+		// Shown as min + max - value (a volume stored as attenuation).
+		if (d->reversed)
+			fields.push_back("reversed=true");
+		if (d->unit)
+			fields.push_back(std::string("unit=") + d->unit);
+		// Shown as value / scale (a gamma stored in tenths).
+		if (d->scale != 0 && d->scale != 1)
+			fields.push_back("scale=" + number_text(d->scale));
+		// A level a front end may show as a slider.
+		if (d->level)
+			fields.push_back("level=true");
+	}
+	// The choices the option offers now, with whether each is available.
+	// Copied first: the list may be rebuilt by the next layer call (host
+	// device lists are).
+	const amiberry_setting_choice* choices = nullptr;
+	const size_t count = amiberry_settings_choices(session, d->id, &choices);
+	std::vector<std::string> values;
+	for (size_t i = 0; i < count; ++i) {
+		values.emplace_back(choices[i].value);
+	}
+	for (const std::string& value : values) {
+		const bool available = amiberry_settings_choice_is_available(session, d->id, value.c_str());
+		fields.push_back(std::string(available ? "choice=" : "unavailable_choice=") + value);
+	}
+	// A tab or line break in a field would split the reply.
+	for (const std::string& field : fields) {
+		if (field.find_first_of("\t\r\n") != std::string::npos) {
+			return make_response(false, {"Description of " + args[0] + " contains a tab or line break"});
+		}
+	}
+	return make_response(true, fields);
+}
+
+static std::string HandleSettingsGetActive(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_GET_ACTIVE" << std::endl;
+	}
+	if (args.size() < 1) {
+		return make_response(false, {"Usage: SETTINGS_GET_ACTIVE <id>"});
+	}
+	std::string value;
+	const amiberry_settings_status status = read_setting(value, [&](char* buffer, size_t size) {
+		return amiberry_settings_get_active(args[0].c_str(), buffer, size);
+	});
+	if (status != AMIBERRY_SETTINGS_OK) {
+		return make_response(false, {settings_status_message(status, args[0], "")});
+	}
+	return make_response(true, {args[0] + "=" + value});
+}
+
+static std::string HandleSettingsApply(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_APPLY" << std::endl;
+	}
+	if (args.size() != 1) {
+		return make_response(false, {"Usage: SETTINGS_APPLY <live|reset|restart>"});
+	}
+	std::string name = args[0];
+	std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+	amiberry_apply_class apply;
+	if (name == "live") {
+		apply = AMIBERRY_APPLY_LIVE;
+	} else if (name == "reset") {
+		apply = AMIBERRY_APPLY_RESET;
+	} else if (name == "restart") {
+		apply = AMIBERRY_APPLY_RESTART;
+	} else {
+		return make_response(false, {"Usage: SETTINGS_APPLY <live|reset|restart>"});
+	}
+	return run_posted_reply(amiberry_actions_apply_settings(apply));
+}
+
+static std::string HandleSettingsResetSession(const std::vector<std::string>& args)
+{
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SETTINGS_RESET_SESSION" << std::endl;
+	}
+	close_settings_session();
+	return make_response(true);
+}
+
 static void InitHandlers()
 {
 	if (!command_handlers.empty()) return;
@@ -2862,6 +4252,11 @@ static void InitHandlers()
 	command_handlers[CMD_GET_CONFIG] = HandleGetConfig;
 	command_handlers[CMD_SET_CONFIG] = HandleSetConfig;
 	command_handlers[CMD_LOAD_CONFIG] = HandleLoadConfig;
+	command_handlers[CMD_SAVE_CONFIG] = HandleSaveConfig;
+	command_handlers[CMD_HOST_SETTINGS_LIST] = HandleHostSettingsList;
+	command_handlers[CMD_HOST_SETTINGS_GET] = HandleHostSettingsGet;
+	command_handlers[CMD_HOST_SETTINGS_SET] = HandleHostSettingsSet;
+	command_handlers[CMD_HOST_SETTINGS_SAVE] = HandleHostSettingsSave;
 	command_handlers[CMD_SEND_KEY] = HandleSendKey;
 	command_handlers[CMD_READ_MEM] = HandleReadMem;
 	command_handlers[CMD_WRITE_MEM] = HandleWriteMem;
@@ -2873,6 +4268,8 @@ static void InitHandlers()
 	command_handlers[CMD_MUTE] = HandleMute;
 	command_handlers[CMD_UNMUTE] = HandleUnmute;
 	command_handlers[CMD_TOGGLE_FULLSCREEN] = HandleToggleFullscreen;
+	command_handlers[CMD_OPEN_SETTINGS] = HandleOpenSettings;
+	command_handlers[CMD_CHOOSE_MEDIA] = HandleChooseMedia;
 	command_handlers[CMD_SET_WARP] = HandleSetWarp;
 	command_handlers[CMD_GET_WARP] = HandleGetWarp;
 	command_handlers[CMD_GET_VERSION] = HandleGetVersion;
@@ -2881,12 +4278,37 @@ static void InitHandlers()
 	command_handlers[CMD_FRAME_ADVANCE] = HandleFrameAdvance;
 	command_handlers[CMD_SET_MOUSE_SPEED] = HandleSetMouseSpeed;
 	command_handlers[CMD_SEND_MOUSE] = HandleSendMouse;
+	command_handlers[CMD_SEND_JOYSTICK] = HandleSendJoystick;
 	command_handlers[CMD_SEND_MOUSE_ABS] = HandleSendMouseAbs;
 	command_handlers[CMD_GET_GUI_AUTOMATION_STATE] = HandleGetGuiAutomationState;
 	command_handlers[CMD_SET_GUI_AUTOMATION_CONFIG] = HandleSetGuiAutomationConfig;
 	command_handlers[CMD_SEND_MOUSE_ABS_GUARDED] = HandleSendMouseAbsGuarded;
 	command_handlers[CMD_RELEASE_MOUSE_BUTTONS] = HandleReleaseMouseButtons;
 	command_handlers[CMD_PING] = HandlePing;
+	command_handlers[CMD_SETTINGS_GET] = HandleSettingsGet;
+	command_handlers[CMD_SETTINGS_SET] = HandleSettingsSet;
+	command_handlers[CMD_SETTINGS_VALIDATE] = HandleSettingsValidate;
+	command_handlers[CMD_SETTINGS_COMMIT] = HandleSettingsCommit;
+	command_handlers[CMD_SETTINGS_RESET_SESSION] = HandleSettingsResetSession;
+	command_handlers[CMD_SETTINGS_GET_ACTIVE] = HandleSettingsGetActive;
+	command_handlers[CMD_SETTINGS_LIST] = HandleSettingsList;
+	command_handlers[CMD_SETTINGS_DESCRIBE] = HandleSettingsDescribe;
+	command_handlers[CMD_SETTINGS_APPLY] = HandleSettingsApply;
+	command_handlers[CMD_LIST_MEDIA] = HandleListMedia;
+	command_handlers[CMD_GET_FOLDER] = HandleGetFolder;
+	command_handlers[CMD_SET_FOLDER] = HandleSetFolder;
+	command_handlers[CMD_SETTINGS_MOUNTS] = HandleSettingsMounts;
+	command_handlers[CMD_SETTINGS_MOUNT_ADD] = HandleSettingsMountAdd;
+	command_handlers[CMD_SETTINGS_MOUNT_REPLACE] = HandleSettingsMountReplace;
+	command_handlers[CMD_SETTINGS_MOUNT_REMOVE] = HandleSettingsMountRemove;
+	command_handlers[CMD_SETTINGS_BOARDS] = HandleSettingsBoards;
+	command_handlers[CMD_SETTINGS_BOARD_DESCRIBE] = HandleSettingsBoardDescribe;
+	command_handlers[CMD_SETTINGS_BOARD_GET] = HandleSettingsBoardGet;
+	command_handlers[CMD_SETTINGS_BOARD_SET] = HandleSettingsBoardSet;
+	command_handlers[CMD_SETTINGS_CUSTOM_CONTROLS] = HandleSettingsCustomControls;
+	command_handlers[CMD_SETTINGS_INPUT_EVENTS] = HandleSettingsInputEvents;
+	command_handlers[CMD_SETTINGS_CUSTOM_CONTROL_GET] = HandleSettingsCustomControlGet;
+	command_handlers[CMD_SETTINGS_CUSTOM_CONTROL_SET] = HandleSettingsCustomControlSet;
 	command_handlers[CMD_HELP] = HandleHelp;
 
 	command_handlers[CMD_QUICKSAVE] = HandleQuickSave;
@@ -2950,6 +4372,9 @@ static void InitHandlers()
 	command_handlers[CMD_DEBUG_STEP] = HandleDebugStep;
 	command_handlers[CMD_DEBUG_STEP_OVER] = HandleDebugStepOver;
 	command_handlers[CMD_DEBUG_CONTINUE] = HandleDebugContinue;
+#ifdef GDBSERVER
+	command_handlers[CMD_MONITOR] = HandleMonitor;
+#endif
 	command_handlers[CMD_GET_CPU_REGS] = HandleGetCPURegs;
 	command_handlers[CMD_GET_CUSTOM_REGS] = HandleGetCustomRegs;
 	command_handlers[CMD_DISASSEMBLE] = HandleDisassemble;
@@ -2965,7 +4390,7 @@ static void InitHandlers()
 }
 
 // Process a single command line
-static std::string ProcessCommand(const std::string& line)
+static std::string ProcessCommand(const std::string& line, uae_u64 client_id)
 {
 	// Parse: COMMAND\tARG1\tARG2...
 	std::vector<std::string> parts = split(line, '\t');
@@ -2978,13 +4403,402 @@ static std::string ProcessCommand(const std::string& line)
 	std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
 
 	std::vector<std::string> args(parts.begin() + 1, parts.end());
+	// split() drops a trailing empty field, so `SETTINGS_SET\tppc_model\t`
+	// would lose its value. An empty string is a real settings value (for
+	// example ppc_model= turns PPC emulation off, an empty board rom_file a
+	// board without its ROM, an empty custom control its default), so keep
+	// it for those commands and the strict-arity joystick command only;
+	// every other command parses exactly as before.
+	if ((cmd == "SETTINGS_SET" || cmd == "SETTINGS_BOARD_SET" || cmd == "SETTINGS_CUSTOM_CONTROL_SET"
+		|| cmd == "HOST_SETTINGS_SET" || cmd == CMD_SEND_JOYSTICK)
+		&& !line.empty() && line.back() == '\t')
+		args.emplace_back();
 
 	const auto it = command_handlers.find(cmd);
 	if (it != command_handlers.end()) {
+		joystick_client_id = client_id;
 		return it->second(args);
 	}
 
 	return make_response(false, {"Unknown command: " + cmd});
+}
+
+// Transport. POSIX builds listen on a Unix-domain socket. Windows builds listen
+// on a named pipe: CPython, Node and Windows PowerShell can all open a named
+// pipe, but none of them can connect to an AF_UNIX socket on Windows. Both are
+// driven from the emulation thread without blocking, through the Conn*,
+// AcceptClients and WaitForActivity functions; request handling is shared.
+
+enum class IoStatus {
+	Ok,         // data moved
+	WouldBlock, // nothing more can move until the peer acts
+	Closed,     // end of stream or connection error
+};
+
+#ifdef _WIN32
+
+static constexpr DWORD IPC_PIPE_BUFFER_SIZE = 64 * 1024;
+
+// One pipe instance, first waiting for a client and then connected to it.
+// Overlapped operations keep pointers into this object until they complete,
+// so it is heap allocated and never moves. The pending connect uses read_ov.
+struct PipeConnection {
+	HANDLE pipe = INVALID_HANDLE_VALUE;
+	OVERLAPPED read_ov{};
+	OVERLAPPED write_ov{};
+	bool read_pending = false;
+	bool write_pending = false;
+	char read_buffer[4096]{};
+	std::string write_buffer;
+
+	PipeConnection()
+	{
+		read_ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		write_ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	}
+	PipeConnection(const PipeConnection&) = delete;
+	PipeConnection& operator=(const PipeConnection&) = delete;
+	~PipeConnection()
+	{
+		if (pipe != INVALID_HANDLE_VALUE) {
+			// Bytes the pipe has accepted stay readable by the client after the
+			// handle is closed; only operations still in flight are dropped.
+			if (read_pending || write_pending) {
+				CancelIoEx(pipe, nullptr);
+				DWORD ignored;
+				if (read_pending) {
+					GetOverlappedResult(pipe, &read_ov, &ignored, TRUE);
+				}
+				if (write_pending) {
+					GetOverlappedResult(pipe, &write_ov, &ignored, TRUE);
+				}
+			}
+			CloseHandle(pipe);
+		}
+		if (read_ov.hEvent) {
+			CloseHandle(read_ov.hEvent);
+		}
+		if (write_ov.hEvent) {
+			CloseHandle(write_ov.hEvent);
+		}
+	}
+};
+
+using IPCConnection = std::unique_ptr<PipeConnection>;
+#else
+using IPCConnection = int;
+#endif
+
+// A connected controller. Connections stay open across IPCHandle() calls
+// until the client closes them, so a controller can keep one connection for
+// many requests or open one connection per request.
+struct IPCClient {
+	IPCConnection conn;
+	std::string pending; // received bytes not handled yet
+	std::string output;  // reply bytes the connection has not accepted yet
+	bool eof;            // the client has stopped sending
+	uae_u64 input_id = ++next_input_client_id;
+};
+
+static std::vector<IPCClient> ipc_clients;
+static constexpr size_t IPC_MAX_CLIENTS = 16;
+using IPCReadyFlags = std::array<bool, IPC_MAX_CLIENTS>;
+
+// Commands run on the emulation thread, which calls IPCHandle() once per
+// frame. After handling a request, keep listening briefly for the next one so
+// a controller that sends requests back to back is not limited to one request
+// per frame. No new command starts after IPC_MAX_SERVICE_TIME, except that
+// each client with a request waiting gets at least one per pass.
+static constexpr std::chrono::milliseconds IPC_FOLLOWUP_WAIT{2};
+static constexpr std::chrono::milliseconds IPC_MAX_SERVICE_TIME{5};
+
+// Upper bound on reads (4 KiB each) from one client per service pass, so a
+// client that writes continuously cannot hold the emulation thread.
+static constexpr int IPC_MAX_READS_PER_PASS = 16;
+
+// Longest request line accepted. A client that sends more than this without a
+// newline is disconnected (after a best-effort error reply), so a malformed
+// controller cannot grow the receive buffer without limit.
+static constexpr size_t IPC_MAX_REQUEST_BYTES = 64 * 1024;
+
+static bool OutputBusy(const IPCClient& client);
+
+#ifdef _WIN32
+
+// The instance waiting for the next client.
+static IPCConnection pipe_listener;
+
+// Grants pipe access to the account Amiberry runs as and nobody else, like the
+// per-user XDG_RUNTIME_DIR that holds the Unix socket. The default pipe DACL
+// would let every local account open read-only connections and use up the
+// client slots.
+static PSECURITY_DESCRIPTOR pipe_security = nullptr;
+
+static bool CreatePipeSecurity()
+{
+	HANDLE token;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+		return false;
+	}
+	DWORD size = 0;
+	GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+	std::vector<BYTE> user(size);
+	const bool have_user = size != 0
+		&& GetTokenInformation(token, TokenUser, user.data(), size, &size);
+	CloseHandle(token);
+	LPSTR sid = nullptr;
+	if (!have_user
+		|| !ConvertSidToStringSidA(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) {
+		return false;
+	}
+	const std::string sddl = std::string("D:P(A;;GA;;;") + sid + ")";
+	LocalFree(sid);
+	return ConvertStringSecurityDescriptorToSecurityDescriptorA(
+		sddl.c_str(), SDDL_REVISION_1, &pipe_security, nullptr);
+}
+
+static bool ConnIsOpen(const IPCClient& client)
+{
+	return client.conn != nullptr;
+}
+
+static void CloseClient(IPCClient& client)
+{
+	inputdevice_release_joystick(client.input_id);
+	client.conn.reset();
+}
+
+// Creates a pipe instance and starts waiting for a client on it. With
+// first_instance set, creation fails with ERROR_ACCESS_DENIED when another
+// process already owns the name.
+static IPCConnection CreatePipeListener(const std::string& name, bool first_instance, DWORD& error)
+{
+	auto conn = std::make_unique<PipeConnection>();
+	if (!conn->read_ov.hEvent || !conn->write_ov.hEvent) {
+		error = GetLastError();
+		return nullptr;
+	}
+	DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+	if (first_instance) {
+		open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+	}
+	SECURITY_ATTRIBUTES security{sizeof(security), pipe_security, FALSE};
+	conn->pipe = CreateNamedPipeA(name.c_str(), open_mode,
+		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+		PIPE_UNLIMITED_INSTANCES, IPC_PIPE_BUFFER_SIZE, IPC_PIPE_BUFFER_SIZE, 0, &security);
+	if (conn->pipe == INVALID_HANDLE_VALUE) {
+		error = GetLastError();
+		return nullptr;
+	}
+	if (!ConnectNamedPipe(conn->pipe, &conn->read_ov)) {
+		error = GetLastError();
+		if (error == ERROR_IO_PENDING) {
+			conn->read_pending = true;
+		} else if (error != ERROR_PIPE_CONNECTED && error != ERROR_NO_DATA) {
+			return nullptr;
+		}
+	}
+	// Connected already (a client that has also gone again is accepted and
+	// then closed on its first read): let the accept path see it.
+	if (!conn->read_pending) {
+		SetEvent(conn->read_ov.hEvent);
+	}
+	error = ERROR_SUCCESS;
+	return conn;
+}
+
+// Replaces the listener after a connection. IPCHandle retries every frame
+// while this fails, so each distinct error is reported once.
+static void RestartPipeListener()
+{
+	static DWORD reported_error = ERROR_SUCCESS;
+	DWORD error = ERROR_SUCCESS;
+	pipe_listener = CreatePipeListener(socket_path, false, error);
+	if (!pipe_listener && error != reported_error && !currprefs.ipc_disable_logging) {
+		std::cerr << "IPC: Failed to create pipe instance: error " << error << std::endl;
+	}
+	reported_error = error;
+}
+
+// Starts a read so the read event signals when data or end of stream arrives.
+static bool StartRead(PipeConnection& c)
+{
+	if (c.read_pending) {
+		return true;
+	}
+	if (!ReadFile(c.pipe, c.read_buffer, sizeof(c.read_buffer), nullptr, &c.read_ov)
+		&& GetLastError() != ERROR_IO_PENDING) {
+		return false;
+	}
+	c.read_pending = true;
+	return true;
+}
+
+// Appends whatever one read delivers to out.
+static IoStatus ConnRead(IPCClient& client, std::string& out)
+{
+	PipeConnection& c = *client.conn;
+	if (!StartRead(c)) {
+		return IoStatus::Closed;
+	}
+	DWORD received = 0;
+	if (!GetOverlappedResult(c.pipe, &c.read_ov, &received, FALSE)) {
+		if (GetLastError() == ERROR_IO_INCOMPLETE) {
+			return IoStatus::WouldBlock;
+		}
+		c.read_pending = false;
+		return IoStatus::Closed;
+	}
+	c.read_pending = false;
+	out.append(c.read_buffer, received);
+	return IoStatus::Ok;
+}
+
+// A write handed to the pipe has not been accepted into its buffer yet.
+static bool ConnWriteBusy(const IPCClient& client)
+{
+	return client.conn && client.conn->write_pending
+		&& WaitForSingleObject(client.conn->write_ov.hEvent, 0) != WAIT_OBJECT_0;
+}
+
+// Hands data to the pipe. The pipe owns the bytes from then on, but the next
+// write waits until it has accepted them (ConnWriteBusy).
+static IoStatus ConnWrite(IPCClient& client, const char* data, size_t size, size_t& written)
+{
+	PipeConnection& c = *client.conn;
+	written = 0;
+	if (c.write_pending) {
+		DWORD done = 0;
+		if (!GetOverlappedResult(c.pipe, &c.write_ov, &done, FALSE)) {
+			if (GetLastError() == ERROR_IO_INCOMPLETE) {
+				return IoStatus::WouldBlock;
+			}
+			c.write_pending = false;
+			return IoStatus::Closed;
+		}
+		c.write_pending = false;
+	}
+	c.write_buffer.assign(data, size);
+	if (!WriteFile(c.pipe, c.write_buffer.data(), static_cast<DWORD>(c.write_buffer.size()), nullptr, &c.write_ov)
+		&& GetLastError() != ERROR_IO_PENDING) {
+		return IoStatus::Closed;
+	}
+	c.write_pending = true;
+	written = size;
+	return IoStatus::Ok;
+}
+
+static void ConnWaitWritable(IPCClient& client, int timeout_ms)
+{
+	WaitForSingleObject(client.conn->write_ov.hEvent, static_cast<DWORD>(timeout_ms));
+}
+
+// Closing the handle ends the client's stream after the bytes already sent.
+static void ConnFinishWrite(IPCClient&)
+{
+}
+
+// Accept every connected pipe instance, up to the client limit.
+// Returns true if at least one connection was accepted.
+static bool AcceptClients()
+{
+	bool accepted = false;
+	while (ipc_clients.size() < IPC_MAX_CLIENTS && pipe_listener) {
+		if (pipe_listener->read_pending) {
+			DWORD ignored;
+			if (!GetOverlappedResult(pipe_listener->pipe, &pipe_listener->read_ov, &ignored, FALSE)) {
+				if (GetLastError() == ERROR_IO_INCOMPLETE) {
+					break;
+				}
+				// The connect failed; wait on a fresh instance instead.
+				pipe_listener->read_pending = false;
+				RestartPipeListener();
+				continue;
+			}
+			pipe_listener->read_pending = false;
+		}
+		ipc_clients.push_back({std::move(pipe_listener), {}, {}, false});
+		accepted = true;
+		RestartPipeListener();
+	}
+	return accepted;
+}
+
+// Waits up to timeout_ms until the listener or a client can make progress.
+// Sets accept_ready and ready[i] for each such client in ipc_clients.
+// Returns the number of ready objects, 0 on timeout, or -1 on failure.
+static int WaitForActivity(bool can_accept, int timeout_ms, bool& accept_ready, IPCReadyFlags& ready)
+{
+	constexpr size_t listener_owner = IPC_MAX_CLIENTS;
+	std::array<HANDLE, IPC_MAX_CLIENTS + 1> handles{};
+	std::array<size_t, IPC_MAX_CLIENTS + 1> owners{};
+	DWORD count = 0;
+	int immediate = 0;
+	accept_ready = false;
+	ready.fill(false);
+
+	if (can_accept && pipe_listener) {
+		owners[count] = listener_owner;
+		handles[count++] = pipe_listener->read_ov.hEvent;
+	}
+	for (size_t i = 0; i < ipc_clients.size(); ++i) {
+		IPCClient& client = ipc_clients[i];
+		HANDLE event;
+		if (OutputBusy(client)) {
+			event = client.conn->write_ov.hEvent;
+		} else if (!client.eof && StartRead(*client.conn)) {
+			event = client.conn->read_ov.hEvent;
+		} else {
+			// The client has stopped sending, or its read failed at once:
+			// servicing it answers what is left and closes it.
+			ready[i] = true;
+			++immediate;
+			continue;
+		}
+		owners[count] = i;
+		handles[count++] = event;
+	}
+
+	if (count == 0) {
+		return immediate;
+	}
+	const DWORD result = WaitForMultipleObjects(count, handles.data(), FALSE,
+		immediate > 0 ? 0 : static_cast<DWORD>(timeout_ms));
+	if (result == WAIT_FAILED) {
+		return -1;
+	}
+	if (result == WAIT_TIMEOUT) {
+		return immediate;
+	}
+	int signalled = immediate;
+	for (DWORD h = 0; h < count; ++h) {
+		if (WaitForSingleObject(handles[h], 0) != WAIT_OBJECT_0) {
+			continue;
+		}
+		++signalled;
+		if (owners[h] == listener_owner) {
+			accept_ready = true;
+		} else {
+			ready[owners[h]] = true;
+		}
+	}
+	return signalled;
+}
+
+#else
+
+static bool ConnIsOpen(const IPCClient& client)
+{
+	return client.conn >= 0;
+}
+
+static void CloseClient(IPCClient& client)
+{
+	inputdevice_release_joystick(client.input_id);
+	if (client.conn >= 0) {
+		close(client.conn);
+		client.conn = -1;
+	}
 }
 
 static void ConfigureClientSocket(int client_socket)
@@ -2999,98 +4813,238 @@ static void ConfigureClientSocket(int client_socket)
 	}
 }
 
-static bool SendResponse(int client_socket, const std::string& response)
+// Appends whatever one read delivers to out.
+static IoStatus ConnRead(IPCClient& client, std::string& out)
 {
-	const char* data = response.c_str();
-	size_t remaining = response.length();
-
-	while (remaining > 0) {
-		const ssize_t written = send(client_socket, data, remaining, MSG_NOSIGNAL);
-		if (written > 0) {
-			data += written;
-			remaining -= written;
+	char buffer[4096];
+	for (;;) {
+		const ssize_t n = read(client.conn, buffer, sizeof(buffer));
+		if (n > 0) {
+			out.append(buffer, static_cast<size_t>(n));
+			return IoStatus::Ok;
+		}
+		if (n < 0 && errno == EINTR) {
 			continue;
 		}
-		if (written < 0 && errno == EINTR) {
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			return IoStatus::WouldBlock;
+		}
+		return IoStatus::Closed;
+	}
+}
+
+static bool ConnWriteBusy(const IPCClient&)
+{
+	return false;
+}
+
+static IoStatus ConnWrite(IPCClient& client, const char* data, size_t size, size_t& written)
+{
+	written = 0;
+	for (;;) {
+		const ssize_t n = send(client.conn, data, size, MSG_NOSIGNAL);
+		if (n > 0) {
+			written = static_cast<size_t>(n);
+			return IoStatus::Ok;
+		}
+		if (n < 0 && errno == EINTR) {
 			continue;
 		}
-		if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			struct pollfd pfd{};
-			pfd.fd = client_socket;
-			pfd.events = POLLOUT;
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			return IoStatus::WouldBlock;
+		}
+		return IoStatus::Closed;
+	}
+}
 
-			int ret;
-			do {
-				ret = poll(&pfd, 1, 100);
-			} while (ret < 0 && errno == EINTR);
+static void ConnWaitWritable(IPCClient& client, int timeout_ms)
+{
+	pollfd pfd{client.conn, POLLOUT, 0};
+	poll(&pfd, 1, timeout_ms);
+}
 
-			if (ret > 0 && (pfd.revents & POLLOUT)) {
+static void ConnFinishWrite(IPCClient& client)
+{
+	shutdown(client.conn, SHUT_WR);
+}
+
+// Accept every queued connection, up to the client limit.
+// Returns true if at least one connection was accepted.
+static bool AcceptClients()
+{
+	bool accepted = false;
+	while (ipc_clients.size() < IPC_MAX_CLIENTS) {
+		const int client_socket = accept(server_socket, nullptr, nullptr);
+		if (client_socket < 0) {
+			if (errno == EINTR) {
 				continue;
 			}
+			break;
 		}
-		return false;
+		ConfigureClientSocket(client_socket);
+		ipc_clients.push_back({client_socket, {}, {}, false});
+		accepted = true;
+	}
+	return accepted;
+}
+
+// Waits up to timeout_ms until the listener or a client can make progress.
+// Sets accept_ready and ready[i] for each such client in ipc_clients.
+// Returns the number of ready objects, 0 on timeout, or -1 on failure.
+static int WaitForActivity(bool can_accept, int timeout_ms, bool& accept_ready, IPCReadyFlags& ready)
+{
+	std::array<pollfd, IPC_MAX_CLIENTS + 1> fds{};
+	nfds_t count = 0;
+	if (can_accept) {
+		fds[count++] = {server_socket, POLLIN, 0};
+	}
+	const nfds_t first_client = count;
+	for (const auto& client : ipc_clients) {
+		fds[count++] = {client.conn, static_cast<short>(OutputBusy(client) ? POLLOUT : POLLIN), 0};
 	}
 
+	int ret;
+	do {
+		ret = poll(fds.data(), count, timeout_ms);
+	} while (ret < 0 && errno == EINTR);
+
+	accept_ready = ret > 0 && can_accept && (fds[0].revents & POLLIN);
+	ready.fill(false);
+	for (size_t i = 0; ret > 0 && i < ipc_clients.size(); ++i) {
+		ready[i] = fds[first_client + i].revents != 0;
+	}
+	return ret;
+}
+
+#endif
+
+// A reply is waiting to go out, so the client's next request must wait.
+static bool OutputBusy(const IPCClient& client)
+{
+	return !client.output.empty() || ConnWriteBusy(client);
+}
+
+// Write as much queued output as the connection accepts without blocking.
+// Returns false if the connection failed.
+static bool FlushOutput(IPCClient& client)
+{
+	size_t sent = 0;
+	while (sent < client.output.size()) {
+		size_t written = 0;
+		const IoStatus status = ConnWrite(client, client.output.data() + sent,
+			client.output.size() - sent, written);
+		if (status == IoStatus::Closed) {
+			return false;
+		}
+		if (status == IoStatus::WouldBlock) {
+			break;
+		}
+		sent += written;
+	}
+	client.output.erase(0, sent);
 	return true;
 }
 
-// Handle a single client connection
-static void HandleClient(int client_socket)
+// A complete request is waiting and nothing blocks answering it.
+static bool HasBacklog(const IPCClient& client)
 {
-	char buffer[4096];
-	std::string accumulated;
-	bool quit_after_reply = false;
+	return !OutputBusy(client) && client.pending.find('\n') != std::string::npos;
+}
 
-	ConfigureClientSocket(client_socket);
-
-	// Read with timeout
-	struct pollfd pfd{};
-	pfd.fd = client_socket;
-	pfd.events = POLLIN;
-
-	while (!quit_after_reply) {
-		int ret = poll(&pfd, 1, 100); // 100ms timeout
-		if (ret <= 0) break;
-
-		ssize_t n = read(client_socket, buffer, sizeof(buffer) - 1);
-		if (n <= 0) break;
-
-		buffer[n] = '\0';
-		accumulated += buffer;
-
-		// Process complete lines
-		size_t pos;
-		while ((pos = accumulated.find('\n')) != std::string::npos) {
-			std::string line = accumulated.substr(0, pos);
-			accumulated.erase(0, pos + 1);
-
-			// Remove trailing \r if present
-			if (!line.empty() && line.back() == '\r') {
-				line.pop_back();
-			}
-
-			if (!line.empty()) {
-				std::string response = ProcessCommand(line);
-				quit_after_reply = ipc_quit_requested;
-				SendResponse(client_socket, response);
-				if (quit_after_reply) {
-					break;
-				}
-			}
-		}
-	}
-
-	if (quit_after_reply) {
-		shutdown(client_socket, SHUT_WR);
-	}
-	close(client_socket);
-
-	if (quit_after_reply) {
-		ipc_quit_requested = false;
-		uae_quit();
+// QUIT ends the process, so this is the one place where waiting for a client
+// is acceptable: give the reply a bounded chance to go out before closing.
+static void FlushBeforeQuit(IPCClient& client)
+{
+	const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+	while (FlushOutput(client) && OutputBusy(client)
+		&& std::chrono::steady_clock::now() < give_up) {
+		ConnWaitWritable(client, 50);
 	}
 }
 
+// Send queued replies, then read what the client has sent and answer complete
+// lines. Nothing ever waits for the connection: while a reply is still queued,
+// the client's further requests stay unread, so a controller that stops
+// reading replies is held back by its own connection instead of stalling
+// emulation.
+// Requests are answered until the deadline passes, but at least one per call,
+// so every client makes progress; the rest wait for the next call, and nothing
+// more is read from the client until they are answered.
+// Closes the client once it has stopped sending and every reply is out, and
+// on error, oversized request, or QUIT.
+// Returns true if a queued reply finished sending or a command ran, so the
+// caller keeps listening for the client's next request.
+static bool ServiceClient(IPCClient& client, std::chrono::steady_clock::time_point deadline)
+{
+	const bool drained = OutputBusy(client);
+	if (!FlushOutput(client)) {
+		CloseClient(client);
+		return false;
+	}
+	if (OutputBusy(client)) {
+		return false;
+	}
+
+	const bool backlog = client.pending.find('\n') != std::string::npos;
+	for (int reads = 0; !backlog && !client.eof && reads < IPC_MAX_READS_PER_PASS; ++reads) {
+		const IoStatus status = ConnRead(client, client.pending);
+		if (status == IoStatus::WouldBlock) {
+			break;
+		}
+		if (status == IoStatus::Closed) {
+			// Lines already received are still answered; a client that
+			// half-closes after sending can read the replies.
+			client.eof = true;
+		}
+	}
+
+	int processed = 0;
+	size_t start = 0;
+	size_t pos;
+	while (!OutputBusy(client)
+		&& (processed == 0 || std::chrono::steady_clock::now() < deadline)
+		&& (pos = client.pending.find('\n', start)) != std::string::npos) {
+		std::string line = client.pending.substr(start, pos - start);
+		start = pos + 1;
+
+		// Remove trailing \r if present
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (line.empty()) {
+			continue;
+		}
+
+		client.output += ProcessCommand(line, client.input_id);
+		++processed;
+		if (ipc_quit_requested) {
+			FlushBeforeQuit(client);
+			ConnFinishWrite(client);
+			CloseClient(client);
+			return true;
+		}
+		if (!FlushOutput(client)) {
+			CloseClient(client);
+			return true;
+		}
+	}
+	client.pending.erase(0, start);
+
+	const size_t last_newline = client.pending.rfind('\n');
+	const size_t unterminated = last_newline == std::string::npos
+		? client.pending.size()
+		: client.pending.size() - last_newline - 1;
+	if (unterminated > IPC_MAX_REQUEST_BYTES) {
+		client.output += make_response(false, {"Request too long"});
+		FlushOutput(client);
+		CloseClient(client);
+	} else if (client.eof && !OutputBusy(client) && last_newline == std::string::npos) {
+		CloseClient(client);
+	}
+	return drained || processed > 0;
+}
+
+#ifndef _WIN32
 // Helper: Check if a socket is stale (no process listening)
 static bool is_socket_stale(const std::string& path)
 {
@@ -3136,10 +5090,15 @@ static bool is_socket_stale(const std::string& path)
 	// Other errors - assume stale to allow cleanup
 	return true;
 }
+#endif
 
-// Helper: Generate socket path with optional instance suffix
+// Helper: Generate socket path (pipe name on Windows) with optional instance suffix
 static std::string get_socket_path(int instance = 0)
 {
+#ifdef _WIN32
+	const std::string base_path = "\\\\.\\pipe\\amiberry";
+	const char* suffix = "";
+#else
 	std::string base_path;
 	const char* xdg_runtime = getenv("XDG_RUNTIME_DIR");
 	if (xdg_runtime) {
@@ -3147,15 +5106,47 @@ static std::string get_socket_path(int instance = 0)
 	} else {
 		base_path = "/tmp/amiberry";
 	}
+	const char* suffix = ".sock";
+#endif
 
 	if (instance == 0) {
-		return base_path + ".sock";
+		return base_path + suffix;
 	} else {
-		return base_path + "_" + std::to_string(instance) + ".sock";
+		return base_path + "_" + std::to_string(instance) + suffix;
 	}
 }
 
-void Amiberry::IPC::IPCSetup()
+#ifdef _WIN32
+// Claims the first free pipe name. A pipe disappears with the process that
+// created it, so there are no stale names to clean up.
+static bool OpenListener()
+{
+	if (!CreatePipeSecurity()) {
+		std::cerr << "IPC: Failed to build pipe security descriptor: error " << GetLastError() << std::endl;
+		return false;
+	}
+	for (int instance = 0; instance < 10; ++instance) {
+		socket_path = get_socket_path(instance);
+		DWORD error = ERROR_SUCCESS;
+		pipe_listener = CreatePipeListener(socket_path, true, error);
+		if (pipe_listener) {
+			socket_instance = instance;
+			if (instance > 0 && !currprefs.ipc_disable_logging) {
+				std::cout << "IPC: Default pipe in use, using instance " << instance << std::endl;
+			}
+			return true;
+		}
+		// ERROR_ACCESS_DENIED: another process owns this name.
+		if (error != ERROR_ACCESS_DENIED && error != ERROR_PIPE_BUSY) {
+			std::cerr << "IPC: Failed to create pipe " << socket_path << ": error " << error << std::endl;
+			return false;
+		}
+	}
+	std::cerr << "IPC: Could not find available pipe name after 10 attempts" << std::endl;
+	return false;
+}
+#else
+static bool OpenListener()
 {
 	// Try to find an available socket path
 	// First, try the default path
@@ -3163,7 +5154,9 @@ void Amiberry::IPC::IPCSetup()
 
 	// Check if existing socket is stale (from a crashed instance)
 	if (is_socket_stale(socket_path)) {
-		std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+		if (!currprefs.ipc_disable_logging) {
+			std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+		}
 		unlink(socket_path.c_str());
 	}
 
@@ -3171,7 +5164,7 @@ void Amiberry::IPC::IPCSetup()
 	server_socket = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (server_socket < 0) {
 		std::cerr << "IPC: Failed to create socket: " << strerror(errno) << std::endl;
-		return;
+		return false;
 	}
 
 	// Set non-blocking
@@ -3189,7 +5182,9 @@ void Amiberry::IPC::IPCSetup()
 
 			// Check for stale socket at this path too
 			if (is_socket_stale(socket_path)) {
-				std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+				if (!currprefs.ipc_disable_logging) {
+					std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+				}
 				unlink(socket_path.c_str());
 			}
 		}
@@ -3200,7 +5195,8 @@ void Amiberry::IPC::IPCSetup()
 
 		if (::bind(server_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
 			bound = true;
-			if (instance > 0) {
+			socket_instance = instance;
+			if (instance > 0 && !currprefs.ipc_disable_logging) {
 				std::cout << "IPC: Default socket in use, using instance " << instance << std::endl;
 			}
 			break;
@@ -3211,7 +5207,7 @@ void Amiberry::IPC::IPCSetup()
 			std::cerr << "IPC: Failed to bind socket: " << strerror(errno) << std::endl;
 			close(server_socket);
 			server_socket = -1;
-			return;
+			return false;
 		}
 	}
 
@@ -3219,15 +5215,24 @@ void Amiberry::IPC::IPCSetup()
 		std::cerr << "IPC: Could not find available socket path after 10 attempts" << std::endl;
 		close(server_socket);
 		server_socket = -1;
-		return;
+		return false;
 	}
 
 	// Listen
-	if (listen(server_socket, 5) < 0) {
+	if (listen(server_socket, SOMAXCONN) < 0) {
 		std::cerr << "IPC: Failed to listen on socket: " << strerror(errno) << std::endl;
 		close(server_socket);
 		server_socket = -1;
 		unlink(socket_path.c_str());
+		return false;
+	}
+	return true;
+}
+#endif
+
+void Amiberry::IPC::IPCSetup()
+{
+	if (!OpenListener()) {
 		return;
 	}
 
@@ -3235,7 +5240,9 @@ void Amiberry::IPC::IPCSetup()
 	InitHandlers();
 
 	ipc_active = true;
-	std::cout << "IPC: Listening on " << socket_path << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Listening on " << socket_path << std::endl;
+	}
 
 	// Register cleanup
 	atexit(Amiberry::IPC::IPCCleanUp);
@@ -3243,6 +5250,17 @@ void Amiberry::IPC::IPCSetup()
 
 void Amiberry::IPC::IPCCleanUp()
 {
+	for (auto& client : ipc_clients) {
+		CloseClient(client);
+	}
+	ipc_clients.clear();
+
+#ifdef _WIN32
+	pipe_listener.reset();
+	LocalFree(pipe_security);
+	pipe_security = nullptr;
+	socket_path.clear();
+#else
 	if (server_socket >= 0) {
 		close(server_socket);
 		server_socket = -1;
@@ -3252,7 +5270,9 @@ void Amiberry::IPC::IPCCleanUp()
 		unlink(socket_path.c_str());
 		socket_path.clear();
 	}
+#endif
 
+	close_settings_session();
 	ipc_active = false;
 }
 
@@ -3261,23 +5281,86 @@ void Amiberry::IPC::IPCHandle()
 	std::unique_lock<std::mutex> lock(ipc_handle_mutex, std::try_to_lock);
 	if (!lock.owns_lock()) return;
 
+#ifdef _WIN32
+	if (!ipc_active) return;
+	if (!pipe_listener) {
+		// Creating the next instance failed earlier; try again.
+		RestartPipeListener();
+	}
+#else
 	if (server_socket < 0) return;
+#endif
 
-	// Check for incoming connections (non-blocking)
-	struct pollfd pfd{};
-	pfd.fd = server_socket;
-	pfd.events = POLLIN;
+	using clock = std::chrono::steady_clock;
+	const auto started = clock::now();
+	auto last_activity = started;
+	bool active = false;
+	IPCReadyFlags ready{};
 
-	int ret = poll(&pfd, 1, 0); // Non-blocking
-	if (ret > 0 && (pfd.revents & POLLIN)) {
-		struct sockaddr_un client_addr{};
-		socklen_t client_len = sizeof(client_addr);
+	while (!ipc_quit_requested) {
+		// Without activity, only take what is already waiting. After a request
+		// or a new connection, wait a little for the next request.
+		const auto hard_deadline = started + IPC_MAX_SERVICE_TIME;
+		auto deadline = hard_deadline;
+		if (active) {
+			deadline = std::min(deadline, last_activity + IPC_FOLLOWUP_WAIT);
+		}
+		const auto now = clock::now();
+		if (now >= deadline) {
+			break;
+		}
 
-		int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
-		if (client_socket >= 0) {
-			HandleClient(client_socket);
+		const bool can_accept = ipc_clients.size() < IPC_MAX_CLIENTS;
+		bool backlog = false;
+		for (const auto& client : ipc_clients) {
+			backlog = backlog || HasBacklog(client);
+		}
+
+		// Requests left over from an earlier pass are answered without waiting.
+		const int timeout_ms = active && !backlog
+			? static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count())
+			: 0;
+		bool accept_ready = false;
+		const int ret = WaitForActivity(can_accept, timeout_ms, accept_ready, ready);
+		if (ret < 0 || (ret == 0 && !backlog)) {
+			break;
+		}
+
+		bool progressed = false;
+		const size_t waited_on = ipc_clients.size();
+		for (size_t i = 0; i < waited_on && !ipc_quit_requested; ++i) {
+			IPCClient& client = ipc_clients[i];
+			if ((ready[i] || HasBacklog(client))
+				&& ServiceClient(client, hard_deadline)) {
+				progressed = true;
+			}
+		}
+		ipc_clients.erase(
+			std::remove_if(ipc_clients.begin(), ipc_clients.end(),
+				[](const IPCClient& client) { return !ConnIsOpen(client); }),
+			ipc_clients.end());
+
+		if (can_accept && accept_ready && !ipc_quit_requested && AcceptClients()) {
+			progressed = true;
+		}
+
+		if (progressed) {
+			active = true;
+			last_activity = clock::now();
 		}
 	}
+
+	if (ipc_quit_requested) {
+		ipc_quit_requested = false;
+		// Executes the quit action HandleQuit posted (and anything queued
+		// before it), after the replies have been written.
+		amiberry_actions_run_pending();
+	}
+}
+
+int Amiberry::IPC::IPCInstance()
+{
+	return ipc_active ? socket_instance : 0;
 }
 
 bool Amiberry::IPC::IPCIsActive()

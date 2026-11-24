@@ -53,6 +53,8 @@ extern bool debugger_request_step(int count);
 extern bool debugger_request_step_over(void);
 extern bool debugger_request_continue(void);
 extern void debugger_breakpoints_changed(void);
+extern const char* debugger_last_stop_reason(void);
+extern void debugger_service_ipc(void);
 #endif
 extern const TCHAR *debuginfo (int);
 extern void record_copper (uaecptr addr, uaecptr nextaddr, uae_u16 word1, uae_u16 word2, int hpos, int vpos);
@@ -193,10 +195,18 @@ struct memwatch_node {
 	bool nobreak;
 	bool reportonly;
 	int bus_error;
+	int remote;
 };
 extern struct memwatch_node mwnodes[MEMWATCH_TOTAL];
 
+/* memwatch_node.remote: entries owned by the remote debugger */
+#define MW_REMOTE_LOG 1		// record access evidence for the remote client
+#define MW_REMOTE_EXACT 2	// match complete accesses only, compare old RAM values
+
 extern void memwatch_dump2 (TCHAR *buf, int bufsize, int num);
+extern void initialize_memwatch(int mode);
+extern int deinitialize_memwatch(void);
+extern void memwatch_setup (void);
 
 void debug_getpeekdma_chipram(uaecptr addr, uae_u32 mask, int reg);
 void debug_getpeekdma_value(uae_u32);
@@ -247,7 +257,7 @@ struct dma_rec
     uae_u32 evt;
 	uae_u32 agnus_evt, agnus_evt_changed;
 	uae_u32 denise_evt[2], denise_evt_changed[2];
-	uae_u32 evtdata;
+	uae_u32 evtdata, evtdata2;
 	bool evtdataset;
     uae_s16 type;
 	uae_u16 extra;
@@ -312,6 +322,7 @@ extern struct dma_rec *last_dma_rec;
 #define DMA_EVENT_MODADD		0x00080000
 #define DMA_EVENT_LOF			0x00100000
 #define DMA_EVENT_LOL			0x00200000
+#define DMA_EVENT_DMAL			0x00400000
 
 #define DMA_EVENT_CIAA_IRQ		0x08000000
 #define DMA_EVENT_CIAB_IRQ		0x10000000
@@ -345,6 +356,7 @@ extern void record_dma_event_agnus(uae_u32 evt, bool onoff);
 extern void record_dma_event_denise(struct dma_rec *rd, int h, uae_u32 evt, bool onoff);
 extern void record_dma_event(uae_u32 evt);
 extern void record_dma_event_data(uae_u32 evt, uae_u32 data);
+extern void record_dma_event_data2(uae_u32 evt, uae_u32 data);
 extern void record_dma_clear(void);
 extern bool record_dma_check(void);
 extern void record_cia_access(int r, int mask, uae_u16 value, bool rw, int phase);
@@ -364,6 +376,16 @@ extern int get_dma_debug_color(struct dma_rec *dr, int line, uae_u32 *cp);
 #define TRACE_RAM_PC 6
 #define TRACE_IMMEDIATE 7
 #define TRACE_CHECKONLY 10
+
+#ifdef GDBSERVER
+extern void debug_remote_interrupt(void);
+extern void debug_remote_resume(bool step, bool check);
+extern void debug_remote_run_to(uaecptr pc);
+extern void debug_remote_hold(void);
+extern bool debug_remote_frame_save(bool enable);
+extern int debug_history_size(void);
+extern const struct regstruct *debug_history_get(int index, int *frame, int *vpos, int *hpos);
+#endif
 
 #else
 

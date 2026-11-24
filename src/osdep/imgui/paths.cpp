@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 #include "sysdeps.h"
+#include "target.h"
 #include "options.h"
 #include "gui/gui_handling.h"
 #include "uae.h"
@@ -81,7 +82,7 @@ static void start_whdboot_download()
 	s_whdboot_dl_now.store(0);
 	s_whdboot_dl_total.store(0);
 	s_whdboot_step.store(0);
-	s_whdboot_step_count.store(10);
+	s_whdboot_step_count.store(6);
 	{
 		std::lock_guard<std::mutex> lock(s_whdboot_mutex);
 		s_whdboot_status = "Starting...";
@@ -121,6 +122,11 @@ static void start_whdboot_download()
 			else if (result.outcome == whdboot_download_outcome::partial_failure)
 			{
 				s_whdboot_result_msg = "Some files failed to download.\nPlease check the log for details.";
+				s_whdboot_result_is_error = true;
+			}
+			else if (result.outcome == whdboot_download_outcome::busy)
+			{
+				s_whdboot_result_msg = "Another WHDBooter download is already running,\nor the machine is running. Stop it and try again.";
 				s_whdboot_result_is_error = true;
 			}
 			else
@@ -231,6 +237,167 @@ static bool path_exists_cached(const char* id, const std::string& path, bool is_
 	return e.exists;
 }
 
+static bool install_user_plugin(const std::filesystem::path& source, const std::filesystem::path& directory,
+	std::string& status)
+{
+	std::error_code ec;
+	std::filesystem::create_directories(directory, ec);
+	if (ec)
+	{
+		status = "Could not create the user plugins folder: " + ec.message();
+		return false;
+	}
+
+	const auto destination = directory / source.filename();
+	auto temporary = destination;
+	temporary += ".new";
+	std::filesystem::remove(temporary, ec);
+	if (ec)
+	{
+		status = "Could not prepare plugin installation: " + ec.message();
+		return false;
+	}
+
+	std::filesystem::copy_file(source, temporary, std::filesystem::copy_options::none, ec);
+	if (ec)
+	{
+		std::error_code cleanup_ec;
+		std::filesystem::remove(temporary, cleanup_ec);
+		status = "Could not copy plugin: " + ec.message();
+		return false;
+	}
+
+	const auto remove_temporary = [&]() {
+		std::error_code cleanup_ec;
+		std::filesystem::remove(temporary, cleanup_ec);
+	};
+	const auto fail = [&](const char* action) {
+		remove_temporary();
+		status = std::string("Could not ") + action + ": " + ec.message();
+		return false;
+	};
+
+#ifdef _WIN32
+	const auto destination_exists = std::filesystem::exists(destination, ec);
+	if (ec)
+		return fail("check the existing plugin");
+	if (destination_exists)
+	{
+		auto backup = destination;
+		backup += ".old";
+		std::filesystem::remove(backup, ec);
+		if (ec)
+			return fail("remove the previous plugin backup");
+		std::filesystem::rename(destination, backup, ec);
+		if (ec)
+			return fail("move the existing plugin aside");
+		std::filesystem::rename(temporary, destination, ec);
+		if (ec)
+		{
+			std::error_code restore_ec;
+			std::filesystem::rename(backup, destination, restore_ec);
+			return fail("replace the plugin");
+		}
+	}
+	else
+	{
+		std::filesystem::rename(temporary, destination, ec);
+		if (ec)
+			return fail("install the plugin");
+	}
+#else
+	std::filesystem::rename(temporary, destination, ec);
+	if (ec)
+		return fail("replace the plugin");
+#endif
+
+	status = "Installed " + destination.filename().string() + ". Restart Amiberry to use the new version.";
+	return true;
+}
+
+void render_plugin_paths_settings(const char* id)
+{
+	if (!user_plugins_supported())
+		return;
+
+	static std::string selected_plugin;
+	static std::string install_status;
+	static bool install_failed = false;
+	const auto user_plugins_path = get_user_plugins_path();
+	const std::string dialog_key = std::string("INSTALL_PLUGIN_") + id;
+	const std::string popup_id = std::string("Overwrite Plugin##") + id;
+
+#if defined(_WIN32)
+	constexpr const char* plugin_filter = "Amiberry plugins (*.dll){.dll}";
+#elif defined(AMIBERRY_MACOS)
+	constexpr const char* plugin_filter = "Amiberry plugins (*.dylib){.dylib}";
+#else
+	constexpr const char* plugin_filter = "Amiberry plugins (*.so){.so}";
+#endif
+
+	auto install = [&]() {
+		install_failed = !install_user_plugin(selected_plugin, user_plugins_path, install_status);
+	};
+
+	ImGui::PushID(id);
+	ImGui::TextWrapped("Bundled plugins stay with Amiberry. Install extra plugins in your user plugins folder.");
+	ImGui::Text("User plugins: %s", user_plugins_path.c_str());
+	if (AmigaButton("Open", ImVec2(SMALL_BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT)))
+	{
+		std::error_code ec;
+		std::filesystem::create_directories(user_plugins_path, ec);
+		if (ec)
+		{
+			install_status = "Could not create the user plugins folder: " + ec.message();
+			install_failed = true;
+		}
+		else
+		{
+			const auto directory = std::filesystem::path(user_plugins_path).generic_string();
+#ifdef _WIN32
+			const auto url = std::string("file:///") + directory;
+#else
+			const auto url = std::string("file://") + directory;
+#endif
+			if (!SDL_OpenURL(url.c_str()))
+			{
+				install_status = "Could not open the user plugins folder.";
+				install_failed = true;
+			}
+		}
+	}
+	ImGui::SameLine();
+	if (AmigaButton("Install plugin...", ImVec2(BUTTON_WIDTH * 1.5f, BUTTON_HEIGHT)))
+		OpenFileDialogKey(dialog_key.c_str(), "Install plugin", plugin_filter, user_plugins_path);
+
+	std::string picked_plugin;
+	if (ConsumeFileDialogResultKey(dialog_key.c_str(), picked_plugin) && !picked_plugin.empty())
+	{
+		selected_plugin = picked_plugin;
+		const auto destination = std::filesystem::path(user_plugins_path) / std::filesystem::path(selected_plugin).filename();
+		if (std::filesystem::exists(destination))
+			ImGui::OpenPopup(popup_id.c_str());
+		else
+			install();
+	}
+	if (ImGui::BeginPopupModal(popup_id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+	{
+		ImGui::TextWrapped("A plugin with this name is already installed. Replace it?");
+		if (AmigaButton("Replace", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT)))
+		{
+			install();
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (AmigaButton("Cancel", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT)))
+			ImGui::CloseCurrentPopup();
+		ImGui::EndPopup();
+	}
+	if (!install_status.empty())
+		ImGui::TextColored(install_failed ? GetErrorTextColor() : GetSuccessTextColor(), "%s", install_status.c_str());
+	ImGui::PopID();
+}
+
 void render_panel_paths()
 {
 	char tmp[MAX_DPATH];
@@ -320,7 +487,7 @@ void render_panel_paths()
 		const bool exists = path_exists_cached(id, path, is_file);
 
 		if (!exists) {
-			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255));
+			ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 		}
 
 		// Use a local buffer for InputText to avoid constness/temporary issues
@@ -372,7 +539,7 @@ void render_panel_paths()
 
 		const bool exists = path_exists_cached(id, path, false);
 		if (!exists)
-			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255));
+			ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 
 		char buffer[MAX_DPATH];
 		strncpy(buffer, path.c_str(), MAX_DPATH);
@@ -462,6 +629,27 @@ void render_panel_paths()
 		}
 #endif
 		ShowHelpMarker(portable_help.c_str());
+#if !defined(__MACH__)
+		if (!portable_toggle_available
+			&& portable_toggle_unavailable_reason.rfind("AppImage", 0) == 0)
+		{
+			ImGui::TextWrapped("%s", portable_toggle_unavailable_reason.c_str());
+		}
+#endif
+	}
+	{
+		bool use_relative_paths = relativepaths != 0;
+		if (AmigaCheckbox("Use relative paths", &use_relative_paths))
+			relativepaths = use_relative_paths ? 1 : 0;
+		const std::string relative_help =
+			"When enabled, file and folder paths inside the base folder are saved as relative paths\n"
+			"(for example ./Floppies/game.adf), so the folder can move to another drive or location.\n"
+			"Paths outside the base folder stay absolute.\n\n"
+			"Base folder: " + get_relative_path_base() + "\n\n"
+			"In portable mode, the base folder is the executable directory and amiberry.conf paths\n"
+			"are stored relative to it as well. Relative paths are always resolved when loading,\n"
+			"whether or not this option is enabled.";
+		ShowHelpMarker(relative_help.c_str());
 	}
 	ImGui::Spacing();
 	ImGui::Separator();
@@ -488,7 +676,7 @@ void render_panel_paths()
 	ImGui::SetNextItemWidth(input_width);
 	const bool base_content_exists = path_exists_cached("BASE_CONTENT", s_base_content_path_input, false);
 	if (!base_content_exists)
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255));
+		ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 
 	char base_content_buffer[MAX_DPATH];
 	strncpy(base_content_buffer, s_base_content_path_input.c_str(), MAX_DPATH);
@@ -575,7 +763,8 @@ void render_panel_paths()
 		get_nvram_path(tmp, sizeof tmp);
 		RenderPathRow("NVRAM:", "NVRAMPath", tmp, [](const std::string& p) { set_nvram_path(p); });
 
-		RenderPathRow("Plugins:", "PluginsPath", get_plugins_path(), [](const std::string& p) { set_plugins_path(p); });
+		RenderPathRow("Plugins override:", "PluginsPath", get_plugins_override_path(), [](const std::string& p) { set_plugins_path(p); });
+		render_plugin_paths_settings("PathsPlugins");
 		RenderPathRow("Controllers DB:", "ControllersPath", get_controllers_path(), [](const std::string& p) { set_controllers_path(p); });
 		RenderPathRow("RetroArch config:", "RetroArchConfigPath", get_retroarch_file(), [](const std::string& p) { set_retroarch_file(p); }, true, "Choose Retroarch .cfg file", ".cfg");
 		RenderPathRow("WHDBoot:", "WHDBootPath", get_whdbootpath(), [](const std::string& p) { set_whdbootpath(p); });
@@ -643,6 +832,15 @@ void render_panel_paths()
 			ImGui::EndDisabled();
 	}
 
+	ImGui::Spacing();
+	ImGui::TextWrapped("WHDLoad by Bert Jahn is fetched from whdload.de; the kickstart "
+		"RTB files, JST and the optional Amiga libraries (the XPK packer stack by Dirk "
+		"Stöcker, MMULib's 68040.library by Thomas Richter, explode.library by "
+		"Struijk/Brouwer and OctaMED's medplayer.library by Teijo Kinnunen) from Aminet; "
+		"host-quit, boot-data.zip and the WHDLoad game database from the Amiberry "
+		"project. WHDLoad, JST, the RTB files and those libraries are not bundled with "
+		"Amiberry.");
+
 	const bool show_download_status =
 		s_whdboot_downloading.load() || s_whdboot_complete.load() || s_whdboot_failed.load()
 		|| s_controllers_downloading.load() || s_controllers_complete.load() || s_controllers_failed.load();
@@ -693,7 +891,7 @@ void render_panel_paths()
 			{
 				std::lock_guard<std::mutex> lock(s_whdboot_mutex);
 				if (s_whdboot_result_is_error)
-					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+					ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 				ImGui::TextWrapped("%s", s_whdboot_result_msg.c_str());
 				if (s_whdboot_result_is_error)
 					ImGui::PopStyleColor();
@@ -732,7 +930,7 @@ void render_panel_paths()
 			{
 				std::lock_guard<std::mutex> lock(s_controllers_mutex);
 				if (s_controllers_result_is_error)
-					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+					ImGui::PushStyleColor(ImGuiCol_Text, GetErrorTextColor());
 				ImGui::TextWrapped("%s", s_controllers_result_msg.c_str());
 				if (s_controllers_result_is_error)
 					ImGui::PopStyleColor();

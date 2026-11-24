@@ -1,7 +1,6 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <sstream>
 #include <fstream>
 #include <filesystem>
 #include <cstring>
@@ -15,8 +14,8 @@
 #include "sysconfig.h"
 #include "sysdeps.h"
 #include "amiberry_update.h"
-#include "options.h"
-#include "threaddep/thread.h"
+#include "amiberry_update_asset_policy.h"
+#include "amiberry_curl.h"
 
 #ifdef AMIBERRY_HAS_CURL
 #include <curl/curl.h>
@@ -260,11 +259,31 @@ struct DownloadContext {
 	std::atomic<bool>* cancel_flag = nullptr;
 };
 
-static std::thread s_update_thread;
+// The shared state is declared before the thread holder so it is destroyed
+// after it: statics are destroyed in reverse declaration order, and the
+// holder's destructor joins the thread, which must still find every shared
+// object alive.
 static std::mutex s_update_mutex;
 static std::atomic<bool> s_update_running{false};
 static std::atomic<bool> s_update_cancel{false};
 static UpdateInfo s_update_result;
+
+// A plain std::thread would call std::terminate() at exit when the process
+// ends while a check is still running (for example when graphics
+// initialization fails and main() returns without uae_quit(), so nothing
+// joins it). Cancelling and joining is safe here: curl's progress callback
+// checks s_update_cancel, so a transfer in flight stops on its own. If the
+// thread was never started or already joined, there is nothing to do.
+static struct UpdateThread {
+	std::thread thread;
+	~UpdateThread()
+	{
+		if (thread.joinable()) {
+			s_update_cancel.store(true);
+			thread.join();
+		}
+	}
+} s_update_thread;
 
 #ifdef _WIN32
 static std::string s_windows_restart_script;
@@ -336,6 +355,17 @@ static std::string get_executable_path()
 #endif
 }
 
+#if defined(__linux__)
+static linux_release_arch get_linux_release_arch()
+{
+#if defined(__aarch64__) || defined(CPU_AARCH64)
+	return linux_release_arch::aarch64;
+#else
+	return linux_release_arch::x86_64;
+#endif
+}
+
+#else
 static std::string get_platform_asset_suffix()
 {
 #if defined(_WIN32)
@@ -349,26 +379,12 @@ static std::string get_platform_asset_suffix()
 
 static bool matches_platform_asset(const std::string& name)
 {
-#if defined(__linux__)
-	// Linux release assets use various naming conventions per distro/arch
-	// (e.g. "debian-bookworm-amd64", "fedora-x86_64", "ubuntu-24.04-arm64").
-	// Exclude assets for other platforms that share architecture substrings.
-	const std::string name_lower = to_lower(name);
-	if (name_lower.find("macos") != std::string::npos || name_lower.find("windows") != std::string::npos)
-		return false;
-	#if defined(__aarch64__) || defined(CPU_AARCH64)
-	return name_lower.find("arm64") != std::string::npos || name_lower.find("aarch64") != std::string::npos;
-	#elif defined(__arm__) || defined(CPU_arm)
-	return name_lower.find("armhf") != std::string::npos;
-	#else
-	return name_lower.find("amd64") != std::string::npos || name_lower.find("x86_64") != std::string::npos;
-	#endif
-#else
 	const std::string suffix = get_platform_asset_suffix();
-	if (suffix.empty()) return true;
+	if (suffix.empty())
+		return true;
 	return name.find(suffix) != std::string::npos;
-#endif
 }
+#endif
 
 static bool is_allowed_download_url(const std::string& url)
 {
@@ -436,6 +452,13 @@ static bool http_get(const std::string& url, std::string& response_body, long& h
 		return false;
 	}
 
+	std::string ca_error;
+	if (!apply_effective_ca_bundle_to_curl(curl, &ca_error)) {
+		write_log("Updater: failed to configure libcurl CA bundle: %s\n", ca_error.c_str());
+		curl_easy_cleanup(curl);
+		return false;
+	}
+
 	HttpContext ctx;
 
 	const std::string ua = std::string("User-Agent: amiberry/") + AMIBERRY_VERSION;
@@ -475,7 +498,9 @@ static bool http_get(const std::string& url, std::string& response_body, long& h
 }
 #endif // AMIBERRY_HAS_CURL
 
-static bool parse_release_json(const nlohmann::json& rel, UpdateInfo& out)
+// cancel_flag stops the SHA256SUMS request too, so cancelling the update
+// check (or exiting) never waits for that transfer to time out.
+static bool parse_release_json(const nlohmann::json& rel, UpdateInfo& out, std::atomic<bool>* cancel_flag)
 {
 	if (!rel.is_object()) {
 		return false;
@@ -505,13 +530,13 @@ static bool parse_release_json(const nlohmann::json& rel, UpdateInfo& out)
 	}
 
 	std::string sha256_url;
+#if defined(__linux__)
+	std::vector<std::string> linux_asset_names;
+#endif
 
 	if (rel.contains("assets") && rel["assets"].is_array()) {
 		for (const auto& asset : rel["assets"]) {
-			if (!asset.is_object()) {
-				continue;
-			}
-			if (!asset.contains("name") || !asset["name"].is_string()) {
+			if (!asset.is_object() || !asset.contains("name") || !asset["name"].is_string()) {
 				continue;
 			}
 			const std::string name = asset["name"].get<std::string>();
@@ -522,16 +547,16 @@ static bool parse_release_json(const nlohmann::json& rel, UpdateInfo& out)
 				continue;
 			}
 
-			if (!matches_platform_asset(name)) {
-				continue;
-			}
-
-			if (!asset.contains("browser_download_url") || !asset["browser_download_url"].is_string()) {
+#if defined(__linux__)
+			linux_asset_names.push_back(name);
+#else
+			if (!matches_platform_asset(name)
+				|| !asset.contains("browser_download_url")
+				|| !asset["browser_download_url"].is_string()) {
 				continue;
 			}
 
 #ifdef _WIN32
-			// On Windows prefer .exe installer over .zip archive
 			const bool is_installer = name.size() >= 4
 				&& to_lower(name.substr(name.size() - 4)) == ".exe";
 			if (!out.download_url.empty() && !is_installer) {
@@ -548,30 +573,41 @@ static bool parse_release_json(const nlohmann::json& rel, UpdateInfo& out)
 			if (asset.contains("size") && asset["size"].is_number_integer()) {
 				out.asset_size = asset["size"].get<int64_t>();
 			}
+#endif
 		}
+
+#if defined(__linux__)
+		const auto selected_name = select_linux_release_asset(
+			linux_asset_names, get_linux_release_arch(), get_linux_installation_kind());
+		if (!selected_name.empty()) {
+			for (const auto& asset : rel["assets"]) {
+				if (!asset.is_object() || !asset.contains("name") || !asset["name"].is_string()
+					|| asset["name"].get<std::string>() != selected_name
+					|| !asset.contains("browser_download_url")
+					|| !asset["browser_download_url"].is_string()) {
+					continue;
+				}
+				out.download_url = asset["browser_download_url"].get<std::string>();
+				out.asset_name = selected_name;
+				if (asset.contains("size") && asset["size"].is_number_integer()) {
+					out.asset_size = asset["size"].get<int64_t>();
+				}
+				break;
+			}
+		}
+#endif
 	}
 
 	if (!sha256_url.empty() && is_allowed_download_url(sha256_url)) {
 		std::string sums_body;
 		long sums_code = 0;
 #ifdef AMIBERRY_HAS_CURL
-		if (http_get(sha256_url, sums_body, sums_code, nullptr) && sums_code >= 200 && sums_code < 300) {
+		if (http_get(sha256_url, sums_body, sums_code, cancel_flag) && sums_code >= 200 && sums_code < 300) {
 #else
+		(void)cancel_flag;
 		if (false) {
 #endif
-			std::istringstream iss(sums_body);
-			std::string line;
-			static const std::regex sha_re(R"(^\s*([A-Fa-f0-9]{64})\s+\*?(.+?)\s*$)");
-			while (std::getline(iss, line)) {
-				if (out.asset_name.empty() || line.find(out.asset_name) == std::string::npos) {
-					continue;
-				}
-				std::smatch m;
-				if (std::regex_match(line, m, sha_re)) {
-					out.sha256_expected = to_lower(m[1].str());
-					break;
-				}
-			}
+			out.sha256_expected = find_release_asset_sha256(sums_body, out.asset_name);
 		}
 	}
 
@@ -606,7 +642,7 @@ static bool read_release(UpdateChannel channel, UpdateInfo& out, std::atomic<boo
 	}
 
 	if (channel == UpdateChannel::Stable) {
-		if (!parse_release_json(doc, out)) {
+		if (!parse_release_json(doc, out, cancel_flag)) {
 			out.error_message = "GitHub latest release payload missing fields";
 			return false;
 		}
@@ -625,7 +661,7 @@ static bool read_release(UpdateChannel channel, UpdateInfo& out, std::atomic<boo
 		if (rel.contains("draft") && rel["draft"].is_boolean() && rel["draft"].get<bool>()) {
 			continue;
 		}
-		if (parse_release_json(rel, out)) {
+		if (parse_release_json(rel, out, cancel_flag)) {
 			return true;
 		}
 	}
@@ -678,6 +714,9 @@ UpdateMethod get_update_method()
 	return UpdateMethod::NOTIFY_ONLY;
 #elif defined(_WIN32)
 	return UpdateMethod::SELF_UPDATE;
+#elif defined(MACOS_APP_STORE)
+	// The App Store updates the app; an app updating itself is refused.
+	return UpdateMethod::DISABLED;
 #elif defined(AMIBERRY_MACOS)
 	return UpdateMethod::SELF_UPDATE;
 #else
@@ -788,6 +827,15 @@ std::string download_update(const UpdateInfo& info, DownloadProgressCallback pro
 	CURL* curl = curl_easy_init();
 	if (!curl) {
 		write_log("Updater: curl_easy_init failed in download_update\n");
+		out.close();
+		std::filesystem::remove(temp_path, ec);
+		return {};
+	}
+
+	std::string ca_error;
+	if (!apply_effective_ca_bundle_to_curl(curl, &ca_error)) {
+		write_log("Updater: failed to configure libcurl CA bundle: %s\n", ca_error.c_str());
+		curl_easy_cleanup(curl);
 		out.close();
 		std::filesystem::remove(temp_path, ec);
 		return {};
@@ -1378,11 +1426,11 @@ void start_async_update_check(UpdateChannel channel)
 	s_update_running.store(true);
 	s_update_cancel.store(false);
 
-	if (s_update_thread.joinable()) {
-		s_update_thread.join();
+	if (s_update_thread.thread.joinable()) {
+		s_update_thread.thread.join();
 	}
 
-	s_update_thread = std::thread([channel]() {
+	s_update_thread.thread = std::thread([channel]() {
 		UpdateInfo result = check_for_updates(channel);
 		{
 			std::lock_guard<std::mutex> lock(s_update_mutex);
@@ -1399,18 +1447,27 @@ bool is_update_check_running()
 
 UpdateInfo get_async_update_result()
 {
-	if (s_update_thread.joinable() && !s_update_running.load()) {
-		s_update_thread.join();
+	if (s_update_thread.thread.joinable() && !s_update_running.load()) {
+		s_update_thread.thread.join();
 	}
 	std::lock_guard<std::mutex> lock(s_update_mutex);
 	return s_update_result;
 }
 
-void cancel_async_update_check()
+void cancel_async_update_check(bool wait_for_finish)
 {
 	s_update_cancel.store(true);
-	if (s_update_thread.joinable()) {
-		s_update_thread.join();
+	if (!wait_for_finish) {
+		// A restart does not need the check's result. The cancel flag
+		// aborts the transfer, but phases that never call the progress
+		// callback (DNS resolution) cannot be interrupted, so joining could
+		// block the restart on the network until the HTTP timeout. The
+		// thread stays owned and running: a later start_async_update_check()
+		// joins it once it is done, and a quit (or exit) joins it.
+		return;
+	}
+	if (s_update_thread.thread.joinable()) {
+		s_update_thread.thread.join();
 	}
 	s_update_running.store(false);
 }

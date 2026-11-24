@@ -2,6 +2,7 @@
 #include "libretro_shared.h"
 #include "libretro_crop_helpers.h"
 #include "libretro_path_helpers.h"
+#include "amiberry_embed.h"
 #ifdef LIBRETRO
 #include "sdl_compat.h"
 #endif
@@ -50,11 +51,13 @@ extern "C" {
 #include "keyboard.h"
 #include "uae.h"
 #include "memory.h"
+#include "newcpu.h"
 #include "savestate.h"
 #include "disk.h"
 #include "blkdev.h"
 #include "gui.h"
 #include "amiberry_gfx.h"
+#include "imgui_osk.h"
 #include "amiberry_rp9.h"
 #include "irenderer.h"
 #include "statusline.h"
@@ -72,6 +75,7 @@ struct AmigaMonitor;
 extern struct AmigaMonitor AMonitors[];
 extern int gfx_GetWidth(const struct AmigaMonitor* mon);
 extern int gfx_GetHeight(const struct AmigaMonitor* mon);
+extern int joystick_mousemap_mouse_device(int device_index);
 
 cothread_t main_fiber;
 cothread_t core_fiber;
@@ -88,6 +92,11 @@ unsigned libretro_audio_frames_this_run;
 static char game_path[1024];
 static bool core_started = false;
 static bool core_shutdown_complete = false;
+// Statefile accepted by retro_unserialize() but not yet applied by the core.
+// The emulator restores it when the core next resumes, through the regular
+// restore_state() + hard reset path; until then retro_serialize() reports it.
+static std::vector<uint8_t> pending_state;
+static bool pending_state_queued = false;
 static bool input_log_enabled = true;
 static uint8_t key_state[RETROK_LAST + 1];
 static constexpr size_t kJoypadMax = RETRO_DEVICE_ID_JOYPAD_R3 + 1;
@@ -95,6 +104,13 @@ static int16_t last_joypad[2][kJoypadMax];
 static int16_t last_analog[2][4];
 static int16_t last_trigger[2][2];
 static int16_t last_mouse_buttons[2][3];
+enum class LibretroInputOwner : uint8_t {
+	neutral,
+	gameplay,
+	osk
+};
+static LibretroInputOwner joypad_owner[2][kJoypadMax];
+static LibretroInputOwner analog_owner[2][SDL_CONTROLLER_AXIS_MAX];
 static int16_t last_mouse_x[2];
 static int16_t last_mouse_y[2];
 static unsigned libretro_port_device[2] = { RETRO_DEVICE_MOUSE, RETRO_DEVICE_JOYPAD };
@@ -630,6 +646,10 @@ static void update_geometry()
 	if (width <= 0 || height <= 0)
 		return;
 
+	// RTG screens have square pixels and are never cropped.
+	if (!crop.active && adisplays[0].picasso_on)
+		aspect = static_cast<float>(width) / static_cast<float>(height);
+
 	if (width == last_geometry_width && height == last_geometry_height
 		&& aspect == last_geometry_aspect)
 		return;
@@ -716,6 +736,7 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_video_vresolution", "Video Line Mode; double|auto|single" },
 	{ "amiberry_statusline", "On-Screen Status Line; disabled|enabled" },
 	{ "amiberry_statusline_size", "On-Screen Status Line Size; 1x|2x|3x|4x" },
+	{ "amiberry_on_screen_keyboard", "On-Screen Keyboard; disabled|enabled" },
 	{ "amiberry_port0_device", "Port 1 Device; mouse|joystick" },
 	{ "amiberry_port1_device", "Port 2 Device; joystick|mouse" },
 	{ "amiberry_swap_ports", "Swap Ports; disabled|enabled" },
@@ -1084,7 +1105,7 @@ static struct retro_core_option_v2_definition option_defs[] = {
 		"amiberry_internal_vsync",
 		"Internal VSync",
 		"Internal VSync",
-		"Select internal vsync mode.",
+		"Let the frontend pace frames instead of the core's own timer. Use it when the frontend syncs to a display running at the Amiga's refresh rate (50 Hz PAL, 60 Hz NTSC).",
 		NULL,
 		"video",
 		{
@@ -1482,6 +1503,20 @@ static struct retro_core_option_v2_definition option_defs[] = {
 		},
 		"1x"
 	},
+	{
+		"amiberry_on_screen_keyboard",
+		"On-Screen Keyboard",
+		"On-Screen Keyboard",
+		"Show an on-screen Amiga keyboard (bottom of the screen) for typing. Toggle it with a bound gamepad button; D-pad or stick moves the focus and another button presses the key.",
+		NULL,
+		"video",
+		{
+			{ "disabled", "Disabled" },
+			{ "enabled", "Enabled" },
+			{ NULL, NULL }
+		},
+		"disabled"
+	},
 #ifdef WITH_MIDI
 	{
 		"amiberry_midi_output",
@@ -1510,7 +1545,7 @@ static struct retro_core_option_v2_definition option_defs[] = {
 		"amiberry_joy_as_mouse",
 		"Joystick As Mouse",
 		"Joystick As Mouse",
-		"Map joystick to mouse input.",
+		"Left analog stick of the selected Amiga port's controller moves the Amiga mouse in port 1; L/R shoulder buttons act as the left/right mouse buttons. Requires Analog Input and a mouse in port 1.",
 		NULL,
 		"input",
 		{
@@ -1612,6 +1647,17 @@ static bool core_options_update_display_callback(void)
 }
 
 extern int amiberry_main(int argc, char** argv);
+
+// Arguments a program that links the core in adds to the end of
+// amiberry_main()'s command line (amiberry_embed.h).
+static std::vector<std::string> embed_extra_args;
+
+void amiberry_libretro_set_extra_args(int argc, const char* const* argv)
+{
+	embed_extra_args.clear();
+	for (int i = 0; i < argc; i++)
+		embed_extra_args.emplace_back(argv[i] ? argv[i] : "");
+}
 
 static bool path_is_absolute(const std::string& path)
 {
@@ -2173,7 +2219,7 @@ static bool dir_exists(const std::string& path)
 {
 	if (path.empty())
 		return false;
-	struct stat st {};
+	STAT st {};
 	return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
@@ -2486,6 +2532,80 @@ static bool parse_m3u(const char* path, std::vector<DiskImage>& out_images)
 	return !out_images.empty();
 }
 
+// With block_extract set, RetroArch passes a file the user browsed to inside an
+// archive as "<archive>#<entry>". zfile opens archive members as
+// "<archive>/<entry>", so rewrite the delimiter for the archive types zfile
+// handles. Other paths are returned unchanged.
+static std::string frontend_path_to_zfile_path(const std::string& path)
+{
+	const char* delim = path_get_archive_delim(path.c_str());
+	if (!delim)
+		return path;
+	const size_t pos = static_cast<size_t>(delim - path.c_str());
+	const std::string archive_ext = path_extension_lower(path.substr(0, pos));
+	if (archive_ext != "zip" && archive_ext != "7z")
+		return path;
+	return path.substr(0, pos) + "/" + path.substr(pos + 1);
+}
+
+// zfile names archive members after the archive path with '\' turned into '/'
+// and repeated '/' collapsed. Apply the same rules before comparing paths.
+static std::string zfile_path_key(std::string path)
+{
+	std::replace(path.begin(), path.end(), '\\', '/');
+	path.erase(std::unique(path.begin(), path.end(), [](const char a, const char b) {
+		return a == '/' && b == '/';
+	}), path.end());
+	return path;
+}
+
+static int collect_archive_floppy_image(struct zfile* f, void* user)
+{
+	auto* paths = static_cast<std::vector<std::string>*>(user);
+	const TCHAR* name = zfile_getname(f);
+	if (name && zfile_gettype(f) == ZFILE_DISKIMAGE)
+		paths->emplace_back(name);
+	return 0;
+}
+
+// Given a .zip or .7z, UAE inserts only the first disk it finds. Expose every
+// floppy image in the archive as its own disk control entry instead, sorted by
+// name like the desktop disk swapper. If the content path names a member
+// ("<archive>#<entry>"), `selected` receives its zfile path. A member that is
+// not a floppy image (an HDF or CD image) becomes the only entry. Returns false
+// when the content is not a zip/7z or holds no floppy images, so the caller
+// falls back to passing the content path through unchanged.
+static bool load_archive_disk_images(const std::string& content_path,
+	std::vector<DiskImage>& out_images, std::string& selected)
+{
+	selected.clear();
+	std::string archive = content_path;
+	if (const char* delim = path_get_archive_delim(content_path.c_str()))
+		archive = content_path.substr(0, static_cast<size_t>(delim - content_path.c_str()));
+	const std::string archive_ext = path_extension_lower(archive);
+	if (archive_ext != "zip" && archive_ext != "7z")
+		return false;
+	if (archive != content_path)
+		selected = zfile_path_key(frontend_path_to_zfile_path(content_path));
+
+	std::vector<std::string> paths;
+	zfile_zopen(archive, collect_archive_floppy_image, &paths);
+	if (!selected.empty() && std::none_of(paths.begin(), paths.end(), [&selected](const std::string& p) {
+			return zfile_path_key(p) == selected;
+		})) {
+		paths.assign(1, selected);
+	}
+	if (paths.empty())
+		return false;
+
+	std::sort(paths.begin(), paths.end());
+	for (auto& p : paths)
+		out_images.push_back({ std::move(p), {} });
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO, "Archive %s: exposing %zu disk image(s)\n", archive.c_str(), out_images.size());
+	return true;
+}
+
 static bool libretro_get_image_label(unsigned index, char* s, size_t len);
 
 static void sync_rp9_disk_control_media()
@@ -2544,6 +2664,14 @@ static void show_message(const char* text, unsigned duration_ms = 2000,
 		msg.frames = duration_ms / 16; // ~60fps
 		environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
 	}
+}
+
+// WHDLoad/JST are not bundled with the core and it cannot download them:
+// this tells the user where the missing tool belongs (called from
+// amiberry_whdbooter.cpp).
+void libretro_show_whdboot_message(const char* text)
+{
+	show_message(text, 6000, RETRO_LOG_WARN);
 }
 
 static void notify_disk_change()
@@ -2687,9 +2815,10 @@ static bool libretro_replace_image_index(unsigned index, const struct retro_game
 	if (index >= disk_images.size())
 		return false;
 	if (info && info->path) {
-		if (!file_readable(info->path) && log_cb)
+		const std::string image_path = frontend_path_to_zfile_path(info->path);
+		if (image_path == info->path && !file_readable(info->path) && log_cb)
 			log_cb(RETRO_LOG_WARN, "Disk image not readable: %s\n", info->path);
-		disk_images[index].path = info->path;
+		disk_images[index].path = image_path;
 		disk_images[index].label.clear();
 	} else {
 		disk_images[index].path.clear();
@@ -3506,6 +3635,15 @@ libretro_crop libretro_compute_crop(void)
 	libretro_crop crop = { 0, 0, 0, 0, 0.0f, false };
 	const libretro_crop_mode crop_mode = get_libretro_crop_mode();
 
+	// While the on-screen keyboard is visible, present the full frame: the
+	// keyboard occupies the bottom 42% of the emulated area, so content
+	// cropping must not run (it would scan keyboard pixels as content and
+	// its cached region would feed a wrong aspect into the geometry).
+	if (imgui_osk_should_render()) {
+		libretro_reset_crop_policy();
+		return libretro_cache_crop(crop);
+	}
+
 	if (crop_mode == libretro_crop_mode::disabled) {
 		libretro_reset_crop_policy();
 		return libretro_cache_crop(crop);
@@ -4168,6 +4306,30 @@ static void apply_libretro_statusline_options(void)
 		changed_prefs.leds_on_screen_multiplier[i] = mult;
 	}
 }
+// Frontend joypad action space, shared by poll_input()'s gameplay routing
+// and apply_libretro_osk_options(): a toggle button only works if the
+// frontend can actually press it.
+struct JoypadMap {
+	unsigned retro_id;
+	int sdl_button;
+	const char* name;
+};
+static const JoypadMap joypad_map[] = {
+	{ RETRO_DEVICE_ID_JOYPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_UP, "dpad_up" },
+	{ RETRO_DEVICE_ID_JOYPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_DOWN, "dpad_down" },
+	{ RETRO_DEVICE_ID_JOYPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_LEFT, "dpad_left" },
+	{ RETRO_DEVICE_ID_JOYPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "dpad_right" },
+	{ RETRO_DEVICE_ID_JOYPAD_B, SDL_CONTROLLER_BUTTON_A, "b" },
+	{ RETRO_DEVICE_ID_JOYPAD_A, SDL_CONTROLLER_BUTTON_B, "a" },
+	{ RETRO_DEVICE_ID_JOYPAD_Y, SDL_CONTROLLER_BUTTON_X, "y" },
+	{ RETRO_DEVICE_ID_JOYPAD_X, SDL_CONTROLLER_BUTTON_Y, "x" },
+	{ RETRO_DEVICE_ID_JOYPAD_SELECT, SDL_CONTROLLER_BUTTON_BACK, "select" },
+	{ RETRO_DEVICE_ID_JOYPAD_START, SDL_CONTROLLER_BUTTON_START, "start" },
+	{ RETRO_DEVICE_ID_JOYPAD_L, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "l1" },
+	{ RETRO_DEVICE_ID_JOYPAD_R, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "r1" },
+	{ RETRO_DEVICE_ID_JOYPAD_L3, SDL_CONTROLLER_BUTTON_LEFTSTICK, "l3" },
+	{ RETRO_DEVICE_ID_JOYPAD_R3, SDL_CONTROLLER_BUTTON_RIGHTSTICK, "r3" }
+};
 
 // Mirrors the overscanmodes[] table in cfgfile.cpp, which is what the
 // gfx_overscanmode config key and Amiberry's Display > Overscan combo use.
@@ -4261,6 +4423,64 @@ static void apply_libretro_video_resolution_options(void)
 	set_config_changed();
 }
 
+static bool libretro_joypad_supports_button(const SDL_GamepadButton button)
+{
+	for (const auto& mapping : joypad_map)
+		if (mapping.sdl_button == button)
+			return true;
+	return false;
+}
+
+// Explicit gamepad toggle for the on-screen keyboard, installed by
+// apply_libretro_osk_options(). The libretro poll path has no SDL event
+// loop, so the native vkbd_button checks (amiberry.cpp) never run here;
+// poll_input() consumes the matching button and enqueues AKS_OSK instead.
+static SDL_GamepadButton libretro_vkbd_button = SDL_CONTROLLER_BUTTON_INVALID;
+
+static void apply_libretro_osk_options(void)
+{
+	const bool enabled = option_enabled(get_option_value("amiberry_on_screen_keyboard"));
+	currprefs.vkbd_enabled = enabled;
+	changed_prefs.vkbd_enabled = enabled;
+	if (!enabled) {
+		// Shutdown releases pressed keys and sticky modifiers immediately. A
+		// visibility-only hide intentionally preserves sticky modifiers.
+		libretro_vkbd_button = SDL_CONTROLLER_BUTTON_INVALID;
+		imgui_osk_shutdown();
+		return;
+	}
+
+	// Install the configured gamepad toggle (default "leftstick" in the
+	// libretro build; a loaded .uae config may override it). The libretro
+	// poll path has no SDL event loop, so only a gamepad binding can drive
+	// the toggle here; anything that doesn't resolve to a pressable joypad
+	// button falls back to the default toggle so the OSK stays reachable:
+	// - a keyboard hotkey like "F12" or "A" doesn't resolve at all (the
+	//   lookup only knows joypad button names, and the letter key "A" is
+	//   not read as the South button SDL names "a"), and
+	// - the standalone default "guide" is not in the frontend joypad action
+	//   space.
+	SDL_GamepadButton toggle = currprefs.vkbd_toggle[0]
+		? gamepad_button_from_config(currprefs.vkbd_toggle)
+		: SDL_CONTROLLER_BUTTON_INVALID;
+	if (currprefs.vkbd_toggle[0] &&
+		(toggle == SDL_CONTROLLER_BUTTON_INVALID || !libretro_joypad_supports_button(toggle))) {
+		if (log_cb)
+			log_cb(RETRO_LOG_WARN, "OSK toggle '%s' is not a pressable joypad button; using left stick\n",
+				currprefs.vkbd_toggle);
+		toggle = SDL_CONTROLLER_BUTTON_LEFTSTICK;
+	}
+	libretro_vkbd_button = toggle;
+	// Mirror native graphics initialization so .uae OSK presentation prefs
+	// still apply in a frontend without an ImGui context.
+	imgui_osk_init();
+	imgui_osk_set_transparency(
+		(currprefs.vkbd_transparency > 0)
+			? static_cast<float>(currprefs.vkbd_transparency) / 100.0f
+			: 0.85f);
+	imgui_osk_set_language(currprefs.vkbd_language);
+	imgui_osk_set_numpad(currprefs.vkbd_numpad);
+}
 static void apply_libretro_input_options(void)
 {
 	unsigned desired_port_device[2] = { libretro_port_device[0], libretro_port_device[1] };
@@ -4425,6 +4645,10 @@ static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_
 	case RETROK_LEFTBRACKET: scancode = SDL_SCANCODE_LEFTBRACKET; break;
 	case RETROK_BACKSLASH: scancode = SDL_SCANCODE_BACKSLASH; break;
 	case RETROK_RIGHTBRACKET: scancode = SDL_SCANCODE_RIGHTBRACKET; break;
+	// The ISO key next to left Shift: RetroArch sends OEM_102, other
+	// front ends send LESS.
+	case RETROK_LESS:
+	case RETROK_OEM_102: scancode = SDL_SCANCODE_NONUSBACKSLASH; break;
 	case RETROK_BACKQUOTE: scancode = SDL_SCANCODE_GRAVE; break;
 	case RETROK_a: scancode = SDL_SCANCODE_A; break;
 	case RETROK_b: scancode = SDL_SCANCODE_B; break;
@@ -4517,6 +4741,210 @@ static bool poll_frontend_input(void)
 	return true;
 }
 
+static void route_libretro_joy_button(const int joy, const int button,
+	const int state, LibretroInputOwner& owner)
+{
+	const bool osk_active = imgui_osk_is_active();
+	const bool osk_rendering = imgui_osk_should_render();
+	if (owner == LibretroInputOwner::neutral && state)
+		// A fresh press during the closing animation stays OSK-owned (and is
+		// discarded on release), so it cannot reach the guest while the
+		// keyboard still covers the screen. Mirrors the standalone
+		// controller path.
+		owner = osk_rendering ? LibretroInputOwner::osk : LibretroInputOwner::gameplay;
+
+	if (owner == LibretroInputOwner::gameplay) {
+		const inputdevice_osk_passthrough passthrough;
+		setjoybuttonstate(joy, button, state);
+		if (!state)
+			owner = LibretroInputOwner::neutral;
+		return;
+	}
+	if (owner == LibretroInputOwner::osk && !osk_active) {
+		// Closing the OSK clears its own accumulated state. Do not dispatch
+		// this later release into gameplay, where it could clear a different
+		// still-held control that maps to the same emulated direction/button.
+		if (!state) {
+			inputdevice_discard_osk_button_state(joy, button);
+			owner = LibretroInputOwner::neutral;
+		}
+		return;
+	}
+	if (owner == LibretroInputOwner::osk)
+		setjoybuttonstate_osk(joy, button, state);
+	else
+		setjoybuttonstate(joy, button, state);
+	if (!state)
+		owner = LibretroInputOwner::neutral;
+}
+
+static void route_libretro_joy_axis(const int joy, const int axis,
+	const int state, LibretroInputOwner& owner)
+{
+	const bool osk_active = imgui_osk_is_active();
+	const bool osk_rendering = imgui_osk_should_render();
+	const bool axis_active =
+		inputdevice_is_joystick_axis_active(joy, axis, state, 32767);
+	if (owner == LibretroInputOwner::neutral && axis_active)
+		// A fresh movement during the closing animation stays OSK-owned (and
+		// is discarded on release), so it cannot reach the guest while the
+		// keyboard still covers the screen. Mirrors the standalone
+		// controller path.
+		owner = osk_rendering ? LibretroInputOwner::osk : LibretroInputOwner::gameplay;
+
+	if (owner == LibretroInputOwner::gameplay) {
+		const inputdevice_osk_passthrough passthrough;
+		// The closing animation still owns the screen: only neutralization
+		// may reach the guest until the keyboard has left it. Mirrors the
+		// standalone controller path.
+		setjoystickstate(joy, axis,
+			(!osk_active && osk_rendering) ? 0 : state, 32767);
+		if (!axis_active)
+			owner = LibretroInputOwner::neutral;
+		return;
+	}
+	if (owner == LibretroInputOwner::osk && !osk_active) {
+		if (!axis_active) {
+			inputdevice_discard_osk_axis_state(joy, axis);
+			owner = LibretroInputOwner::neutral;
+		}
+		return;
+	}
+
+	if (owner == LibretroInputOwner::osk)
+		setjoystickstate_osk(joy, axis, state, 32767);
+	else
+		setjoystickstate(joy, axis, state, 32767);
+	if (!axis_active)
+		owner = LibretroInputOwner::neutral;
+}
+
+// Joystick As Mouse: full left-stick deflection moves the Amiga mouse this many
+// counts per frame (before the mouse speed pref), matching PUAE's default
+// analog mouse speed. Polled every frame, so a held stick keeps moving.
+static constexpr float libretro_stick_mouse_counts_per_frame = 10.0f;
+static float stick_mouse_remainder[2][2];
+// The stick was moving the mouse when the on-screen keyboard opened. Like a
+// gameplay-held stick it stays with the mouse until released, so it cannot
+// steer the keyboard by accident (mirrors controller_axis_has_gameplay_input).
+static bool stick_mouse_held[2];
+
+// The left stick drives the Amiga mouse instead of this port's joystick
+// directions (mirrors read_controller_axis). While the on-screen keyboard is
+// on screen the stick steers it instead, through the usual axis ownership.
+static void route_libretro_stick_mouse(const int joy, const int mouse_device,
+	const int16_t x, const int16_t y)
+{
+	const float magnitude = sqrtf(static_cast<float>(x) * x + static_cast<float>(y) * y);
+	const float deadzone = currprefs.input_joymouse_deadzone * 32768.0f / 100.0f;
+	const bool deflected = magnitude > deadzone && deadzone < 32768.0f;
+	const bool osk_rendering = imgui_osk_should_render();
+	if (!deflected)
+		stick_mouse_held[joy] = false;
+
+	const int16_t values[2] = { x, y };
+	const int axes[2] = { SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY };
+	for (int n = 0; n < 2; n++) {
+		LibretroInputOwner& owner = analog_owner[joy][axes[n]];
+		// Zero neutralizes the guest joystick axis and releases any keyboard
+		// or gameplay ownership left from before the map applied.
+		const bool to_osk = osk_rendering && !stick_mouse_held[joy]
+			&& owner != LibretroInputOwner::gameplay;
+		route_libretro_joy_axis(joy, axes[n], to_osk ? values[n] : 0, owner);
+	}
+
+	float* remainder = stick_mouse_remainder[joy];
+	if (!deflected || osk_rendering) {
+		remainder[0] = remainder[1] = 0.0f;
+		return;
+	}
+	stick_mouse_held[joy] = true;
+	const float travel = std::min((magnitude - deadzone) / (32768.0f - deadzone), 1.0f);
+	const float scale = travel * libretro_stick_mouse_counts_per_frame / magnitude;
+	const float motion[2] = { x * scale + remainder[0], y * scale + remainder[1] };
+	for (int axis = 0; axis < 2; axis++) {
+		const int counts = static_cast<int>(motion[axis]);
+		remainder[axis] = motion[axis] - counts;
+		if (counts)
+			setmousestate(mouse_device, axis, counts, 0);
+	}
+}
+
+// The on-screen keyboard's direct driver. While the keyboard is on screen the
+// RetroPads are the keyboard's navigation surface: the D-pad / A move and
+// select, and the left stick steers. This mirrors the standalone controller
+// path (amiberry.cpp handle_osk_button / osk_publish_controller_state) by
+// driving osk_control() directly, so navigation works even when no core port
+// is mapped to an emulated joystick - the guest's port mapping is irrelevant
+// to the OSK.
+static int libretro_osk_button_bit(const int sdl_button)
+{
+	switch (sdl_button) {
+	case SDL_CONTROLLER_BUTTON_DPAD_UP:    return OSK_UP;
+	case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  return OSK_DOWN;
+	case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  return OSK_LEFT;
+	case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return OSK_RIGHT;
+	case SDL_CONTROLLER_BUTTON_A:          return OSK_BUTTON; // south: select
+	default:                               return 0;
+	}
+}
+
+static void libretro_osk_publish_state(void)
+{
+	if (!imgui_osk_should_render())
+		return;
+
+	// Publish only the controls the keyboard acquired after it opened. A
+	// direction, select or stick deflected for gameplay before the keyboard
+	// opened is gameplay-owned (see route_libretro_joy_button / axis); feeding
+	// its raw level here would be misread as a fresh OSK press and move focus
+	// or type a key while the same control is still active in the guest. A
+	// control held on either pad keeps navigating, so OR the OSK-relevant,
+	// OSK-owned controls of both ports into one state.
+	int dir = 0;
+	int btn = 0;
+	for (int i = 0; i < 2; i++) {
+		const unsigned dev = libretro_port_device[i] & RETRO_DEVICE_MASK;
+		if (dev == RETRO_DEVICE_NONE)
+			continue;
+		for (const auto& mapping : joypad_map) {
+			const int bit = libretro_osk_button_bit(mapping.sdl_button);
+			if (!bit)
+				continue;
+			if (joypad_owner[i][mapping.retro_id] != LibretroInputOwner::osk)
+				continue;
+			if (!last_joypad[i][mapping.retro_id])
+				continue;
+			if (bit == OSK_BUTTON)
+				btn = 1;
+			else
+				dir |= bit;
+		}
+		// The left stick steers the keyboard, mirroring handle_osk_axis().
+		// Only steer when the keyboard owns that axis; a stick deflected for
+		// gameplay before the keyboard opened is gameplay-owned and must not
+		// move focus.
+		if (analog_owner[i][SDL_CONTROLLER_AXIS_LEFTX] == LibretroInputOwner::osk) {
+			const int16_t lx = last_analog[i][0];
+			if (lx < -SDL_JOYSTICK_AXIS_MAX * 2 / 5)
+				dir |= OSK_LEFT;
+			else if (lx > SDL_JOYSTICK_AXIS_MAX * 2 / 5)
+				dir |= OSK_RIGHT;
+		}
+		if (analog_owner[i][SDL_CONTROLLER_AXIS_LEFTY] == LibretroInputOwner::osk) {
+			const int16_t ly = last_analog[i][1];
+			if (ly < -SDL_JOYSTICK_AXIS_MAX * 2 / 5)
+				dir |= OSK_UP;
+			else if (ly > SDL_JOYSTICK_AXIS_MAX * 2 / 5)
+				dir |= OSK_DOWN;
+		}
+	}
+	const int dx = (dir & OSK_LEFT) ? -1 : (dir & OSK_RIGHT) ? 1 : 0;
+	const int dy = (dir & OSK_UP) ? -1 : (dir & OSK_DOWN) ? 1 : 0;
+	osk_control(dx, dy, 0, 0, OskInputSource::Gamepad);
+	osk_control(0, 0, 1, btn, OskInputSource::Gamepad);
+}
+
 static void poll_input(void)
 {
 	if (!poll_frontend_input())
@@ -4528,27 +4956,6 @@ static void poll_input(void)
 	const bool clear_analog = !analog_enabled && last_analog_enabled;
 
 	// Joystick input
-	struct JoypadMap {
-		unsigned retro_id;
-		int sdl_button;
-		const char* name;
-	};
-	static const JoypadMap joypad_map[] = {
-		{ RETRO_DEVICE_ID_JOYPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_UP, "dpad_up" },
-		{ RETRO_DEVICE_ID_JOYPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_DOWN, "dpad_down" },
-		{ RETRO_DEVICE_ID_JOYPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_LEFT, "dpad_left" },
-		{ RETRO_DEVICE_ID_JOYPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "dpad_right" },
-		{ RETRO_DEVICE_ID_JOYPAD_B, SDL_CONTROLLER_BUTTON_A, "b" },
-		{ RETRO_DEVICE_ID_JOYPAD_A, SDL_CONTROLLER_BUTTON_B, "a" },
-		{ RETRO_DEVICE_ID_JOYPAD_Y, SDL_CONTROLLER_BUTTON_X, "y" },
-		{ RETRO_DEVICE_ID_JOYPAD_X, SDL_CONTROLLER_BUTTON_Y, "x" },
-		{ RETRO_DEVICE_ID_JOYPAD_SELECT, SDL_CONTROLLER_BUTTON_BACK, "select" },
-		{ RETRO_DEVICE_ID_JOYPAD_START, SDL_CONTROLLER_BUTTON_START, "start" },
-		{ RETRO_DEVICE_ID_JOYPAD_L, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "l1" },
-		{ RETRO_DEVICE_ID_JOYPAD_R, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "r1" },
-		{ RETRO_DEVICE_ID_JOYPAD_L3, SDL_CONTROLLER_BUTTON_LEFTSTICK, "l3" },
-		{ RETRO_DEVICE_ID_JOYPAD_R3, SDL_CONTROLLER_BUTTON_RIGHTSTICK, "r3" }
-	};
 
 	for (int i = 0; i < 2; i++)
 	{
@@ -4565,11 +4972,49 @@ static void poll_input(void)
 			const int state = input_bitmask_supported
 				? ((joypad_mask >> mapping.retro_id) & 1)
 				: (input_state_cb(i, RETRO_DEVICE_JOYPAD, 0, mapping.retro_id) & 1);
-			if (state != last_joypad[i][mapping.retro_id]) {
+			const int was = last_joypad[i][mapping.retro_id];
+			if (state != was) {
 				last_joypad[i][mapping.retro_id] = state;
 				log_input_button(i, mapping.name, state);
 			}
-			setjoybuttonstate(joy, mapping.sdl_button, state);
+			// Explicit OSK binding wins over the gameplay mapping: toggle on
+			// press, consume both edges. Mirrors the native controller path
+			// (amiberry.cpp handle_gamepad_button / raw mapping path).
+			if (currprefs.vkbd_enabled
+				&& libretro_vkbd_button != SDL_CONTROLLER_BUTTON_INVALID
+				&& mapping.sdl_button == libretro_vkbd_button) {
+				// Rising edge only. The input-code queue is drained every
+				// frame by inputdevice_vsync, so a level-triggered enqueue
+				// (state alone) would fire the toggle once per frame for
+				// the whole hold: 40 held frames = 40 toggles, an even
+				// count that cancels out and leaves the OSK closed.
+				// The native path enqueues on the press edge only.
+				if (state && !was)
+					inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+				continue;
+			}
+			// East (B) hides the keyboard while it is open, mirroring the
+			// standalone controller path. The keyboard only acquires B on a
+			// press made while it is open; a B already held for gameplay before
+			// the keyboard opened stays gameplay-owned, so its release must
+			// still reach the guest. Skipped when B is the OSK toggle.
+			if (currprefs.vkbd_enabled
+				&& mapping.sdl_button == SDL_CONTROLLER_BUTTON_B
+				&& libretro_vkbd_button != SDL_CONTROLLER_BUTTON_B
+				&& imgui_osk_is_active()) {
+				LibretroInputOwner& bowner = joypad_owner[i][mapping.retro_id];
+				if (bowner == LibretroInputOwner::neutral && state)
+					bowner = LibretroInputOwner::osk;
+				if (bowner == LibretroInputOwner::osk) {
+					if (state && !was)
+						imgui_osk_hide();
+					if (!state)
+						bowner = LibretroInputOwner::neutral;
+					continue;
+				}
+			}
+			route_libretro_joy_button(
+				joy, mapping.sdl_button, state, joypad_owner[i][mapping.retro_id]);
 		}
 
 		const int l2 = input_bitmask_supported
@@ -4602,59 +5047,83 @@ static void poll_input(void)
 			log_input_axis(i, "lt", lt, &last_trigger[i][0]);
 			log_input_axis(i, "rt", rt, &last_trigger[i][1]);
 
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_LEFTX, lx, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_LEFTY, ly, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_RIGHTX, rx, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_RIGHTY, ry, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, lt, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, rt, 32767);
+			const int stick_mouse = joystick_mousemap_mouse_device(joy);
+			if (stick_mouse >= 0) {
+				route_libretro_stick_mouse(joy, stick_mouse, lx, ly);
+			} else {
+				route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_LEFTX, lx,
+					analog_owner[i][SDL_CONTROLLER_AXIS_LEFTX]);
+				route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_LEFTY, ly,
+					analog_owner[i][SDL_CONTROLLER_AXIS_LEFTY]);
+			}
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_RIGHTX, rx,
+				analog_owner[i][SDL_CONTROLLER_AXIS_RIGHTX]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_RIGHTY, ry,
+				analog_owner[i][SDL_CONTROLLER_AXIS_RIGHTY]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, lt,
+				analog_owner[i][SDL_CONTROLLER_AXIS_TRIGGERLEFT]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, rt,
+				analog_owner[i][SDL_CONTROLLER_AXIS_TRIGGERRIGHT]);
 		} else if (clear_analog) {
 			memset(last_analog[i], 0, sizeof(last_analog[i]));
 			memset(last_trigger[i], 0, sizeof(last_trigger[i]));
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_LEFTX, 0, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_LEFTY, 0, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_RIGHTX, 0, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_RIGHTY, 0, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, 0, 32767);
-			setjoystickstate(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 0, 32767);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_LEFTX, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_LEFTX]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_LEFTY, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_LEFTY]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_RIGHTX, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_RIGHTX]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_RIGHTY, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_RIGHTY]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_TRIGGERLEFT]);
+			route_libretro_joy_axis(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 0,
+				analog_owner[i][SDL_CONTROLLER_AXIS_TRIGGERRIGHT]);
 		}
 	}
 
-	// Mouse input — poll both ports (Amiga supports 2 mice)
-	for (int i = 0; i < 2; i++)
 	{
-		const unsigned dev = libretro_port_device[i] & RETRO_DEVICE_MASK;
-		if (dev != RETRO_DEVICE_MOUSE && dev != RETRO_DEVICE_JOYPAD)
-			continue;
+		const inputdevice_osk_passthrough passthrough;
 
-		int16_t mouse_x = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
-		int16_t mouse_y = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
-		if (i == 0)
-			log_mouse_motion(mouse_x, mouse_y);
-		if (mouse_x != 0 || mouse_y != 0)
+		// Mouse input — poll both ports (Amiga supports 2 mice)
+		for (int i = 0; i < 2; i++)
 		{
-			setmousestate(i, 0, mouse_x, 0);
-			setmousestate(i, 1, mouse_y, 0);
-		}
+			const unsigned dev = libretro_port_device[i] & RETRO_DEVICE_MASK;
+			if (dev != RETRO_DEVICE_MOUSE && dev != RETRO_DEVICE_JOYPAD)
+				continue;
 
-		static const int mouse_buttons[] = {
-			RETRO_DEVICE_ID_MOUSE_LEFT,
-			RETRO_DEVICE_ID_MOUSE_RIGHT,
-			RETRO_DEVICE_ID_MOUSE_MIDDLE
-		};
-		for (int b = 0; b < 3; b++)
-		{
-			const int16_t state = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, mouse_buttons[b]) & 1;
-			if (state != last_mouse_buttons[i][b]) {
-				last_mouse_buttons[i][b] = state;
-				if (i == 0)
-					log_mouse_button(b, state);
+			int16_t mouse_x = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
+			int16_t mouse_y = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+			if (i == 0)
+				log_mouse_motion(mouse_x, mouse_y);
+			if (mouse_x != 0 || mouse_y != 0)
+			{
+				setmousestate(i, 0, mouse_x, 0);
+				setmousestate(i, 1, mouse_y, 0);
 			}
-			setmousebuttonstate(i, b, state);
+
+			static const int mouse_buttons[] = {
+				RETRO_DEVICE_ID_MOUSE_LEFT,
+				RETRO_DEVICE_ID_MOUSE_RIGHT,
+				RETRO_DEVICE_ID_MOUSE_MIDDLE
+			};
+			for (int b = 0; b < 3; b++)
+			{
+				const int16_t state = input_state_cb(i, RETRO_DEVICE_MOUSE, 0, mouse_buttons[b]) & 1;
+				if (state != last_mouse_buttons[i][b]) {
+					last_mouse_buttons[i][b] = state;
+					if (i == 0)
+						log_mouse_button(b, state);
+				}
+				setmousebuttonstate(i, b, state);
+			}
+			last_mouse_x[i] = mouse_x;
+			last_mouse_y[i] = mouse_y;
 		}
-		last_mouse_x[i] = mouse_x;
-		last_mouse_y[i] = mouse_y;
 	}
+	// Drive the on-screen keyboard directly from the polled RetroPad state;
+	// independent of any guest port mapping.
+	libretro_osk_publish_state();
 	last_analog_enabled = analog_enabled;
 }
 
@@ -4970,10 +5439,11 @@ static void core_entry(void)
 
 	const bool automatic_crop = get_libretro_crop_mode() == libretro_crop_mode::auto_crop;
 	if (libretro_should_queue_auto_crop_options(automatic_crop, is_rp9)) {
-		push_s_option("gfx_auto_crop=true");
-		push_s_option("gfx_manual_crop=false");
-		push_s_option("gfx_horizontal_offset=0");
-		push_s_option("gfx_vertical_offset=0");
+		// Amiberry target options: the config parser only accepts the prefixed form.
+		push_s_option("amiberry.gfx_auto_crop=true");
+		push_s_option("amiberry.gfx_manual_crop=false");
+		push_s_option("amiberry.gfx_horizontal_offset=0");
+		push_s_option("amiberry.gfx_vertical_offset=0");
 		push_s_option("gfx_center_horizontal=none");
 		push_s_option("gfx_center_vertical=none");
 	}
@@ -5082,16 +5552,10 @@ static void core_entry(void)
 			}
 		}
 	}
-	if (!save_dir.empty()) {
-		const std::string cfg_path = "config_path=" + save_dir;
-		const std::string saveimage_path = "saveimage_dir=" + save_dir;
-		const std::string savestate_path = "savestate_dir=" + save_dir;
-		const std::string statefile_path = "statefile_path=" + save_dir;
-		push_s_option(cfg_path);
-		push_s_option(saveimage_path);
-		push_s_option(savestate_path);
-		push_s_option(statefile_path);
-	}
+	// Host directories (config, savestate, screenshot, ...) come from
+	// AMIBERRY_HOME_DIR; only the statefile path is a per-config option.
+	if (!save_dir.empty())
+		push_s_option("statefile_path=" + save_dir);
 
 	if (game_path[0])
 	{
@@ -5188,6 +5652,8 @@ static void core_entry(void)
 		}
 		safe_strdup("-G");
 	}
+	for (const auto& arg : embed_extra_args)
+		safe_strdup(arg.c_str());
 	argv.push_back(nullptr);
 
 	if (libretro_debug_file) {
@@ -5254,6 +5720,40 @@ static void delete_core_fiber()
 	core_fiber = NULL;
 }
 
+static void clear_pending_state()
+{
+	pending_state.clear();
+	pending_state.shrink_to_fit();
+	pending_state_queued = false;
+	savestate_restore_memory(nullptr, 0);
+}
+
+// Hand the pending statefile to the emulator. Only valid while the core is
+// parked inside the CPU loop. Startup resets savestate_state with the default
+// prefs, and m68k_go()'s reset handling presents frames, so the core can
+// yield mid-reset: a request queued there loses its SPCFLAG_BRK to
+// m68k_reset2() and is never acted on (#2429). The state stays pending and is
+// retried on every retro_run() until the core is back in the CPU loop.
+static void queue_pending_state()
+{
+	if (pending_state.empty() || pending_state_queued || !core_is_running()
+		|| !m68k_cpu_loop_active)
+		return;
+	savestate_restore_memory(pending_state.data(), pending_state.size());
+	// Samples still buffered belong to the timeline being discarded.
+	libretro_audio_reset();
+	pending_state_queued = true;
+}
+
+// Drop the pending copy once the emulator has finished restoring it.
+static void retire_pending_state()
+{
+	if (pending_state_queued
+		&& savestate_state != STATE_DORESTORE
+		&& savestate_state != STATE_RESTORE)
+		clear_pending_state();
+}
+
 static void reset_core_runtime_state()
 {
 	if (fastforward_forced) {
@@ -5272,6 +5772,9 @@ static void reset_core_runtime_state()
 	libretro_reset_crop_policy();
 	libretro_audio_reset();
 	libretro_options_dirty = true;
+	memset(joypad_owner, 0, sizeof joypad_owner);
+	memset(analog_owner, 0, sizeof analog_owner);
+	clear_pending_state();
 }
 
 static void apply_minimum_audio_latency()
@@ -5676,6 +6179,7 @@ void retro_run(void)
 		apply_libretro_statusline_options();
 		apply_libretro_video_resolution_options();
 		apply_libretro_overscan_option();
+		apply_libretro_osk_options();
 #ifdef WITH_MIDI
 		apply_libretro_midi_options();
 #endif
@@ -5710,6 +6214,7 @@ void retro_run(void)
 			set_fastforward_override(fastforwarding);
 		}
 	}
+	queue_pending_state();
 	poll_input();
 	libretro_audio_frames_this_run = 0;
 	co_switch(core_fiber);
@@ -5719,6 +6224,7 @@ void retro_run(void)
 	}
 	if (core_shutdown_complete)
 		return;
+	retire_pending_state();
 	apply_cheats();
 	update_memory_map();
 	update_led_interface();
@@ -5727,6 +6233,11 @@ void retro_run(void)
 		midi_iface_ptr->flush();
 #endif
 	update_geometry();
+
+	// Poll on-screen keyboard key repeat (directions held on a stable D-pad
+	// or analog axis generate no further input events; repeat is driven here,
+	// once per frame, on the thread that owns imgui_osk_process()).
+	imgui_osk_update();
 }
 
 bool retro_load_game(const struct retro_game_info *info)
@@ -5872,6 +6383,7 @@ bool retro_load_game(const struct retro_game_info *info)
 		last_disk_index = 0;
 		last_disk_ejected = false;
 
+		std::string selected_disk;
 		const auto ext_pos = path.find_last_of('.');
 		const std::string path_ext = (ext_pos == std::string::npos) ? "" : path.substr(ext_pos);
 		if (path_ext == ".m3u" || path_ext == ".m3u8") {
@@ -5882,22 +6394,35 @@ bool retro_load_game(const struct retro_game_info *info)
 				image.path = path;
 				disk_images.push_back(image);
 			}
-		} else {
+		} else if (!load_archive_disk_images(path, disk_images, selected_disk)) {
 			DiskImage image;
 			image.path = path;
 			disk_images.push_back(image);
 		}
 
 		if (!disk_images.empty()) {
+			// A saved image path that matches nothing is stale: ignore the
+			// restore and fall back to the browsed archive member, if any.
+			bool restored = false;
 			if (!initial_disk_path.empty()) {
 				for (size_t i = 0; i < disk_images.size(); i++) {
 					if (disk_images[i].path == initial_disk_path) {
 						disk_index = static_cast<unsigned>(i);
+						restored = true;
 						break;
 					}
 				}
 			} else if (initial_disk_index >= 0 && static_cast<unsigned>(initial_disk_index) < disk_images.size()) {
 				disk_index = static_cast<unsigned>(initial_disk_index);
+				restored = true;
+			}
+			if (!restored && !selected_disk.empty()) {
+				for (size_t i = 0; i < disk_images.size(); i++) {
+					if (zfile_path_key(disk_images[i].path) == selected_disk) {
+						disk_index = static_cast<unsigned>(i);
+						break;
+					}
+				}
 			}
 			strncpy(game_path, disk_images[disk_index].path.c_str(), sizeof(game_path) - 1);
 			game_path[sizeof(game_path) - 1] = '\0';
@@ -5982,12 +6507,23 @@ size_t retro_serialize_size(void)
 	total += currprefs.mbresmem_low.size;
 	total += currprefs.mbresmem_high.size;
 	total += 8 * 1024 * 1024;
-	return total;
+	return std::max(total, pending_state.size());
 }
 
 bool retro_serialize(void *data, size_t size)
 {
-	if (!core_is_running() || !data || size == 0)
+	if (!data || size == 0)
+		return false;
+
+	// A loaded state the core has not applied yet is the current state.
+	if (!pending_state.empty()) {
+		if (pending_state.size() > size)
+			return false;
+		memcpy(data, pending_state.data(), pending_state.size());
+		return true;
+	}
+
+	if (!core_is_running())
 		return false;
 
 	struct zfile *f = zfile_fopen_empty(NULL, _T("libretro"));
@@ -6017,13 +6553,21 @@ bool retro_serialize(void *data, size_t size)
 
 bool retro_unserialize(const void *data, size_t size)
 {
-	if (!core_is_running() || !data || size == 0)
+	if (core_shutdown_complete || !data || size < 4)
+		return false;
+	if (memcmp(data, "ASF ", 4) != 0)
 		return false;
 
-	struct zfile *f = zfile_fopen_data(_T("libretro"), (uae_u64)size, (const uae_u8*)data);
-	if (!f) return false;
-
-	restore_state_file(f);
+	// Restoring needs the CPU loop to unwind to m68k_go(), which runs
+	// restore_state() followed by the hard reset that rebuilds memory maps,
+	// devices and the filesystem from the restored chunks. Queue the state;
+	// the core applies it as soon as it resumes inside the CPU loop. States
+	// loaded before the core has booted (RetroArch auto-load) or while it is
+	// mid-reset wait until it is.
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	pending_state.assign(bytes, bytes + size);
+	pending_state_queued = false;
+	queue_pending_state();
 	return true;
 }
 

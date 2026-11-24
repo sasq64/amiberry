@@ -280,7 +280,7 @@ extern struct romdata *getfrombydefaultname(const TCHAR *name, int size);
 extern struct romlist **getarcadiaroms(int);
 extern struct romdata *getarcadiarombyname (const TCHAR *name);
 extern struct romlist **getromlistbyident (int ver, int rev, int subver, int subrev, const TCHAR *model, int romflags, bool all);
-extern void getromname (const struct romdata*, TCHAR*);
+extern void getromname (const struct romdata*, TCHAR*, int);
 extern struct romdata *getromdatabyname (const TCHAR*);
 extern struct romlist *getromlistbyids (const int *ids, const TCHAR *romname);
 extern struct romlist *getromlistbyromtype(uae_u32 romtype, const TCHAR *romname);
@@ -314,6 +314,19 @@ extern int romlist_count (void);
 extern int romlist_get_generation (void);
 extern struct romlist *romlist_getit (void);
 extern int configure_rom (struct uae_prefs *p, const int *rom, int msg);
+#ifdef __cplusplus
+#include <vector>
+// While set, configure_rom() configures nothing: it records each ROM list it
+// is asked for (alternative ROM IDs) and answers whether a ROM was found
+// from answers (not found past its end). The settings schema export walks a
+// preset's every branch with it to list the ROMs the preset can use.
+struct configure_rom_probe {
+	std::vector<std::vector<int>> lists;
+	std::vector<bool> answers;
+	size_t calls = 0;
+};
+extern configure_rom_probe *configure_rom_probing;
+#endif
 
 int is_device_rom(struct uae_prefs *p, int romtype, int devnum);
 struct zfile *read_device_rom(struct uae_prefs *p, int romtype, int devnum, int *roms);

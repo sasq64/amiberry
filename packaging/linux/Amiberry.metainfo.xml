@@ -67,6 +67,31 @@
         </screenshot>
     </screenshots>
     <releases>
+        <release version="8.6.0" date="2026-11-16">
+            <description>
+                <p>On multi-core hosts, 68020 to 68060 configurations set to the fastest CPU speed run the CPU on its own thread. A new Exact FPU core emulates 80-bit precision and works with the ARM64 JIT, 68020 cycle-exact timing matches a real A1200, and FPU instructions take their real time in cycle-exact mode. x86 bridgeboards and PC graphics chips run on 86Box instead of PCem, images can be copied between the Amiga and host clipboards, and a global screenshot key names screenshots after the WHDLoad game. Fixes from WinUAE and the amitorture test suite cover the CPU, MMU, FPU, JIT, ECS superhires, Picasso96 split screens, sound boards, the AHI driver, MIDI, bsdsocket multicast and non-ASCII directory hard drives. 32-bit hosts are no longer supported.</p>
+            </description>
+        </release>
+        <release version="8.5.0" date="2026-10-27">
+            <description>
+                <p>WHDBooter now downloads WHDLoad, JST, the Kickstart RTB files and the optional XPK, MMULib, explode and medplayer libraries from their authors' sites instead of bundling them, and host-quit replaces AmiQuit. LhA archives are read with Lhasa and LZX archives with a new decoder; an LZX archive in the ROMs folder no longer crashes the ROM scan. PearPC is removed (PPC uses QEMU) and DBus control is replaced by IPC, with new settings commands. Fixes crashes when switching RTG boards between Zorro II and III and on Blizzard boards without RAM, a ZZ9000 slirp hang on reboot, file requesters for the media and state hotkeys, and many configuration save and load issues. Each release now includes the source of its third-party libraries.</p>
+            </description>
+        </release>
+        <release version="8.4.2" date="2026-10-19">
+            <description>
+                <p>Bugfix release: Linux AppImages for x86_64 and aarch64, and packages for Ubuntu 26.10. The multithreaded CPU option runs at full JIT speed again and no longer crashes on a keyboard reset. WHDBooter prefers exact SHA1 matches, refreshes outdated game databases on upgrade, and applies the 68030, 68040 and cycle-exact settings from the database. Fixed the FPS adjustment in the Display panel, Chipset Extra changes on reboot, the .uaem metadata option while running, and the Host Only cursor hotspot drifting during slow movement. Adds IPC control on Windows, GDB monitor commands over IPC, ZZ9000 WebP, FLAC, Ogg Vorbis, WebM and MPEG-2 services, an option to stretch PAL as NTSC, and the latest WinUAE updates.</p>
+            </description>
+        </release>
+        <release version="8.4.1" date="2026-10-14">
+            <description>
+                <p>Bugfix release: RetroArch save states load reliably, including auto-loaded states, and restore mounted directory paths; libretro Joystick As Mouse moves the pointer with the left stick. Fixed the Host Only cursor losing its lower half on the right side of native screens, ROM folder handling with relative paths, configuration strings such as hardfile geometry truncated on save, cache-inhibited MMU pages, file renames while files are open, and A2024, Graffiti and genlock overscan handling. Adds an optional GDB remote debugging server, MacPorts support on macOS, FreeBSD packages with each release, GLES-only and USE_PPC=OFF build fixes, libavcodec-extra support in DEB packages, updated AROS ROMs, and the latest WinUAE updates.</p>
+            </description>
+        </release>
+        <release version="8.4.0" date="2026-10-11">
+            <description>
+                <p>Feature release: expanded ZZ9000 emulation (AHI audio, SANA-II networking, SDK mailbox and MHI audio, MPEGA streams, image and ZZPlay services, firmware 2.8 register ABI), support for an external MiniGL renderer plugin (available separately) with dma-buf frame compositing, user plugin locations, custom cartridge ROM and .A1000 ROM support, relative media paths, and a --dump-config command-line option. RTG dirty-tracking and warm-reset fixes, ARM64 JIT trap and FPU fixes, RPi4 zero-copy native frames and faster AGA drawing, runtime GL capability detection, bsdsocket/SANA-II/uaenet networking fixes, a libretro on-screen keyboard and disk control improvements, Android launcher/touch/TV fixes, and the latest WinUAE and ImGui updates.</p>
+            </description>
+        </release>
             <release version="8.3.0" date="2026-08-05">
                 <description>
                     <p>Feature release: ZZ9000 RTG emulation, RP9 package support, a new Global Settings panel, configuration category grouping, and separate GUI window on Windows. Extensive host-only cursor fixes (hotspot, jumps, alignment across native/P96 modes), autocrop improvements (non-black border detection, live refresh, libretro crop overscan), and Android UI/UX polish (touch tap-to-click reliability, Files panel layout, native shader selection, touch trackpad mouse controls, ADPF adaptive CPU tuning, config save-as UX). Performance improvements on RPi4 (KMSDRM throughput, Copper overhead, PGO), renderer/machdep/P96 hot paths, and PPC QEMU flush tuning. KMSDRM display timing and GUI resume fixes, SCSI/SDMAC/53C710 emulation fixes, networking fixes (Ariadne II/X-Surf/Ethernet/serial), libretro audio and ROM lookup fixes, 68030 MMU JIT fixes, and SDL updated to 3.4.12. Merged latest WinUAE updates, added CI for libretro buildbot, and Capsimg 5.2 support.</p>

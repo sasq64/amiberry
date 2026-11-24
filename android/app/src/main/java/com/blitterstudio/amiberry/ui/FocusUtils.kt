@@ -13,6 +13,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -23,9 +24,20 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.SoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 
 /**
@@ -130,40 +142,148 @@ fun hasTouchScreen(context: Context): Boolean {
  * Use this on Cards, Rows, or other custom composables that aren't
  * standard Material interactive elements (which already have focus indication).
  */
-fun Modifier.dpadFocusable(): Modifier = composed {
-	var isFocused by remember { mutableStateOf(false) }
-	val borderColor by animateColorAsState(
-		targetValue = if (isFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-		label = "focusBorder"
-	)
-
-	this
-		.onFocusChanged { isFocused = it.isFocused }
-		.border(
-			width = 2.dp,
-			color = borderColor,
-			shape = RoundedCornerShape(12.dp)
-		)
-		.focusable()
-}
+fun Modifier.dpadFocusable(): Modifier = dpadFocusRing().focusable()
 
 /**
  * Lighter variant that only adds focus tracking + border styling
  * without making the element focusable (for elements that are already
  * focusable via clickable() or other means).
  */
-fun Modifier.dpadFocusIndicator(): Modifier = composed {
+fun Modifier.dpadFocusIndicator(): Modifier = dpadFocusRing()
+
+/**
+ * The focus ring of a read-only dropdown field, on a TV only: Material's own focused
+ * outline is a thin primary line that reads as unfocused from across the room. Elsewhere
+ * a tap focuses the field, and its outline already shows that.
+ */
+fun Modifier.dpadFieldFocusIndicator(): Modifier = composed {
+	if (isTvDevice()) dpadFocusRing() else Modifier
+}
+
+/**
+ * The ring around the control with D-pad focus. On a TV it is 3 dp in the content colour
+ * (white on the dark theme): a primary-coloured ring vanished against filled primary buttons.
+ */
+private fun Modifier.dpadFocusRing(): Modifier = composed {
 	var isFocused by remember { mutableStateOf(false) }
+	val tv = isTvDevice()
 	val borderColor by animateColorAsState(
-		targetValue = if (isFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+		targetValue = when {
+			!isFocused -> Color.Transparent
+			tv -> MaterialTheme.colorScheme.onSurface
+			else -> MaterialTheme.colorScheme.primary
+		},
 		label = "focusBorder"
 	)
 
 	this
 		.onFocusChanged { isFocused = it.isFocused }
 		.border(
-			width = 2.dp,
+			width = if (tv) 3.dp else 2.dp,
 			color = borderColor,
 			shape = RoundedCornerShape(12.dp)
 		)
+}
+
+/**
+ * Text fields consume the D-pad arrows as text-cursor movement, trapping TV focus.
+ * Up/Down move focus to the neighbouring control instead; Left/Right still move the
+ * cursor of an editable single-line field.
+ */
+fun Modifier.dpadVerticalMovesFocus(): Modifier = arrowsMoveFocus(horizontal = false)
+
+/**
+ * Read-only dropdown anchors (ExposedDropdownMenuBox text fields) have no cursor to
+ * move, yet consume all four D-pad arrows: every arrow moves focus instead, so Left/Right
+ * reach an Eject button beside the field or the navigation rail.
+ */
+fun Modifier.dpadArrowsMoveFocus(): Modifier = arrowsMoveFocus(horizontal = true)
+
+private fun Modifier.arrowsMoveFocus(horizontal: Boolean): Modifier = composed {
+	val focusManager = LocalFocusManager.current
+	this.onPreviewKeyEvent { event ->
+		if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+		when (event.key) {
+			Key.DirectionDown -> focusManager.moveFocus(FocusDirection.Down)
+			Key.DirectionUp -> focusManager.moveFocus(FocusDirection.Up)
+			Key.DirectionLeft -> horizontal && focusManager.moveFocus(FocusDirection.Left)
+			Key.DirectionRight -> horizontal && focusManager.moveFocus(FocusDirection.Right)
+			else -> false
+		}
+	}
+}
+
+/**
+ * A Slider takes all four arrow keys, so D-pad Up/Down changed the value and focus
+ * could never leave it. Up/Down move to the neighbouring control instead (and never
+ * change the value, even with nothing in that direction); Left/Right still adjust it,
+ * and are consumed at either end so focus does not jump sideways off the slider.
+ * Pass it in the Slider's modifier so it wraps the slider's own key handling.
+ */
+fun Modifier.dpadSliderKeys(): Modifier = composed {
+	val focusManager = LocalFocusManager.current
+	this.onPreviewKeyEvent { event ->
+		when (event.key) {
+			Key.DirectionDown -> {
+				if (event.type == KeyEventType.KeyDown) focusManager.moveFocus(FocusDirection.Down)
+				true
+			}
+			Key.DirectionUp -> {
+				if (event.type == KeyEventType.KeyDown) focusManager.moveFocus(FocusDirection.Up)
+				true
+			}
+			else -> false
+		}
+	}.onKeyEvent { event ->
+		// Reached only when the slider itself did not use the key (at its end).
+		event.key == Key.DirectionLeft || event.key == Key.DirectionRight
+	}
+}
+
+
+/**
+ * A TV IME opens as soon as an editable text field gains focus and then takes the
+ * D-pad, so moving through a form got stuck in the keyboard. On a TV the field stays
+ * read-only ([readOnly]) until OK/Enter is pressed on it, which opens the IME, and
+ * becomes read-only again when focus leaves it or [stopTyping] is called (IME Done).
+ * Apply [modifier] to the text field. Elsewhere nothing changes. (TV, not "no
+ * touchscreen": TV emulators report one, and mouse users elsewhere press no OK key.)
+ */
+@Stable
+class DpadTypingGate internal constructor(
+	private val gated: Boolean,
+	private val keyboardController: SoftwareKeyboardController?
+) {
+	private var typing by mutableStateOf(!gated)
+
+	val readOnly: Boolean get() = !typing
+
+	/**
+	 * For IME Done. A custom onDone replaces Compose's default Done handling, which
+	 * hides the keyboard: on a TV the field turns read-only again (ending the input
+	 * session closes the IME); elsewhere the keyboard is hidden here.
+	 */
+	fun stopTyping() {
+		if (gated) typing = false else keyboardController?.hide()
+	}
+
+	val modifier: Modifier = if (!gated) Modifier else Modifier
+		.onPreviewKeyEvent { event ->
+			if (event.type == KeyEventType.KeyDown &&
+				(event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter)
+			) {
+				// Becoming editable starts the input session, which shows the IME; once
+				// editable (IME closed with Back), OK shows it again.
+				if (typing) keyboardController?.show() else typing = true
+			}
+			false
+		}
+		.onFocusChanged { if (!it.isFocused) typing = false }
+}
+
+@Composable
+fun rememberDpadTypingGate(): DpadTypingGate {
+	val tv = isTvDevice()
+	val keyboardController = LocalSoftwareKeyboardController.current
+	return remember(tv, keyboardController) { DpadTypingGate(tv, keyboardController) }
 }

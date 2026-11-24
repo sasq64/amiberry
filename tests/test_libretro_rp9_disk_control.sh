@@ -46,7 +46,7 @@ fi
 
 if ! awk '
 	/if \(!package_path\.empty\(\)\)/ { in_package = 1 }
-	in_package && /if \(!is_rp9\)/ { excludes_rp9 = 1 }
+	in_package && /if \(!is_rp9[) ]/ { excludes_rp9 = 1 }
 	in_package && excludes_rp9 && /disk_images\.push_back\(image\)/ { guarded_publish = 1 }
 	in_package && /return true;/ { exit }
 	END { exit excludes_rp9 && guarded_publish ? 0 : 1 }

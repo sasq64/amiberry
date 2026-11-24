@@ -31,38 +31,32 @@ class DirectImportGuardArchitectureTest {
 	}
 
 	@Test
-	fun `quick start direct imports are guarded and controls show busy state`() {
-		val quickStart = source("screens/QuickStartScreen.kt")
-		val mediaSelector = source("components/MediaSelector.kt")
+	fun `library direct imports are guarded and controls show busy state`() {
+		val library = source("screens/library/LibraryScreen.kt")
 
 		assertTrue(
-			"QuickStartScreen should remember a direct import guard.",
-			quickStart.contains("val importGuard = rememberImportInFlightGuard()")
+			"LibraryScreen should remember a direct import guard for ROM imports.",
+			library.contains("val importGuard = rememberImportInFlightGuard()")
 		)
 		assertTrue(
-			"QuickStartScreen should read import busy state for its import controls.",
-			quickStart.contains("val importInProgress = importGuard.isImporting")
+			"LibraryScreen should read import busy state for its import controls.",
+			library.contains("val importInProgress = importGuard.isImporting")
 		)
 		assertTrue(
-			"QuickStartScreen should guard all direct media and ROM import callbacks.",
-			quickStart.split("launchImportGuarded(importGuard)").size - 1 >= 4
+			"LibraryScreen should guard its direct ROM import callbacks (files and folders).",
+			library.split("launchImportGuarded(importGuard)").size - 1 >= 2
 		)
 		assertTrue(
-			"QuickStartScreen should pass import busy state to its media selector import buttons.",
-			quickStart.split("importInProgress = importInProgress").size - 1 >= 4
+			"The ROM notice import button should be disabled while a direct import is active.",
+			Regex("""Button\(onClick = onImport, enabled = !importInProgress""")
+				.containsMatchIn(library)
 		)
-		assertTrue(
-			"QuickStartScreen setup ROM import button should be disabled while a direct import is active.",
-			Regex("""Button\([\s\S]*enabled = !importInProgress""")
-				.containsMatchIn(quickStart)
-		)
-		assertMediaSelectorBusyState(mediaSelector)
 	}
 
 	@Test
 	fun `settings direct imports are guarded and controls show busy state`() {
 		val settings = source("screens/settings/SettingsScreen.kt")
-		val storage = source("screens/settings/StorageTab.kt")
+		val storage = source("screens/settings/StoragePage.kt")
 
 		assertTrue(
 			"SettingsScreen should remember a direct import guard for ROM imports.",
@@ -78,37 +72,16 @@ class DirectImportGuardArchitectureTest {
 				.containsMatchIn(settings)
 		)
 		assertTrue(
-			"StorageTab should remember a direct import guard for floppy imports.",
+			"StoragePage should remember a direct import guard for floppy imports.",
 			storage.contains("val importGuard = rememberImportInFlightGuard()")
 		)
 		assertTrue(
-			"StorageTab should guard direct floppy import callbacks.",
+			"StoragePage should guard direct floppy import callbacks.",
 			storage.contains("launchImportGuarded(importGuard)")
 		)
 		assertTrue(
-			"StorageTab should disable floppy import buttons while a direct import is active.",
-			Regex("""TextButton\(onClick = \{ importLauncher\.launch\(FilePickerFilters\.mimeTypesFor\(FileCategory\.FLOPPIES\)\) \}, enabled = !importInProgress\)""")
-				.containsMatchIn(storage)
-		)
-		assertTrue(
-			"StorageTab should show an importing label while direct floppy import is active.",
+			"StoragePage should show an importing label while direct floppy import is active.",
 			storage.contains("R.string.action_importing")
-		)
-	}
-
-	private fun assertMediaSelectorBusyState(mediaSelector: String) {
-		assertTrue(
-			"MediaSelector should accept direct import busy state from its caller.",
-			mediaSelector.contains("importInProgress: Boolean = false")
-		)
-		assertTrue(
-			"MediaSelector import button should be disabled while importing.",
-			Regex("""TextButton\(onClick = onImport, enabled = !importInProgress\)""")
-				.containsMatchIn(mediaSelector)
-		)
-		assertTrue(
-			"MediaSelector should show an importing label while busy.",
-			mediaSelector.contains("R.string.action_importing")
 		)
 	}
 

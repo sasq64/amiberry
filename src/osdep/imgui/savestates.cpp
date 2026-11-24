@@ -1,12 +1,10 @@
 #include "imgui.h"
 #include "sysdeps.h"
-#include "options.h"
 #include "gui.h"
 #include "gui/gui_handling.h"
 #include "savestate.h"
 #include <sys/stat.h>
 #include <string>
-#include <vector>
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -42,6 +40,9 @@ static void ShowAlert(const char *title, const char *message) {
 
 static ImTextureID savestate_screenshot_tex = ImTextureID_Invalid;
 static int savestate_screenshot_slot = -1;
+// Set where the preview cannot go at once (a requester's callback runs after
+// the panel queued its image for the frame); the panel drops it next frame.
+static bool savestate_preview_stale = false;
 
 static void ClearScreenshotTexture() {
     if (savestate_screenshot_tex != ImTextureID_Invalid) {
@@ -86,6 +87,10 @@ void render_panel_savestates() {
     if (current_state_num != last_state_num) {
         gui_update();
         last_state_num = current_state_num;
+        force_reload = true;
+    }
+    if (savestate_preview_stale) {
+        savestate_preview_stale = false;
         force_reload = true;
     }
 
@@ -209,16 +214,24 @@ void render_panel_savestates() {
         ImGui::Spacing();
 
         if (AmigaButton(ICON_FA_UPLOAD " Load state...", ImVec2(file_btn_w, BUTTON_HEIGHT))) {
-            disk_selection(4, &changed_prefs);
-            current_state_num = 99;
-            last_state_num = 99;
-            gui_update();
-            ClearScreenshotTexture();
+            // As Load from Slot: restores into the running emulation and
+            // leaves the GUI, so nothing here can retarget the restore.
+            if (emulating) {
+                request_disk_selection(4, true);
+            } else {
+                ShowAlert("Loading savestate", "Emulation hasn't started yet.");
+            }
         }
         ImGui::SameLine();
         if (AmigaButton(ICON_FA_FLOPPY_DISK " Save state...", ImVec2(file_btn_w, BUTTON_HEIGHT))) {
             if (emulating) {
-                disk_selection(5, &changed_prefs);
+                // The panel now shows the saved file, not a slot.
+                request_disk_selection(5, false, [] {
+                    current_state_num = 99;
+                    last_state_num = 99;
+                    savestate_preview_stale = true;
+                    ss_info_dirty = true;
+                });
             } else {
                 ShowAlert("Saving state", "Emulation hasn't started yet.");
             }

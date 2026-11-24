@@ -107,7 +107,7 @@ cfg="$test_root/retroarch-test.cfg"
 
 mkdir -p "$kick_dir" "$save_dir/Amiberry" "$state_dir/Amiberry" "$content_dir" "$log_dir"
 
-if [[ "$refresh_assets" -eq 1 || ! -e "$system_dir/whdboot/WHDLoad" ]]; then
+if [[ "$refresh_assets" -eq 1 || ! -e "$system_dir/whdboot/boot-data.zip" ]]; then
 	rm -rf "$system_dir/whdboot"
 	cp -R "$repo_root/whdboot" "$system_dir/"
 fi
@@ -176,6 +176,8 @@ if [[ "$os_name" == "Darwin" ]]; then
 			run_prefix=(arch -x86_64)
 		fi
 	elif [[ "$retroarch_file_info" == *"arm64"* ]]; then
+		# macOS spells it arm64 (also in file(1) output, checked below);
+		# libretro/Makefile maps ARCH=arm64 to aarch64.
 		target_arch="arm64"
 	fi
 fi

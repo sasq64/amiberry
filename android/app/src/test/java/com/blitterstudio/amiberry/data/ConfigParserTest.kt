@@ -1,7 +1,7 @@
 package com.blitterstudio.amiberry.data
 
 import com.blitterstudio.amiberry.data.model.AmigaModel
-import com.blitterstudio.amiberry.data.model.HardDrive
+import com.blitterstudio.amiberry.data.model.MountKind
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -22,6 +22,25 @@ class ConfigParserTest {
 	// --- Basic parsing ---
 
 	@Test
+	fun `legacy mixed stereo loads as the emulator loads it`() {
+		val result = ConfigParser.parse(writeConfig("sound_stereo_separation=3\nsound_channels=mixed\n"))
+
+		assertEquals("stereo", result.settings.soundChannels)
+		// The earlier separation is what "mixed" replaced; both are schema options.
+		assertEquals(mapOf("sound_stereo_separation" to "7", "sound_stereo_mixing_delay" to "5"), result.settings.options)
+		assertTrue(result.unknownLines.isEmpty())
+	}
+
+	@Test
+	fun `a line after legacy mixed stereo still wins`() {
+		val result = ConfigParser.parse(writeConfig("sound_channels=mixed\nsound_stereo_mixing_delay=2\n"))
+
+		assertEquals("stereo", result.settings.soundChannels)
+		assertEquals(mapOf("sound_stereo_mixing_delay" to "2", "sound_stereo_separation" to "7"), result.settings.options)
+		assertTrue(result.unknownLines.isEmpty())
+	}
+
+	@Test
 	fun `parse empty file returns defaults`() {
 		val file = writeConfig("")
 		val result = ConfigParser.parse(file)
@@ -29,8 +48,28 @@ class ConfigParserTest {
 		assertEquals(68000, result.settings.cpuModel)
 		assertEquals("ocs", result.settings.chipset)
 		assertEquals(1, result.settings.chipRam)
+		// Must match the core default (cfgfile.cpp), or saving rewrites a missing key to a lower level.
+		assertEquals("full", result.settings.collisionLevel)
 		assertTrue(result.unknownLines.isEmpty())
 		assertEquals("", result.description)
+	}
+
+	@Test
+	fun `parse input reads vkbd toggle`() {
+		val file = writeConfig("amiberry.vkbd_toggle=rightstick")
+		val result = ConfigParser.parse(file)
+
+		assertEquals("rightstick", result.settings.onScreenKeyboardToggle)
+		assertTrue(result.unknownLines.isEmpty())
+	}
+
+	@Test
+	fun `parse input keeps explicitly empty vkbd toggle distinct from absent`() {
+		val file = writeConfig("amiberry.vkbd_toggle=")
+		assertEquals("", ConfigParser.parse(file).settings.onScreenKeyboardToggle)
+
+		file.writeText("amiberry.vkbd_enabled=true")
+		assertNull(ConfigParser.parse(file).settings.onScreenKeyboardToggle)
 	}
 
 	@Test
@@ -111,8 +150,32 @@ class ConfigParserTest {
 		assertEquals("aga", s.chipset)
 		assertTrue(s.immediateBlits)
 		assertEquals("full", s.collisionLevel)
-		assertTrue(s.cycleExact)
+		assertEquals("true", s.cycleExact)
 		assertTrue(s.ntsc)
+	}
+
+	@Test
+	fun `parse cycle_exact as the emulator reads it`() {
+		for ((stored, expected) in listOf(
+			"memory" to "memory", "true" to "true", "false" to "false",
+			"yes" to "memory", "no" to "false"
+		)) {
+			val file = tempDir.newFile("cycle_exact_$stored.uae").apply { writeText("cycle_exact=$stored") }
+			assertEquals(stored, expected, ConfigParser.parse(file).settings.cycleExact)
+		}
+	}
+
+	@Test
+	fun `floppy_volume sets the drive volumes the per-drive keys leave`() {
+		val file = writeConfig("""
+			floppy_volume=50
+			floppy1soundvolume_disk=10
+		""".trimIndent())
+		val s = ConfigParser.parse(file).settings
+
+		assertEquals(50, s.floppy0SoundVolumeDisk)
+		assertEquals(50, s.floppy3SoundVolumeEmpty)
+		assertEquals(10, s.floppy1SoundVolumeDisk)
 	}
 
 	// --- Memory settings ---
@@ -172,6 +235,7 @@ class ConfigParserTest {
 		val file = writeConfig("""
 			sound_output=normal
 			sound_frequency=48000
+			sound_max_buff=16384
 			sound_channels=mono
 		""".trimIndent())
 		val result = ConfigParser.parse(file)
@@ -179,6 +243,7 @@ class ConfigParserTest {
 
 		assertEquals("normal", s.soundOutput)
 		assertEquals(48000, s.soundFreq)
+		assertEquals(16384, s.soundBuffer)
 		assertEquals("mono", s.soundChannels)
 	}
 
@@ -260,7 +325,34 @@ class ConfigParserTest {
 		// android_joyport1 takes priority over joyport1
 		assertEquals("onscreen_joy", s.joyport1)
 		assertTrue(s.onScreenJoystick)
-		assertFalse(s.onScreenKeyboard)
+		assertFalse(s.onScreenKeyboardButton)
+	}
+
+	@Test
+	fun `parse input reads analog mouse map keys`() {
+		val file = writeConfig("""
+			joyport0=mouse
+			joyport1=joy0
+			joyport1mousemap=1
+		""".trimIndent())
+		val result = ConfigParser.parse(file)
+
+		assertFalse(result.settings.joyport0MouseMap)
+		assertTrue(result.settings.joyport1MouseMap)
+		assertTrue("joyport1mousemap" in result.explicitKeys)
+		assertTrue(result.unknownLines.none { it.trimStart().startsWith("joyport1mousemap=") })
+	}
+
+	@Test
+	fun `parse input ignores unparsable analog mouse speed key and keeps default`() {
+		val file = writeConfig("""
+			input.joymouse_speed_analog=invalid
+		""".trimIndent())
+		val result = ConfigParser.parse(file)
+
+		assertEquals(25, result.settings.analogMouseSpeed)
+		assertTrue("input.joymouse_speed_analog" in result.explicitKeys)
+		assertTrue(result.unknownLines.none { it.trimStart().startsWith("input.joymouse_speed_analog=") })
 	}
 
 	@Test
@@ -271,7 +363,7 @@ class ConfigParserTest {
 		""".trimIndent())
 		val result = ConfigParser.parse(file)
 
-		assertTrue(result.settings.onScreenKeyboard)
+		assertTrue(result.settings.onScreenKeyboardButton)
 		assertTrue(result.unknownLines.isEmpty())
 	}
 
@@ -280,7 +372,7 @@ class ConfigParserTest {
 		val file = writeConfig("amiberry.vkbd_enabled=false")
 		val result = ConfigParser.parse(file)
 
-		assertFalse(result.settings.onScreenKeyboard)
+		assertFalse(result.settings.onScreenKeyboardButton)
 		assertTrue(result.unknownLines.isEmpty())
 	}
 
@@ -585,29 +677,29 @@ class ConfigParserTest {
 	}
 
 	@Test
-	fun `parse preserves directory mounts and cd uaehf lines`() {
+	fun `parse mounts directories CD and tape while dropping directory twins`() {
 		val file = writeConfig("""
 			filesystem2=rw,DH0:Work:/host/dir,0
 			uaehf1=dir,rw,DH0:Work:/host/dir,0
-			uaehf2=cd0,rw,:/host/disc.iso
+			uaehf2=cd0,ro,:/host/disc.iso,0,0,0,2048,0,,ide0
+			uaehf3=tape0,rw,:/host/tape,0,0,0,512,0,,uae0
 		""".trimIndent())
 		val result = ConfigParser.parse(file)
 
-		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("filesystem2=") })
-		assertTrue(result.unknownLines.any { it.startsWith("uaehf1=dir") })
-		assertTrue(result.unknownLines.any { it.startsWith("uaehf2=cd0") })
+		assertEquals(listOf(MountKind.Directory, MountKind.Cd, MountKind.Tape), result.settings.hardDrives.map { it.kind })
+		assertEquals("DH0", result.settings.hardDrives.first().device)
+		assertTrue(result.unknownLines.isEmpty())
 	}
 
 	@Test
-	fun `parse preserves non-uae controller hardfile2`() {
+	fun `parse preserves physical hardfile and its twin`() {
 		val file = writeConfig(
-			"hardfile2=rw,DH0:/hd/scsi.hdf,0,0,0,512,0,,scsi0"
+			"hardfile2=rw,DH0::physical:drive,0,0,0,512,0,,scsi0\nuaehf0=hdf,rw,DH0::physical:drive,0,0,0,512,0,,scsi0"
 		)
 		val result = ConfigParser.parse(file)
 
 		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("hardfile2=") })
+		assertEquals(2, result.unknownLines.size)
 	}
 
 	@Test
@@ -620,56 +712,77 @@ class ConfigParserTest {
 	}
 
 	@Test
-	fun `parse preserves standalone uaehf hdf without matching hardfile2`() {
-		// Legacy/native seed configs ship a uaehf with no hardfile2 twin
-		// (see src/osdep/amiberry.cpp). Dropping it would delete the drive on save.
-		val file = writeConfig("uaehf0=hdf,rw,DH0:/hd/system.hdf,0,0,0,512,0,,uae0")
-		val result = ConfigParser.parse(file)
+	fun `parse standalone uaehf hardfile`() {
+		val result = ConfigParser.parse(writeConfig("uaehf0=hdf,rw,DH0:/hd/system.hdf,32,1,2,512,-128,,uae0"))
 
-		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("uaehf0=") })
-	}
-
-	@Test
-	fun `parse preserves uaehf hdf whose controller has no matching hardfile2`() {
-		val file = writeConfig("""
-			hardfile2=rw,:/hd/system.hdf,0,0,0,512,0,,uae0
-			uaehf1=hdf,rw,DH1:/hd/extra.hdf,0,0,0,512,0,,uae1
-		""".trimIndent())
-		val result = ConfigParser.parse(file)
-
-		// Only the uae0 hardfile2 is adopted; the uae1 twin has no matching hardfile2.
 		assertEquals(1, result.settings.hardDrives.size)
-		assertEquals("/hd/system.hdf", result.settings.hardDrives[0].path)
-		assertTrue(result.unknownLines.any { it.startsWith("uaehf1=") })
+		assertEquals(MountKind.Hardfile, result.settings.hardDrives.single().kind)
+		assertEquals(-128, result.settings.hardDrives.single().bootPriority)
 	}
 
 	@Test
-	fun `parse preserves hardfile2 with custom geometry`() {
-		// UAE controller but non-RDB geometry must not be flattened to 0,0,0,512.
-		val file = writeConfig("hardfile2=rw,:/hd/custom.hdf,63,16,2,512,0,,uae0")
-		val result = ConfigParser.parse(file)
+	fun `parse retains full hardfile properties`() {
+		val result = ConfigParser.parse(writeConfig(
+			"""hardfile2=ro,DH0:"/hd/a,b.hdf",63,16,2,512,-129,myfs,ide1,1024,1024/16/63,"disk.geo",CF,ATA1,flags=0x3,lock,identity"""
+		))
+		val mount = result.settings.hardDrives.single()
 
-		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("hardfile2=") })
+		assertEquals("/hd/a,b.hdf", mount.path)
+		assertEquals("DH0", mount.device)
+		assertEquals("myfs", mount.filesystem)
+		assertEquals("ide1", mount.controller)
+		assertEquals(-129, mount.bootPriority)
+		assertEquals(1024, mount.highCyl)
+		assertEquals("1024/16/63", mount.physicalGeometry)
+		assertEquals("disk.geo", mount.geometry)
+		assertTrue(mount.compactFlash)
+		assertEquals("ATA1", mount.featureLevel)
+		assertEquals("0x3", mount.flags)
+		assertTrue(mount.lock)
+		assertTrue(mount.identity)
 	}
 
 	@Test
-	fun `parse preserves hardfile2 with device name and filesystem`() {
-		val file = writeConfig("hardfile2=rw,DH0:/hd/x.hdf,0,0,0,512,0,myfs,uae0")
-		val result = ConfigParser.parse(file)
+	fun `quoted file names keep their backslashes and the geometry file is unescaped`() {
+		// The native writer quotes a file name with a comma and leaves its
+		// backslashes alone; the geometry file has every backslash escaped.
+		val result = ConfigParser.parse(writeConfig(
+			"""hardfile2=rw,DH0:"C:\hd\a,b.hdf",32,1,2,512,0,"fs,dir\l\Fast",uae0,0,980/10/17,"C:\\geo\\disk.geo""""
+		))
+		val mount = result.settings.hardDrives.single()
 
-		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("hardfile2=") })
+		assertEquals("""C:\hd\a,b.hdf""", mount.path)
+		assertEquals("""fs,dir\l\Fast""", mount.filesystem)
+		assertEquals("""C:\geo\disk.geo""", mount.geometry)
 	}
 
 	@Test
-	fun `parse preserves hardfile2 with extra trailing fields`() {
-		// highcyl / physical geometry / flags appended after the controller.
-		val file = writeConfig("hardfile2=rw,:/hd/x.hdf,0,0,0,512,0,,uae0,1024,1024/16/63")
-		val result = ConfigParser.parse(file)
+	fun `unknown mount overrides remain verbatim`() {
+		val result = ConfigParser.parse(writeConfig("""
+			hardfile2=rw,DH0::physical:drive,0,0,0,512,0,,scsi0
+			uaehf0_bootpri=-1
+		""".trimIndent()))
 
-		assertTrue(result.settings.hardDrives.isEmpty())
-		assertTrue(result.unknownLines.any { it.startsWith("hardfile2=") })
+		assertEquals(2, result.unknownLines.size)
+	}
+
+	@Test
+	fun `the accelerator ROM checksum stays only while it alone names the ROM`() {
+		val named = ConfigParser.parse(tempDir.newFile("named.uae").apply { writeText("""
+			cpuboard_type=A2630
+			cpuboard_rom_file=/roms/a2630.rom
+			cpuboard_rom_file_id=12345678,A2630
+		""".trimIndent()) })
+		assertTrue(named.unknownLines.none { it.startsWith("cpuboard_rom_file_id=") })
+
+		val checksumOnly = ConfigParser.parse(tempDir.newFile("checksum.uae").apply { writeText("""
+			cpuboard_type=A2630
+			cpuboard_rom_file_id=12345678,A2630
+		""".trimIndent()) })
+		assertEquals(listOf("cpuboard_rom_file_id=12345678,A2630"), checksumOnly.unknownLines)
+
+		// A ROM picked afterwards replaces the checksum.
+		val picked = checksumOnly.settings.withOption("cpuboard_rom_file", "/roms/new.rom")
+		assertTrue(ConfigGenerator.preservedLines(picked, checksumOnly.unknownLines).isEmpty())
 	}
 }

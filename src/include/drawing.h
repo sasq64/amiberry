@@ -88,6 +88,9 @@ STATIC_INLINE int color_reg_get(struct color_entry *ce, int c)
 /* Functions in drawing.c.  */
 extern int coord_native_to_amiga_y(int);
 extern int coord_native_to_amiga_x(int);
+#ifdef AMIBERRY
+extern int coord_native_line_shift(void);
+#endif
 
 /* Determine how to draw a scan line.  */
 enum nln_how {
@@ -120,7 +123,7 @@ extern int get_custom_limits(int *pw, int *ph, int *pdx, int *pdy, int *prealh, 
 extern bool custom_limits_are_provisional(void);
 #endif
 extern void store_custom_limits(int w, int h, int dx, int dy);
-extern void set_custom_limits(int w, int h, int dx, int dy, bool blank);
+extern void set_custom_limits(int w, int h, int dx, int dy);
 extern void check_custom_limits(void);
 extern void get_custom_topedge(int *x, int *y, bool max);
 extern void get_custom_raw_limits(int *pw, int *ph, int *pdx, int *pdy);
@@ -185,11 +188,12 @@ struct linestate
 	int fetchmode_size, fetchstart_mask;
 	uae_u16 strobe;
 	int strobe_pos;
+	bool drawmode;
 };
 
 extern struct color_entry denise_colors;
 void draw_denise_line_queue(int gfx_ypos, nln_how how, uae_u32 linecnt, int startpos, int endpos, int startcycle, int endcycle, int skip_start, int skip_end, int dtotal,
-	int calib_start, int calib_len, bool lof, bool lol, int hdelay, bool blanked, bool borderline, bool finalseg, struct linestate *ls);
+	int calib_start, int calib_len, bool lol, int hdelay, bool blanked, uae_s8 borderline, bool finalseg, struct linestate *ls);
 void draw_denise_bitplane_line_fast(int gfx_ypos, enum nln_how how, struct linestate *ls);
 void draw_denise_bitplane_line_fast_queue(int gfx_ypos, enum nln_how how, struct linestate *ls);
 void draw_denise_border_line_fast(int gfx_ypos, bool blank, enum nln_how how, struct linestate *ls);
@@ -197,19 +201,20 @@ void draw_denise_border_line_fast_queue(int gfx_ypos, bool blank, enum nln_how h
 bool start_draw_denise(void);
 void end_draw_denise(void);
 void denise_reset(bool);
-bool denise_update_reg_queued(uae_u16 reg, uae_u16 v, uae_u32 linecnt);
+bool denise_update_reg_queued(uae_u16 reg, uae_u64 v, uae_u32 linecnt);
 void denise_store_registers(void);
 void denise_restore_registers(void);
 bool denise_is_vb(void);
 void draw_denise_vsync_queue(int);
 void draw_denise_line_queue_flush(void);
+void set_multithreaded_denise(bool enabled);
 void quick_denise_rga_queue(uae_u32 linecnt, int startpos, int endpos);
 void denise_handle_quick_strobe_queue(uae_u16 strobe, int strobe_pos, int endpos);
 bool drawing_can_lineoptimizations(void);
 void set_drawbuffer(void);
 int gethresolution(void);
 int getvresolution(void);
-void denise_update_reg_queue(uae_u16 reg, uae_u16 v, uae_u32 linecnt);
+void denise_update_reg_queue(uae_u16 reg, uae_u64 v, uae_u32 linecnt);
 void denise_store_restore_registers_queue(bool store, uae_u32 linecnt);
 void denise_clearbuffers(void);
 uae_u8 *get_row_genlock(int monid, int line);
@@ -218,4 +223,7 @@ bool denise_get_hboffsets(int *hbs, int *hbe, int *hblen, int *total);
 bool denise_get_hbstate(bool);
 void denise_set_hdiw(bool hdiw);
 bool denise_get_hdiw(void);
+void centering_reset(bool h, bool v);
+void get_filter_compatibility_offset(int *dx, int *dy, bool mode);
+
 #endif /* UAE_DRAWING_H */

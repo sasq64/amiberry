@@ -1,5 +1,7 @@
 package com.blitterstudio.amiberry.data
 
+import androidx.annotation.StringRes
+import com.blitterstudio.amiberry.R
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import org.json.JSONArray
 import org.json.JSONObject
@@ -8,10 +10,56 @@ import java.io.File
 object RecentLaunches {
 	const val MAX_ITEMS = 10
 
+	/** What kind of launch an entry repeats; [labelRes] names it for the user. */
+	enum class Type(@param:StringRes val labelRes: Int) {
+		QuickStart(R.string.recent_type_quick_start),
+		Configuration(R.string.recent_type_configuration),
+		WhdLoad(R.string.recent_type_whdload),
+		Rp9(R.string.recent_type_rp9),
+		/** A media file played in a saved machine; the entry's path names the machine. */
+		PlayIn(R.string.recent_type_playin),
+		Unknown(R.string.recent_type_unknown);
+
+		companion object {
+			fun of(entry: JSONObject): Type = when (entry.optString("type")) {
+				"quickstart" -> QuickStart
+				"config" -> Configuration
+				"whdload" -> WhdLoad
+				"rp9" -> Rp9
+				"playin" -> PlayIn
+				else -> Unknown
+			}
+		}
+	}
+
+	/** Whether an entry can be launched again, and if not, why. */
+	enum class Status {
+		Available,
+
+		/** A file the launch used (configuration, game, disk or CD image) is gone. */
+		MissingFiles,
+
+		/** The Quick Start model has no installed Kickstart ROM. */
+		ModelUnavailable
+	}
+
+	/**
+	 * What a Recent row shows: a title, the kind of launch, a short detail (file name or
+	 * model), never a full path, and when it was last launched (null for entries stored
+	 * before the launcher recorded it).
+	 */
 	data class Details(
 		val title: String,
-		val typeLabel: String,
-		val detail: String
+		val type: Type,
+		val detail: String,
+		val launchedAtMs: Long? = null
+	)
+
+	/** One row of the Recent list. */
+	data class Item(
+		val entry: JSONObject,
+		val details: Details,
+		val status: Status
 	)
 
 	fun parse(raw: String): List<JSONObject> {
@@ -29,116 +77,166 @@ object RecentLaunches {
 		return arr.toString()
 	}
 
-	fun add(entries: List<JSONObject>, entry: JSONObject, maxItems: Int = MAX_ITEMS): List<JSONObject> {
-		val entryString = entry.toString()
-		return (listOf(entry) + entries.filterNot { it.toString() == entryString }).take(maxItems)
+	/** [entry] first, launched at [nowMs], without its earlier launch. */
+	fun add(
+		entries: List<JSONObject>,
+		entry: JSONObject,
+		maxItems: Int = MAX_ITEMS,
+		nowMs: Long = System.currentTimeMillis()
+	): List<JSONObject> {
+		val stamped = JSONObject(entry.toString()).put(LAUNCHED_AT, nowMs)
+		val identity = identity(stamped)
+		return (listOf(stamped) + entries.filterNot { identity(it) == identity }).take(maxItems)
 	}
 
-	fun available(
+	/** [entries] without [entry] (in any model ID spelling it was stored with). */
+	fun remove(entries: List<JSONObject>, entry: JSONObject): List<JSONObject> {
+		val identity = identity(entry)
+		return entries.filterNot { identity(it) == identity }
+	}
+
+	/**
+	 * [entries] with launches of the configuration at [oldPath] pointing at [newPath] — a
+	 * Configuration played, or the machine a Play In played — so a renamed configuration
+	 * stays in Recent (and keeps replaying) instead of showing as gone.
+	 */
+	fun replaceConfigPath(entries: List<JSONObject>, oldPath: String, newPath: String): List<JSONObject> =
+		entries
+			.map { entry ->
+				if (entry.namesConfiguration(oldPath)) {
+					JSONObject(entry.toString()).put("path", newPath)
+				} else {
+					entry
+				}
+			}
+			.distinctBy { identity(it) }
+
+	/**
+	 * [entries] without launches of the configuration at [path] (a Configuration's own
+	 * launch, or a Play In's machine): one the user deleted in the app leaves Recent,
+	 * while files that vanish outside the app stay listed as missing.
+	 */
+	fun removeConfigPath(entries: List<JSONObject>, path: String): List<JSONObject> =
+		entries.filterNot { entry -> entry.namesConfiguration(path) }
+
+	/** Whether the entry's path names the configuration/machine at [path] (Configurations and Play Ins). */
+	private fun JSONObject.namesConfiguration(path: String): Boolean =
+		(Type.of(this) == Type.Configuration || Type.of(this) == Type.PlayIn) &&
+			ConfigFiles.sameConfigPath(optString("path"), path)
+
+	// The same launch whatever model ID spelling it was stored with ("A500"
+	// before the launcher used the emulator's presets, "a500" since) and
+	// whenever it was launched.
+	private fun identity(entry: JSONObject): String {
+		val launch = JSONObject(entry.toString()).apply { remove(LAUNCHED_AT) }
+		if (launch.optString("type") != "quickstart") return launch.toString()
+		val model = AmigaModel.find(launch.optString("model")) ?: return launch.toString()
+		return launch.put("model", model.cmdArg).toString()
+	}
+
+	/**
+	 * The rows to show, most recent first, up to [limit]. Entries that can no longer be
+	 * launched stay in the list with their [Status], so the user sees and removes them;
+	 * only entries of an unknown kind are left out.
+	 */
+	fun items(
 		entries: List<JSONObject>,
 		availableModels: Collection<AmigaModel>,
-		fileExists: (String) -> Boolean = { File(it).exists() }
-	): List<JSONObject> = entries.filter { isAvailable(it, availableModels, fileExists) }
+		fileExists: (String) -> Boolean = { File(it).exists() },
+		limit: Int = MAX_ITEMS
+	): List<Item> =
+		entries
+			.filter { Type.of(it) != Type.Unknown }
+			.take(limit)
+			.map { entry -> Item(entry, details(entry), status(entry, availableModels, fileExists)) }
 
-	fun pruneMissingFiles(
-		entries: List<JSONObject>,
-		fileExists: (String) -> Boolean = { File(it).exists() }
-	): List<JSONObject> = entries.filter { hasExistingFiles(it, fileExists) }
-
-	fun isAvailable(
+	fun status(
 		entry: JSONObject,
 		availableModels: Collection<AmigaModel>,
 		fileExists: (String) -> Boolean = { File(it).exists() }
-	): Boolean {
-		return when (entry.optString("type")) {
-			"config", "whdload", "rp9" -> {
+	): Status {
+		return when (Type.of(entry)) {
+			Type.Configuration, Type.WhdLoad, Type.Rp9 -> {
 				val path = entry.optString("path")
-				path.isNotBlank() && fileExists(path)
+				if (path.isNotBlank() && fileExists(path)) Status.Available else Status.MissingFiles
 			}
-			"quickstart" -> {
-				val model = AmigaModel.entries.firstOrNull { it.cmdArg == entry.optString("model") }
-				model in availableModels && MEDIA_KEYS.all { key ->
+			// The machine and every medium the launch inserted must still be there.
+			Type.PlayIn -> {
+				val machineThere = entry.optString("path").isNotBlank() && fileExists(entry.optString("path"))
+				val mediaThere = MEDIA_KEYS.all { key ->
+					entry.optString(key).isBlank() || fileExists(entry.optString(key))
+				}
+				if (machineThere && mediaThere) Status.Available else Status.MissingFiles
+			}
+			Type.QuickStart -> {
+				val mediaPresent = MEDIA_KEYS.all { key ->
 					val path = entry.optString(key)
 					path.isBlank() || fileExists(path)
 				}
+				val model = AmigaModel.find(entry.optString("model"))
+				when {
+					!mediaPresent -> Status.MissingFiles
+					model == null || model !in availableModels -> Status.ModelUnavailable
+					else -> Status.Available
+				}
 			}
-			else -> false
-		}
-	}
-
-	private fun hasExistingFiles(
-		entry: JSONObject,
-		fileExists: (String) -> Boolean
-	): Boolean {
-		return when (entry.optString("type")) {
-			"config", "whdload", "rp9" -> {
-				val path = entry.optString("path")
-				path.isNotBlank() && fileExists(path)
-			}
-			"quickstart" -> {
-				AmigaModel.entries.any { it.cmdArg == entry.optString("model") } &&
-					MEDIA_KEYS.all { key ->
-						val path = entry.optString(key)
-						path.isBlank() || fileExists(path)
-					}
-			}
-			else -> false
+			Type.Unknown -> Status.MissingFiles
 		}
 	}
 
 	fun label(entry: JSONObject): String {
-		return when (entry.optString("type")) {
-			"quickstart" -> {
-				val modelName = entry.optString("model", "?")
+		return when (Type.of(entry)) {
+			Type.QuickStart -> {
+				val modelName = modelName(entry)
 				val media = MEDIA_KEYS
 					.mapNotNull { key -> fileName(entry.optString(key)).takeIf { it.isNotBlank() } }
 					.joinToString(", ")
 					.takeIf { it.isNotBlank() }
 				if (media != null) "$modelName \u2014 $media" else modelName
 			}
-			"config" -> fileName(entry.optString("path")).removeSuffix(".uae").ifEmpty { "Config" }
-			"whdload" -> fileName(entry.optString("path"))
-				.removeSuffix(".lha")
-				.removeSuffix(".lzx")
-				.removeSuffix(".lzh")
+			Type.Configuration -> stripSuffixCaseInsensitive(fileName(entry.optString("path")), ".uae")
+				.ifEmpty { "Config" }
+			Type.WhdLoad -> ARCHIVE_SUFFIXES
+				.fold(fileName(entry.optString("path"))) { name, suffix -> stripSuffixCaseInsensitive(name, suffix) }
 				.ifEmpty { "WHDLoad" }
-			"rp9" -> stripSuffixCaseInsensitive(fileName(entry.optString("path")), ".rp9")
+			Type.Rp9 -> stripSuffixCaseInsensitive(fileName(entry.optString("path")), ".rp9")
 				.ifEmpty { "RP9" }
-			else -> "?"
+			// The media names the launch; the machine is the detail beside it.
+			Type.PlayIn -> MEDIA_KEYS
+				.mapNotNull { key -> fileName(entry.optString(key)).takeIf { it.isNotBlank() } }
+				.joinToString(", ")
+				.ifEmpty { "Machine" }
+			Type.Unknown -> "?"
 		}
 	}
 
 	fun details(entry: JSONObject): Details {
-		return when (entry.optString("type")) {
-			"quickstart" -> quickStartDetails(entry)
-			"config" -> Details(
+		val type = Type.of(entry)
+		val details = when (type) {
+			Type.QuickStart -> quickStartDetails(entry)
+			Type.Configuration, Type.Rp9 -> Details(
 				title = label(entry),
-				typeLabel = "Configuration",
-				detail = entry.optString("path")
+				type = type,
+				detail = fileName(entry.optString("path"))
 			)
-			"whdload" -> Details(
+			Type.WhdLoad -> Details(
+				title = WhdLoadTitles.clean(fileName(entry.optString("path"))).ifEmpty { "WHDLoad" },
+				type = type,
+				detail = fileName(entry.optString("path"))
+			)
+			Type.PlayIn -> Details(
 				title = label(entry),
-				typeLabel = "WHDLoad",
-				detail = entry.optString("path")
+				type = type,
+				detail = stripSuffixCaseInsensitive(fileName(entry.optString("path")), ".uae")
+					.ifEmpty { "Machine" }
 			)
-			"rp9" -> Details(
-				title = label(entry),
-				typeLabel = "RP9",
-				detail = entry.optString("path")
-			)
-			else -> Details(
-				title = "?",
-				typeLabel = "Unknown",
-				detail = ""
-			)
+			Type.Unknown -> Details(title = "?", type = type, detail = "")
 		}
+		return details.copy(launchedAtMs = entry.optLong(LAUNCHED_AT, 0L).takeIf { it > 0L })
 	}
 
-	fun sameEntries(left: List<JSONObject>, right: List<JSONObject>): Boolean =
-		left.size == right.size && left.zip(right).all { (a, b) -> a.toString() == b.toString() }
-
 	private fun quickStartDetails(entry: JSONObject): Details {
-		val modelName = entry.optString("model", "?")
+		val modelName = modelName(entry)
 		val mediaDetails = MEDIA_KEYS
 			.mapNotNull { key ->
 				val name = fileName(entry.optString(key)).takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -152,9 +250,14 @@ object RecentLaunches {
 		}
 		return Details(
 			title = firstMedia,
-			typeLabel = "Quick Start",
+			type = Type.QuickStart,
 			detail = detail
 		)
+	}
+
+	private fun modelName(entry: JSONObject): String {
+		val storedModel = entry.optString("model", "?")
+		return AmigaModel.find(storedModel)?.displayName ?: storedModel
 	}
 
 	private fun fileName(path: String): String =
@@ -164,4 +267,8 @@ object RecentLaunches {
 		if (value.endsWith(suffix, ignoreCase = true)) value.dropLast(suffix.length) else value
 
 	private val MEDIA_KEYS = listOf("df0", "df1", "cd")
+	private val ARCHIVE_SUFFIXES = listOf(".lha", ".lzx", ".lzh")
+
+	/** When the entry was last launched, epoch milliseconds. */
+	private const val LAUNCHED_AT = "time"
 }

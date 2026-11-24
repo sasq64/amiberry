@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           amiberry
-Version:        8.3.0
+Version:        8.6.0
 Release:        1%{?dist}
 Summary:        Optimized Amiga emulator for ARM64, AMD64 and RISC-V platforms
 
@@ -15,8 +15,9 @@ BuildRequires:  ninja-build
 BuildRequires:  gcc-c++
 BuildRequires:  flac-devel
 BuildRequires:  libmpeg2-devel
+BuildRequires:  ffmpeg-free-devel
+BuildRequires:  libwebp-devel
 BuildRequires:  libpng-devel
-BuildRequires:  SDL3-devel
 BuildRequires:  SDL3_image-devel
 BuildRequires:  alsa-lib-devel
 BuildRequires:  mpg123-devel
@@ -33,8 +34,8 @@ Requires:       libstdc++
 Requires:       SDL3
 Requires:       SDL3_image
 Requires:       flac
+Requires:       libwebp
 Requires:       mpg123
-Requires:       libpng
 Requires:       zlib
 Requires:       libcurl
 Requires:       zstd
@@ -88,6 +89,57 @@ fi
 %{_mandir}/man1/amiberry.1.gz
 
 %changelog
+* Mon Nov 16 2026 Dimitris Panokostas <midwan@gmail.com> - 8.6.0-1
+- Release v8.6.0
+- The CPU runs on its own thread on multi-core hosts for 68020-68060 configurations at the fastest speed
+- Exact 80-bit FPU core with ARM64 JIT support; A1200-accurate 68020 cycle-exact timing; FPU timing in cycle-exact mode
+- x86 bridgeboards and PC graphics chips use 86Box instead of PCem; image sharing through the clipboard
+- WinUAE and amitorture fixes for the CPU, MMU, FPU, JIT, chipset, Picasso96, sound boards, AHI, MIDI and bsdsocket
+- 32-bit hosts are no longer supported
+
+* Tue Oct 27 2026 Dimitris Panokostas <midwan@gmail.com> - 8.5.0-1
+- Release v8.5.0
+- WHDBooter: WHDLoad, JST, RTB files and the XPK, MMULib, explode and medplayer libraries are downloaded from their authors' sites; host-quit replaces AmiQuit
+- LhA archives read with Lhasa; LZX archives with a new decoder; an LZX archive in the ROMs folder no longer crashes the ROM scan
+- PearPC removed (PPC uses QEMU); DBus control removed in favour of IPC, with new SETTINGS_* commands
+- Fixed RTG Zorro II/III switch and Blizzard board crashes, a ZZ9000 slirp reboot hang and media/state hotkey requesters
+- Many configuration save/load fixes; third-party source archive published with each release
+
+* Mon Oct 19 2026 Dimitris Panokostas <midwan@gmail.com> - 8.4.2-1
+- Bugfix release v8.4.2
+- Linux AppImages for x86_64 and aarch64; Ubuntu 26.10 packages; install.sh stops on unpublished apt suites
+- Multithreaded CPU: restored JIT performance and fixed keyboard reset crashes and missed reset holds
+- WHDBooter: exact SHA1 matches win, outdated game databases are refreshed, and 68030/68040 CPU and cycle-exact settings from the database are applied
+- Fixed FPS adj. in the Display panel, Chipset Extra changes on hard reset, live .uaem toggle and Host Only cursor hotspot drift
+- IPC: Windows named pipe support, GDB monitor commands, no longer limited to one request per frame
+- ZZ9000: WebP, FLAC, Ogg Vorbis, WebM and MPEG-2 services
+- Merged WinUAE display, NTSC long field and GDB monitor updates; new Always stretch PAL as NTSC option
+- Android: device-shaped RTG modes, AAudio at 48 kHz with a configurable sound buffer, steady stick mouse speed
+
+* Wed Oct 14 2026 Dimitris Panokostas <midwan@gmail.com> - 8.4.1-1
+- Bugfix release v8.4.1
+- Libretro: save states load through the regular restore path, auto-loaded states apply after boot, left stick moves the mouse in Joystick As Mouse
+- Fixed buffer sizes truncating restored directory paths and saved strings such as hardfile geometry
+- Fixed Host Only cursor height on the right half of native screens and ROM folder handling with relative paths
+- Merged WinUAE fixes: MMU cache-inhibited pages, filesystem rename with open files, CIA TOD timing, A2024/Graffiti/genlock overscan
+- Added optional GDB remote debugging server
+- Packaging: MacPorts support on macOS, FreeBSD pkg release assets, libavcodec-extra alternatives in DEB dependencies
+- Build fixes for GLES-only and USE_PPC=OFF configurations; updated AROS ROMs
+
+* Sun Oct 11 2026 Dimitris Panokostas <midwan@gmail.com> - 8.4.0-1
+- Feature release v8.4.0
+- ZZ9000: AHI audio, SANA-II network, SDK mailbox/MHI audio, MPEGA streams, image/ZZPlay services, firmware 2.8 register ABI, direct VRAM mapping
+- Support for an external MiniGL renderer plugin (available separately) via uaelib trap 120, with dma-buf frame compositing; user plugin search locations
+- Custom cartridge ROM support, .A1000 ROMs, relative media paths, --dump-config CLI option, ipc_disable_logging option
+- RTG: dirty-tracking race/split-screen and direct JIT store fixes, hardware sprite on by default, warm reset fixes
+- JIT: ARM64 trap-block demotion by opcode class, register shift count fixes, JIT FPU setting respected, KMSDRM fault handler ordering
+- Performance: RPi4 zero-copy native frames and faster AGA line drawing, duty-cycled auto-crop scan
+- Graphics: runtime GL capability detection, KMSDRM GLES-first context ladder, autocrop and centering fixes
+- Networking: bsdsocket blocking/timeout fixes, SANA-II receive/multicast fixes, uaenet MTU/MAC and macOS BPF fixes
+- Libretro: on-screen keyboard, zip/7z disk control, HDF without RDB, Windows CHD fix, core info generation
+- Android: launcher/touch/TV fixes, controller OSK toggle, analog stick mouse, ChromeOS desktop improvements
+- Merged latest WinUAE and ImGui updates; FreeBSD amd64/aarch64 CI; updated AROS ROMs
+
 * Wed Aug 05 2026 Dimitris Panokostas <midwan@gmail.com> - 8.3.0-1
 - Feature release v8.3.0
 - Added ZZ9000 RTG emulation, RP9 package support, Global Settings panel, and configuration category grouping

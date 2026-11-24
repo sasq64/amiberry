@@ -60,6 +60,12 @@
 #endif
 #endif
 
+#if defined(__FreeBSD__) || defined(__HAIKU__)
+#define ftello64 ftello
+#define fseeko64 fseeko
+#define fopen64 fopen
+#endif
+
 #ifndef _WIN32
 
 #define __cdecl

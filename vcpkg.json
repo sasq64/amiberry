@@ -1,6 +1,6 @@
 {
   "name": "amiberry",
-  "version": "8.3.0",
+  "version": "8.6.0",
   "description": "Optimized Amiga emulator for various platforms",
   "homepage": "https://amiberry.com",
   "dependencies": [
@@ -11,6 +11,18 @@
         "png"
       ]
     },
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "platform": "!(windows & arm64)",
+      "features": [
+        "avcodec",
+        "avformat",
+        "swresample",
+        "swscale"
+      ]
+    },
+    "libwebp",
     "libflac",
     {
       "name": "mpg123",

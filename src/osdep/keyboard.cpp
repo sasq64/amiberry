@@ -1,4 +1,3 @@
-#include <cstring>
 #include <SDL3/SDL.h>
 
 #include "sysdeps.h"
@@ -10,7 +9,6 @@
 #include "clipboard.h"
 #include "uae.h"
 
-char keyboard_type = 0;
 static struct uae_input_device_kbr_default keytrans_amiga[] = {
 	
 	{ SDL_SCANCODE_ESCAPE, INPUTEVENT_KEY_ESC },

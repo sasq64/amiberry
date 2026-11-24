@@ -71,10 +71,6 @@ static MiscListItem misc_items[] = {
 	 "Add a 1 second delay when resetting the emulated Amiga",
 	 &changed_prefs.reset_delay, nullptr, 0, 0, MISC_NORMAL},
 
-	{"Faster RTG",
-	 "Speed up RTG (graphics card) operations by disabling custom chipset emulation",
-	 &changed_prefs.picasso96_nocustom, nullptr, 0, 0, MISC_NORMAL},
-
 	{"Clipboard sharing",
 	 "Share clipboard between Amiga and host system",
 	 &changed_prefs.clipboard_sharing, nullptr, 0, 0, MISC_NORMAL},
@@ -479,12 +475,17 @@ void render_panel_misc()
 			ImGui::PopID();
 		};
 
+		ImGui::TextDisabled("Hotkeys are saved with the configuration");
+		ShowHelpMarker("These hotkeys belong to the current configuration and are stored in its .uae file "
+			"when you save it. Defaults for Open GUI, Quit, Action Replay and Full-window are set in "
+			"Global Settings and stored in amiberry.conf.");
+
 		HotkeyRow("Open GUI:", changed_prefs.open_gui);
-		ShowHelpMarker("Keyboard shortcut to open the configuration GUI");
+		ShowHelpMarker("Keyboard shortcut to open the configuration GUI. F12 is used when empty");
 		HotkeyRow("Quit Key:", changed_prefs.quit_amiberry);
 		ShowHelpMarker("Keyboard shortcut to quit the emulator");
 		HotkeyRow("Action Replay:", changed_prefs.action_replay);
-		ShowHelpMarker("Keyboard shortcut to activate Action Replay cartridge");
+		ShowHelpMarker("Keyboard shortcut to activate Action Replay cartridge. Pause is used when empty");
 		HotkeyRow("Full-window:", changed_prefs.fullscreen_toggle);
 		ShowHelpMarker("Keyboard shortcut to toggle Windowed and Full-window modes");
 		HotkeyRow("Minimize:", changed_prefs.minimize);

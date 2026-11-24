@@ -8,7 +8,7 @@
  * This file is part of the ARAnyM project which builds a new and powerful
  * TOS/FreeMiNT compatible virtual machine running on almost any hardware.
  *
- * JIT compiler m68k -> IA-32 and AMD64
+ * JIT compiler m68k -> ARM64
  *
  * Original 68040 JIT compiler for UAE, copyright 2000-2002 Bernd Meyer
  * Adaptation for Basilisk II and improvements, copyright 2000-2004 Gwenole Beauchesne
@@ -36,14 +36,8 @@
 #include "newcpu.h"
 
 #ifdef UAE
-#ifdef CPU_64_BIT
 typedef uae_u64 uintptr;
 typedef uae_s64 intptr;
-#else
-typedef uae_u32 uintptr;
-#endif
-/* FIXME: cpummu.cpp also checks for USE_JIT, possibly others */
-#define USE_JIT
 #endif
 
 #define JITPTR (uintptr)
@@ -85,13 +79,8 @@ typedef union {
 #define MAXCYCLES (1000 * CYCLE_UNIT)
 
 #define BYTES_PER_INST 10240  /* paranoid ;-) */
-#if defined(CPU_arm)
 #define LONGEST_68K_INST 256 /* The number of bytes the longest possible
 			       68k instruction takes */
-#else
-#define LONGEST_68K_INST 16 /* The number of bytes the longest possible
-			       68k instruction takes */
-#endif
 #define MAX_CHECKSUM_LEN 2048 /* The maximum size we calculate checksums
 				 for. Anything larger will be flushed
 				 unconditionally even with SOFT_FLUSH */
@@ -116,13 +105,7 @@ typedef union {
 #define FLAG_ALL  (FLAG_C | FLAG_Z | FLAG_N | FLAG_V | FLAG_X)
 #define FLAG_ZNV  (FLAG_Z | FLAG_N | FLAG_V)
 
-#if defined(CPU_arm) && !defined(ARMV6T2) && !defined(CPU_AARCH64)
-#define USE_DATA_BUFFER
-#elif defined(CPU_AARCH64)
 #define N_REGS 18   /* really 32, but 29 to 31 are FP, LR, SP; 18 has special meaning; 27 holds memstart and 28 holds regs-struct */
-#else
-#define N_REGS 11  /* really 16, but 13 to 15 are SP, LR, PC; 11 holds memstart and 12 is scratch register */
-#endif
 
 #define N_FREGS 16  // We use 10 regs: 6 - FP_RESULT, 7 - SCRATCH, 8-15 - Amiga regs FP0-FP7
 
@@ -143,6 +126,28 @@ extern int check_for_cache_miss(void);
 
 /* JIT FPU compilation */
 extern void comp_fpp_opp (uae_u32 opcode, uae_u16 extra);
+/* A block with FPU instructions is compiled for the mode
+   (fpu_jit_fpcr_mode()) of the FPCR it is first entered with: inline host
+   code, inline code rounding to single precision, or calls into the FPU core.
+   Entered in another mode, it is recompiled; after FPU_JIT_FPCR_TRIPS such
+   recompiles it stays on the calls. */
+#define FPU_JIT_FPCR_TRIPS 4
+/* the block being compiled calls into the FPU core instead of inline code */
+extern bool jit_fpu_exact_block;
+/* the inline code of the block rounds results to single precision */
+extern bool jit_fpu_single_block;
+/* the block being compiled has host FPU code: it leaves its exceptions in the
+   host FPSR sticky flags, which the C functions the block calls must neither
+   see nor add to (regs.fpu_jit_host_fpsr) */
+extern bool jit_fpu_host_flags;
+/* the block being compiled has no host FPU code, but blocks that ran before
+   may have left their exceptions in the host FPSR (regs.fpu_jit_host_state) */
+extern bool jit_fpu_host_settle;
+/* The block being compiled leaves FPCR in the mode it was entered in: the
+   host FPSR stays live through an FPU block, and only the FPU core or the
+   interpreter can change FPCR in it, and they clear this. Its jumps to blocks
+   compiled for that mode may then enter past their FPU block entry. */
+extern bool jit_fpu_loop_ok;
 extern void comp_fbcc_opp (uae_u32 opcode);
 extern void comp_fscc_opp (uae_u32 opcode, uae_u16 extra);
 
@@ -283,10 +288,8 @@ typedef struct {
 /* What we expose to the outside */
 #define DECLARE_MIDFUNC(func) extern void func
 
-#if defined(CPU_arm)
 #include "compemu_midfunc_arm.h"
 #include "compemu_midfunc_arm2.h"
-#endif
 
 #undef DECLARE_MIDFUNC
 
@@ -364,6 +367,15 @@ typedef struct blockinfo_t {
   uae_u8 optlevel;
   uae_u8 needed_flags;
   uae_u8 status;
+  uae_u8 fpu_trips; /* FPCR guard trips (FPU_JIT_FPCR_TRIPS) */
+  /* FPU block entry mode (fpu_jit_fpcr_mode(), -1: any mode) */
+  uae_s8 fpu_mode;
+  /* the FPU JIT mode of FPCR when this block jumps to another, with the host
+     FPSR live (-1: any mode), or -2: not an FPU block, or it may change FPCR */
+  uae_s8 fpu_chain;
+  /* where jumps from blocks whose fpu_chain matches fpu_mode may enter, past
+     the FPU block entry, or NULL */
+  uae_u32* fpu_resume;
 
   dependency  dep[2];  /* Holds things we depend on */
   dependency* deplist; /* List of things that depend on this */
@@ -391,7 +403,6 @@ typedef fptype fpu_register;
 
 void jit_abort(const TCHAR *format,...);
 
-#ifdef CPU_64_BIT
 static inline uae_u32 check_uae_p32(uintptr address, const char* file, int line)
 {
 	if (address > (uintptr_t)0xffffffff) {
@@ -413,8 +424,5 @@ static inline uae_u32 check_uae_p32(uintptr address, const char* file, int line)
 	return (uae_u32)address;
 }
 #define uae_p32(x) (check_uae_p32((uintptr)(x), __FILE__, __LINE__))
-#else
-#define uae_p32(x) ((uae_u32)(x))
-#endif
 
 #endif /* COMPEMU_H */

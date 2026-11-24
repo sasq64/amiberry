@@ -1,5 +1,7 @@
 #pragma once
 
+#include "clipboard_host.h"
+
 // Returns true if mouse activation should be skipped when no SDL window exists.
 // Host always has a window, so this guard is unnecessary — return false.
 // Libretro returns true since it runs without an SDL window.
@@ -50,12 +52,6 @@ static inline bool osdep_platform_init_sdl()
 	SDL_SetHint(SDL_HINT_IME_IMPLEMENTED_UI, "1");
 
 #ifdef __ANDROID__
-	// OpenSL ES is more reliable than AAudio on older Android versions
-	// (SDL3 has improved AAudio support, but OpenSL ES remains a safe fallback)
-	SDL_SetHint("SDL_AUDIODRIVER", "openslES");
-#endif
-
-#ifdef __ANDROID__
 	// Trap the Android back button so SDL delivers it as SDL_SCANCODE_AC_BACK
 	// instead of letting the system handle it (which would exit/minimize the app)
 	SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
@@ -75,7 +71,6 @@ static inline void osdep_platform_init_ui()
 	normalcursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
 	if (!normalcursor)
 		normalcursor = SDL_GetDefaultCursor();
-	clipboard_init();
 }
 
 static inline void osdep_platform_sync_keyboard_leds()
@@ -108,11 +103,12 @@ static inline void osdep_platform_sync_keyboard_leds()
 
 static inline void osdep_platform_update_clipboard()
 {
-	auto* clipboard_uae = uae_clipboard_get_text();
-	if (clipboard_uae) {
-		SDL_SetClipboardText(clipboard_uae);
-		uae_clipboard_free_text(clipboard_uae);
-	}
+	clipboard_host_flush();
+}
+
+static inline void osdep_platform_clipboard_update(const SDL_ClipboardEvent& event)
+{
+	clipboard_host_update_event(event);
 }
 
 static inline void osdep_platform_call_real_main(int argc, char** argv)

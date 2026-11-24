@@ -25,8 +25,12 @@
 #include <SDL3/SDL.h>
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 #include "sounddep/sound.h"
+#ifdef VIDEOGRAB
+#include "videograb.h"
+#endif
 
 #ifdef LIBRETRO
 #include "libretro_shared.h"
@@ -90,6 +94,7 @@ static int num_sound_devices, num_record_devices;
 
 static struct sound_data sdpaula;
 static struct sound_data *sdp = &sdpaula;
+static bool volume_mute;
 
 static uae_u8 *extrasndbuf;
 static int extrasndbufsize;
@@ -355,15 +360,15 @@ static void clearbuffer_sdl(struct sound_data *sd)
 static void clearbuffer (struct sound_data *sd)
 {
 	const auto* s = sd->data;
-	if (sd->devicetype == SOUND_DEVICE_SDL2)
+	if (sd->devicetype == SOUND_DEVICE_SDL)
 		clearbuffer_sdl(sd);
 	else
 		std::memset(paula_sndbuffer, 0, sizeof paula_sndbuffer);
-	if (s->pullbuffer && (!s->stream || sd->devicetype != SOUND_DEVICE_SDL2)) {
-		if (sd->devicetype == SOUND_DEVICE_SDL2)
+	if (s->pullbuffer && (!s->stream || sd->devicetype != SOUND_DEVICE_SDL)) {
+		if (sd->devicetype == SOUND_DEVICE_SDL)
 			SDL_LockAudioStream(s->stream);
 		std::memset(s->pullbuffer, 0, s->pullbuffermaxlen);
-		if (sd->devicetype == SOUND_DEVICE_SDL2)
+		if (sd->devicetype == SOUND_DEVICE_SDL)
 			SDL_UnlockAudioStream(s->stream);
 	}
 }
@@ -416,7 +421,7 @@ static void close_audio_sdl(struct sound_data* sd)
 	s->stream = nullptr;
 }
 
-extern void setvolume_ahi (int);
+extern void setvolume_ahi (int mute);
 
 void set_volume_sound_device (struct sound_data *sd, int volume, int mute)
 {
@@ -425,7 +430,7 @@ void set_volume_sound_device (struct sound_data *sd, int volume, int mute)
 		return;
 	}
 
-	if (sd->devicetype == SOUND_DEVICE_SDL2) {
+	if (sd->devicetype == SOUND_DEVICE_SDL) {
 		sd->softvolume = -1;
 		if (volume < 100 && !mute) {
 			sd->softvolume = (int)((100.0f - volume) * 32768.0f / 100.0f);
@@ -439,9 +444,18 @@ void set_volume_sound_device (struct sound_data *sd, int volume, int mute)
 
 void set_volume(int volume, int mute)
 {
+	volume_mute = mute != 0;
 	set_volume_sound_device(sdp, volume, mute);
-	setvolume_ahi(volume);
+	setvolume_ahi(mute);
+#ifdef VIDEOGRAB
+	setmastervolumevideograb(volume, mute != 0);
+#endif
 	config_changed = 1;
+}
+
+bool sound_muted(void)
+{
+	return sdp->mute != 0 || volume_mute;
 }
 
 static void finish_sound_buffer_sdl_push(struct sound_data* sd, uae_u16* sndbuffer)
@@ -518,7 +532,7 @@ static int open_audio_sdl(struct sound_data* sd, int index)
 	const SDL_AudioDeviceID device_id = use_default_device
 		? SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK
 		: static_cast<SDL_AudioDeviceID>(sound_devices[index]->id);
-	sd->devicetype = SOUND_DEVICE_SDL2;
+	sd->devicetype = SOUND_DEVICE_SDL;
 	sd->sndbufsize = std::max(sd->sndbufsize, 0x80);
 	s->framesperbuffer = sd->sndbufsize;
 	s->sndbufsize = s->framesperbuffer;
@@ -791,7 +805,7 @@ bool audio_is_event_frame_possible(int)
 	const int type = sdp->devicetype;
 	if (sdp->paused || sdp->deactive || sdp->reset)
 		return false;
-	if (type == SOUND_DEVICE_SDL2)
+	if (type == SOUND_DEVICE_SDL)
 	{
 		sound_dp* s = sdp->data;
 		int bufsize = static_cast<int>(reinterpret_cast<uae_u8*>(paula_sndbufpt) - reinterpret_cast<uae_u8*>(paula_sndbuffer));
@@ -884,7 +898,7 @@ static void channelswap6(uae_s16* sndbuffer, int len)
 
 static bool send_sound_do(struct sound_data* sd)
 {
-	if (const int type = sd->devicetype; type == SOUND_DEVICE_SDL2) {
+	if (const int type = sd->devicetype; type == SOUND_DEVICE_SDL) {
 		finish_sound_buffer_pull(sd, paula_sndbuffer);
 		return true;
 	}
@@ -1031,7 +1045,7 @@ int enumerate_sound_devices()
 			sound_devices[i] = xcalloc(struct sound_device, 1);
 			sound_devices[i]->id = static_cast<int>(playback_devices[i]);
 			sound_devices[i]->cfgname = my_strdup(devname);
-			sound_devices[i]->type = SOUND_DEVICE_SDL2;
+			sound_devices[i]->type = SOUND_DEVICE_SDL;
 			sound_devices[i]->name = my_strdup(devname);
 			sound_devices[i]->alname = my_strdup(std::to_string(i).c_str());
 		}
@@ -1049,7 +1063,7 @@ int enumerate_sound_devices()
 			record_devices[i] = xcalloc(struct sound_device, 1);
 			record_devices[i]->id = static_cast<int>(recording_devices[i]);
 			record_devices[i]->cfgname = my_strdup(devname);
-			record_devices[i]->type = SOUND_DEVICE_SDL2;
+			record_devices[i]->type = SOUND_DEVICE_SDL;
 			record_devices[i]->name = my_strdup(devname);
 			record_devices[i]->alname = my_strdup(std::to_string(i).c_str());
 		}
@@ -1066,6 +1080,76 @@ int enumerate_sound_devices()
 		}
 	}
 	return num_sound_devices;
+}
+
+static void free_sound_device_table(struct sound_device** table)
+{
+	for (int i = 0; i < MAX_SOUND_DEVICES; i++) {
+		if (struct sound_device* sd = table[i]) {
+			xfree(sd->name);
+			xfree(sd->alname);
+			xfree(sd->cfgname);
+			xfree(sd->prefix);
+			xfree(sd);
+			table[i] = nullptr;
+		}
+	}
+}
+
+// The configured device's name, to find it again after the tables change.
+static std::string sound_device_cfgname(struct sound_device** table, int index)
+{
+	if (index < 0 || index >= MAX_SOUND_DEVICES || !table[index] || !table[index]->cfgname)
+		return {};
+	return table[index]->cfgname;
+}
+
+static int find_sound_device(struct sound_device** table, const std::string& cfgname)
+{
+	for (int i = 0; !cfgname.empty() && i < MAX_SOUND_DEVICES && table[i]; i++) {
+		if (table[i]->cfgname && cfgname == table[i]->cfgname)
+			return i;
+	}
+	return -1;
+}
+
+void refresh_sound_devices()
+{
+	// enumerate_sound_devices() only queries the host while the table is
+	// empty, so clear both tables (with their heap-owned strings) first. The
+	// open device keeps copies of the values it uses, not pointers into
+	// them. Configurations select devices by index, so the selected devices
+	// are found again by name: a device that disappeared ahead of the
+	// selected one would otherwise shift the selection to another device.
+	struct uae_prefs* const prefs[] = { &changed_prefs, &currprefs };
+	std::string playback[2], recording[2];
+	for (int k = 0; k < 2; k++) {
+		playback[k] = sound_device_cfgname(sound_devices, prefs[k]->soundcard);
+		recording[k] = sound_device_cfgname(record_devices, prefs[k]->samplersoundcard);
+	}
+	free_sound_device_table(sound_devices);
+	free_sound_device_table(record_devices);
+	num_sound_devices = 0;
+	num_record_devices = 0;
+	enumerate_sound_devices();
+	bool playing_device_lost = false;
+	for (int k = 0; k < 2; k++) {
+		if (!playback[k].empty()) {
+			const int card = find_sound_device(sound_devices, playback[k]);
+			prefs[k]->soundcard = card >= 0 ? card : 0;
+			if (card < 0 && prefs[k] == &currprefs)
+				playing_device_lost = true;
+		}
+		if (!recording[k].empty())
+			prefs[k]->samplersoundcard = find_sound_device(record_devices, recording[k]);
+	}
+	// The stream is still attached to a device that is gone. Both
+	// configurations fall back to the first device, which the audio change
+	// check cannot see (the indices can be equal), so the stream is reset
+	// the way a lost device is: the reset path reopens it on currprefs'
+	// device.
+	if (playing_device_lost)
+		set_reset(sdp);
 }
 
 static int set_master_volume(int volume, int mute)

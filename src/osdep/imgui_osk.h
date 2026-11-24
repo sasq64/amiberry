@@ -8,6 +8,7 @@
 #define OSK_RIGHT  0x08
 #define OSK_BUTTON 0x10
 
+#ifndef AMIBERRY_NO_IMGUI
 // Initialize the on-screen keyboard. Call after imgui_overlay_init().
 void imgui_osk_init();
 
@@ -26,9 +27,28 @@ bool imgui_osk_is_active();
 // Returns true if the keyboard should be rendered this frame.
 bool imgui_osk_should_render();
 
-// Render the keyboard. Called between imgui_overlay_begin_frame/end_frame.
-// Geometry uses ImGui's logical display coordinates for HiDPI correctness.
+// Fraction (0..1) of a width x height window, measured up from the bottom,
+// that the presenter should keep the picture out of because the keyboard is
+// docked there. Non-zero only for the Android touch keyboard in a portrait
+// window, and it follows the slide animation; 0 everywhere else.
+float imgui_osk_bottom_inset_fraction(int width, int height);
+
+// Render the keyboard. Called between imgui_overlay_begin_frame/end_frame in
+// native builds. Libretro renders into a presentation-only surface copy so
+// emulation-owned pixels are never modified.
+// Rendering is read-only with respect to navigation state: it never advances
+// key focus or repeat — that is imgui_osk_update()'s job.
 void imgui_osk_render();
+#ifdef LIBRETRO
+struct SDL_Surface;
+void imgui_osk_render(SDL_Surface* surface);
+#endif
+
+// Advance held-direction key repeat. Call once per frame on the main/input
+// thread, after pumping input events and alongside rendering: a stable
+// analog axis or D-pad produces no further events, so the repeat timers must
+// be polled there. Never call this from the render thread.
+void imgui_osk_update();
 
 // Process joystick/D-pad input for keyboard navigation.
 // state: bitmask of VKBD_UP/DOWN/LEFT/RIGHT/BUTTON
@@ -49,9 +69,43 @@ bool imgui_osk_hit_test(float screen_x, float screen_y);
 void imgui_osk_set_transparency(float alpha); // 0.0 = fully transparent, 1.0 = opaque
 void imgui_osk_set_language(const char* lang); // "US", "UK", "DE", "FR"
 void imgui_osk_set_numpad(bool enabled);
+#else
+// Built without ImGui (the native Apple apps, whose on-screen keyboard is
+// their own): no ImGui keyboard, never shown, consuming nothing.
+inline void imgui_osk_init() {}
+inline void imgui_osk_shutdown() {}
+inline void imgui_osk_toggle() {}
+inline void imgui_osk_hide() {}
+inline bool imgui_osk_is_active() { return false; }
+inline bool imgui_osk_should_render() { return false; }
+inline float imgui_osk_bottom_inset_fraction(int, int) { return 0.0f; }
+inline void imgui_osk_render() {}
+inline void imgui_osk_update() {}
+inline bool imgui_osk_process(int, int*, int*) { return false; }
+inline bool imgui_osk_handle_finger_down(float, float, int) { return false; }
+inline bool imgui_osk_handle_finger_up(float, float, int) { return false; }
+inline bool imgui_osk_handle_finger_motion(float, float, int) { return false; }
+inline bool imgui_osk_hit_test(float, float) { return false; }
+inline void imgui_osk_set_transparency(float) {}
+inline void imgui_osk_set_language(const char*) {}
+inline void imgui_osk_set_numpad(bool) {}
+#endif // AMIBERRY_NO_IMGUI
 
-// Direct gamepad control (called from SDL event handler).
+// Which input surface an osk_control() update originates from. The input
+// layer accumulates one state per source so the generic/core emulated
+// joystick path and direct SDL gamepad events stay independently tracked.
+enum class OskInputSource {
+	EmulatedJoystick, // generic joystick events from the core input path
+	Gamepad           // direct SDL gamepad events (D-pad, sticks, South)
+};
+
+// Direct gamepad control (called from the SDL event handler).
 // x/y: direction (-1,0,1). button: bit index. buttonstate: 0/1.
-void osk_control(int x, int y, int button, int buttonstate);
+// source: which input surface's accumulated state this update applies to
+// (cleared when the keyboard is inactive).
+void osk_control(int x, int y, int button, int buttonstate, OskInputSource source);
+
+// Clear session navigation and reconcile held gesture ownership with physical state.
+void osk_clear_controller_holds();
 
 #endif // IMGUI_OSK_H

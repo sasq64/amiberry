@@ -3,6 +3,8 @@ package com.blitterstudio.amiberry;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.KeyEvent;
 import android.view.WindowManager;
 import android.window.OnBackInvokedCallback;
@@ -10,6 +12,14 @@ import android.window.OnBackInvokedDispatcher;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import com.blitterstudio.amiberry.data.AndroidAutosave;
+import com.blitterstudio.amiberry.data.LaunchRequest;
+import com.blitterstudio.amiberry.overlay.EmulationHints;
+import com.blitterstudio.amiberry.overlay.OverlayHost;
+import com.blitterstudio.amiberry.overlay.OverlayNative;
+import com.blitterstudio.amiberry.overlay.RemoteJoystick;
+import com.blitterstudio.amiberry.overlay.RemoteJoystickHost;
+import com.blitterstudio.amiberry.ui.FocusUtilsKt;
 import org.libsdl.app.SDLActivity;
 
 /**
@@ -21,26 +31,210 @@ import org.libsdl.app.SDLActivity;
  * emulation display.
  *
  * Back-button handling: legacy Back and Android 13+ predictive Back both use
- * dispatchBackToSdl(), which synthesizes KEYCODE_BACK for SDL.  The native side
- * receives SDL_SCANCODE_AC_BACK, closes the on-screen keyboard first, then uses
- * Back as the ImGui GUI shortcut.
+ * dispatchBackToSdl().  While the in-game menu shows, Back is the menu's;
+ * otherwise it synthesizes KEYCODE_BACK for SDL.  The native side receives
+ * SDL_SCANCODE_AC_BACK, closes the on-screen keyboard first, then uses Back
+ * as the GUI shortcut, which opens the in-game menu (OverlayHost) over a
+ * running emulation.
+ *
+ * On a TV with no gamepad the remote's D-pad and OK are the port 2 joystick
+ * (RemoteJoystickHost).  As the emulation starts, a one-time hint says how
+ * to open the menu, and on such a TV what the remote does (EmulationHints).
  */
 public class AmiberryActivity extends SDLActivity {
+	// Messages from src/osdep/android_overlay.cpp (SDL_SendAndroidMessage).
+	private static final int COMMAND_SHOW_OVERLAY = COMMAND_USER + 1;
+	private static final int COMMAND_HIDE_OVERLAY = COMMAND_USER + 2;
+	private static final int COMMAND_MESSAGE = COMMAND_USER + 3;
+	private static final int COMMAND_SHOW_DIALOG = COMMAND_USER + 4;
+	private static final int COMMAND_HIDE_DIALOG = COMMAND_USER + 5;
+	private static final int COMMAND_SHOW_KEYBOARD = COMMAND_USER + 6;
+	private static final int COMMAND_HIDE_KEYBOARD = COMMAND_USER + 7;
+	/** How long after the start the first hint shows. */
+	private static final long HINT_DELAY_MS = 2500;
+
 	private OnBackInvokedCallback backCallback;
+	private OverlayHost overlay;
+	private RemoteJoystickHost remote;
+	/** The emulation started (-G) and its first hint is due or shown. */
+	private boolean hintsReady;
+	/** An autosave is made at most once until the activity returns to the foreground. */
+	private boolean autosaveRequested;
+	/** SDL keeps emulation running while a multi-window activity is paused but visible. */
+	private boolean autosaveNeedsRefreshOnStop;
+	private String[] recoveryArgs;
+	private boolean returnToLauncher;
+	private final Handler hints = new Handler(Looper.getMainLooper());
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
+		prepareRecovery(savedInstanceState);
 		super.onCreate(savedInstanceState);
+		// Without its libraries SDLActivity shows an error and has no layout.
+		if (!mBrokenLibraries && mLayout != null) {
+			overlay = new OverlayHost(this, mLayout, mSurface);
+			overlay.onCreate(savedInstanceState);
+			remote = new RemoteJoystickHost(this, this::showHintIfNew);
+			remote.start();
+			if (startsEmulation()) {
+				// Once the emulation shows, not over the black start-up screen.
+				hints.postDelayed(() -> {
+					hintsReady = true;
+					showHintIfNew();
+				}, HINT_DELAY_MS);
+			}
+		}
+		if (returnToLauncher) {
+			startActivity(new Intent(this, com.blitterstudio.amiberry.ui.MainActivity.class)
+				.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+			finish();
+			return;
+		}
 		registerBackCallback();
 		enterImmersiveMode();
 	}
 
 	@Override
+	protected void onStart() {
+		super.onStart();
+		if (overlay != null) {
+			overlay.onStart();
+		}
+	}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		autosaveRequested = false;
+		autosaveNeedsRefreshOnStop = false;
+		if (overlay != null) {
+			overlay.onResume();
+		}
+	}
+
+	@Override
+	protected void onPause() {
+		autosaveNeedsRefreshOnStop |= isInMultiWindowMode();
+		saveAutosave(false);
+		if (overlay != null) {
+			overlay.onPause();
+		}
+		super.onPause();
+	}
+
+	@Override
+	protected void onStop() {
+		if (autosaveNeedsRefreshOnStop) {
+			// SDL pauses only here after a visible multi-window pause, so replace the
+			// earlier checkpoint with the last frame before that pause.
+			saveAutosave(true);
+		}
+		if (overlay != null) {
+			overlay.onStop();
+		}
+		super.onStop();
+	}
+
+	/**
+	 * SDLActivity pauses its native thread in super.onPause(). The native call therefore
+	 * happens first and waits for its bounded emulator-thread handoff to finish.
+	 */
+	private void saveAutosave(boolean refresh) {
+		if ((!refresh && autosaveRequested) || !startsEmulation()) {
+			return;
+		}
+		try {
+			String[] autosave = OverlayNative.autosave();
+			if (autosave != null && autosave.length >= 2) {
+				AndroidAutosave.INSTANCE.record(
+					this, autosave[0], autosave[1], getArguments(),
+					java.util.Arrays.copyOfRange(autosave, 2, autosave.length)
+				);
+				autosaveRequested = true;
+			}
+		} catch (LinkageError | RuntimeException ignored) {
+			// The session marker still records an interrupted emulator when saving fails.
+		}
+	}
+
+	@Override
+	protected void onSaveInstanceState(Bundle outState) {
+		super.onSaveInstanceState(outState);
+		if (overlay != null) {
+			overlay.onSaveInstanceState(outState);
+		}
+	}
+
+	@Override
 	public void onWindowFocusChanged(boolean hasFocus) {
+		if (!hasFocus) {
+			// SDLActivity may pause native from its focus callback before onPause.
+			autosaveNeedsRefreshOnStop |= isInMultiWindowMode();
+			saveAutosave(false);
+		}
 		super.onWindowFocusChanged(hasFocus);
 		if (hasFocus) {
+			autosaveRequested = false;
+			autosaveNeedsRefreshOnStop = false;
 			enterImmersiveMode();
 		}
+		if (overlay != null) {
+			overlay.onWindowFocusChanged(hasFocus);
+		}
+	}
+
+	@Override
+	public boolean dispatchKeyEvent(KeyEvent event) {
+		// A remote key's release goes where its press went, even if the menu
+		// opened meanwhile, so the joystick never stays held.
+		if (remote != null && event.getAction() == KeyEvent.ACTION_UP && remote.onKeyEvent(event)) {
+			return true;
+		}
+		if (overlay != null && overlay.isShowing()) {
+			if (overlay.onKeyEvent(event)) {
+				return true;
+			}
+		} else if (remote != null && remote.onKeyEvent(event)) {
+			return true;
+		}
+		return super.dispatchKeyEvent(event);
+	}
+
+	@Override
+	protected boolean onUnhandledMessage(int command, Object param) {
+		if (overlay == null) {
+			return super.onUnhandledMessage(command, param);
+		}
+		if (command == COMMAND_SHOW_OVERLAY) {
+			// The param is the page a media or state hotkey asked for (-1: Home).
+			overlay.show(param instanceof Integer ? (Integer) param : -1);
+			return true;
+		}
+		if (command == COMMAND_HIDE_OVERLAY) {
+			overlay.hide();
+			return true;
+		}
+		if (command == COMMAND_MESSAGE) {
+			overlay.showMessages();
+			return true;
+		}
+		if (command == COMMAND_SHOW_DIALOG) {
+			overlay.showRecoveryDialog();
+			return true;
+		}
+		if (command == COMMAND_HIDE_DIALOG) {
+			overlay.hideDialog();
+			return true;
+		}
+		if (command == COMMAND_SHOW_KEYBOARD) {
+			overlay.showKeyboard();
+			return true;
+		}
+		if (command == COMMAND_HIDE_KEYBOARD) {
+			overlay.hideKeyboard();
+			return true;
+		}
+		return super.onUnhandledMessage(command, param);
 	}
 
 	@Override
@@ -59,8 +253,30 @@ public class AmiberryActivity extends SDLActivity {
 		};
 	}
 
+	/**
+	 * Recents may recreate this activity after its dedicated SDL process died. Its
+	 * intent still carries the old launch arguments, so replace them before SDLActivity
+	 * starts native code rather than overwriting the session with a cold boot.
+	 */
+	private void prepareRecovery(Bundle savedInstanceState) {
+		Intent intent = getIntent();
+		if (savedInstanceState == null || intent == null || intent.getStringArrayExtra("SDL_ARGS") == null) {
+			return;
+		}
+		AndroidAutosave.Session session = AndroidAutosave.INSTANCE.load(this);
+		if (session == null) {
+			returnToLauncher = true;
+			return;
+		}
+		recoveryArgs = new LaunchRequest.Autosave(
+			session.getStateFile().getAbsolutePath(), session.getLaunchArgs()).toArgs();
+	}
+
 	@Override
 	protected String[] getArguments() {
+		if (recoveryArgs != null) {
+			return recoveryArgs;
+		}
 		Intent intent = getIntent();
 		if (intent != null) {
 			String[] args = intent.getStringArrayExtra("SDL_ARGS");
@@ -76,6 +292,13 @@ public class AmiberryActivity extends SDLActivity {
 	protected void onDestroy() {
 		final boolean finishing = isFinishing();
 		unregisterBackCallback();
+		hints.removeCallbacksAndMessages(null);
+		if (remote != null) {
+			remote.stop();
+		}
+		if (overlay != null) {
+			overlay.onDestroy();
+		}
 		// Note: SDL3's SDLActivity calls System.exit(0) after native
 		// main() returns, which kills the process without reaching
 		// onDestroy().  Clean-exit markers are therefore written from
@@ -123,7 +346,22 @@ public class AmiberryActivity extends SDLActivity {
 		backCallback = null;
 	}
 
+	/** -G: the launcher always starts the emulation; without it (a direct start) the menu shows first. */
+	private boolean startsEmulation() {
+		return java.util.Arrays.asList(getArguments()).contains("-G");
+	}
+
+	private void showHintIfNew() {
+		if (hintsReady && !isFinishing()) {
+			EmulationHints.INSTANCE.showIfNew(this, RemoteJoystick.INSTANCE.isActive(), FocusUtilsKt.isTvDevice(this));
+		}
+	}
+
 	private void dispatchBackToSdl() {
+		// The in-game menu shows over a paused emulation: Back is its own.
+		if (overlay != null && overlay.handleBack()) {
+			return;
+		}
 		SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_BACK);
 		SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_BACK);
 	}

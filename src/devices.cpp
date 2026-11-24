@@ -1,16 +1,16 @@
 #include "sysconfig.h"
 #include "sysdeps.h"
+#include "gdb_server.h"
 
 #include "devices.h"
 
 #include "options.h"
+#include "rtc.h"
 #include "uae.h"
 #include "threaddep/thread.h"
 #include "memory.h"
 #include "audio.h"
-#ifdef WITH_THREADED_CPU
 #include "cpu_thread.h"
-#endif
 #ifdef GFXBOARD
 #include "gfxboard.h"
 #endif
@@ -68,7 +68,7 @@
 #endif
 #include "ethernet.h"
 #include "drawing.h"
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 #include "videograb.h"
 #endif
 #ifdef AHI
@@ -87,6 +87,9 @@
 #include "dsp3210/dsp_glue.h"
 #endif
 #include "keyboard_mcu.h"
+#ifdef AMIBERRY
+#include "service_transport.h"
+#endif
 
 #define MAX_DEVICE_ITEMS 64
 
@@ -237,12 +240,20 @@ void devices_reset_ext(int hardreset)
 
 void devices_reset(int hardreset)
 {
+	rtc_rebase();
+	gdb_server_reset();
 	memset(device_reset_done, 0, sizeof(device_reset_done));
 #ifdef AMIBERRY
 	uaelib_host_cleanup();
 #endif
 	// must be first
 	init_eventtab();
+#ifdef AMIBERRY
+	// The boards this reset brings in (expamem_reset() copies them in
+	// anyway): init_shm() and its autoconfig scans must lay memory out for
+	// them, not for the running ones.
+	expamem_bring_in_boards();
+#endif
 	init_shm();
 
 #ifdef GFXBOARD
@@ -273,6 +284,11 @@ void devices_reset(int hardreset)
 #endif
 	ethernet_reset();
 	reset_traps();
+#ifdef AMIBERRY
+	// Only now: reset_traps() has drained the trap workers and their queues,
+	// so no plugin dispatch from before the reset can still run.
+	service_transport_reset();
+#endif
 #ifdef FILESYS
 	filesys_prepare_reset();
 	filesys_reset();
@@ -334,6 +350,7 @@ void devices_hsync(void)
 {
 	DISK_hsync();
 	audio_hsync();
+	blitter_hsync();
 
 	decide_blitter(-1);
 #ifdef AHI
@@ -388,6 +405,7 @@ void devices_update_sync(float svpos, float syncadjust)
 
 void virtualdevice_free(void)
 {
+	gdb_server_close();
 #ifdef AMIBERRY
 	uaelib_host_cleanup();
 #endif
@@ -399,6 +417,9 @@ void virtualdevice_free(void)
 	execute_device_items(device_leaves_early, device_leave_early_cnt);
 
 	reset_traps();
+#ifdef AMIBERRY
+	service_transport_reset();
+#endif
 	free_traps();
 #ifdef FILESYS
 	filesys_cleanup();
@@ -425,13 +446,13 @@ void virtualdevice_free(void)
 #endif
 	savestate_free();
 	memory_cleanup();
+	rtarea_free();
 	free_shm();
 	cfgfile_addcfgparam(0);
 #ifdef DRIVESOUND
 	driveclick_free();
 #endif
 	ethernet_enumerate_free();
-	rtarea_free();
 	drawing_free();
 #ifdef WITH_DRACO
 	draco_free();
@@ -444,12 +465,10 @@ void virtualdevice_free(void)
 
 void do_leave_program (void)
 {
-#ifdef WITH_THREADED_CPU
 	// Print CPU thread diagnostics before cleanup
-	if (currprefs.cpu_thread && cpu_thread_diag.enable_diagnostics) {
+	if (cpu_thread_diag_enabled()) {
 		cpu_thread_diag_print_stats();
 	}
-#endif
 
 	virtualdevice_free();
 	graphics_leave();
@@ -473,6 +492,18 @@ void virtualdevice_init (void)
 	if (!thread_sema) {
 		uae_sem_init(&thread_sema, 0, 1);
 	}
+
+	// bsdsocket.library, uaenet.device and uaeserial.device live in the UAE
+	// Boot ROM rebuilt below: their install, the boot ROM placement and the
+	// resident scan read these currprefs flags, so the settings take effect
+	// here and nowhere else. A configuration loaded while emulating reaches
+	// changed_prefs only, and a hard reset does not copy them (#2709).
+	// fixup_prefs() rule: no bsdsocket.library with the indirect boot ROM,
+	// which only a restart changes. uaescsi.device keeps the running
+	// setting: blkdev picked the host CD backends by it.
+	currprefs.socket_emu = changed_prefs.socket_emu && currprefs.uaeboard < 3;
+	currprefs.sana2 = changed_prefs.sana2;
+	currprefs.uaeserial = changed_prefs.uaeserial;
 
 	reset_device_items();
 
@@ -524,8 +555,10 @@ void virtualdevice_init (void)
 
 void devices_restore_start(void)
 {
+	rtc_rebase();
 	restore_audio_start();
 	restore_cia_start();
+	restore_rtc_start();
 	restore_blkdev_start();
 	restore_custom_start();
 	changed_prefs.bogomem.size = 0;
@@ -558,7 +591,7 @@ void devices_pause(void)
 #ifdef RETROPLATFORM
 	rp_pause(1);
 #endif
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 	pausevideograb(1);
 #endif
 	ethernet_pause(1);
@@ -566,6 +599,7 @@ void devices_pause(void)
 
 void devices_unpause(void)
 {
+	rtc_rebase();
 	blkdev_exitgui();
 #ifdef RETROPLATFORM
 	rp_pause(0);
@@ -576,7 +610,7 @@ void devices_unpause(void)
 #ifdef WITH_DSP
 	dsp_pause(0);
 #endif
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 	pausevideograb(0);
 #endif
 	ethernet_pause(0);

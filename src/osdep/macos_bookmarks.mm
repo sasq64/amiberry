@@ -1,6 +1,10 @@
 #ifdef MACOS_APP_STORE
 
 #import <Foundation/Foundation.h>
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -160,6 +164,15 @@ static bool resolve_bookmark(NSString* key, NSData* data)
 	return true;
 }
 
+// The path's one spelling, so a bookmark is found however a caller names
+// the path: a panel can say /tmp where the emulator says /private/tmp.
+// Unchanged when the path does not exist.
+static std::string canonical_path(const std::string& path)
+{
+	char resolved[PATH_MAX];
+	return realpath(path.c_str(), resolved) ? std::string(resolved) : path;
+}
+
 // Normalize a path to a directory (if it's a file, use parent)
 static std::string normalize_to_directory(const std::string& path)
 {
@@ -278,10 +291,100 @@ void macos_bookmarks_shutdown()
 	}
 }
 
-bool macos_bookmark_store(const std::string& path)
+// Whether an active bookmark covers the path: it is the bookmarked file or
+// folder, or inside the folder. Called with s_mutex held.
+static bool is_accessible_locked(NSString* nsPath)
 {
-	if (path.empty())
+	if (!s_active_urls)
 		return false;
+	for (NSString* key in s_active_urls)
+	{
+		// A path prefix, not just a string prefix.
+		if ([nsPath hasPrefix:key]
+			&& ([nsPath length] == [key length] || [nsPath characterAtIndex:[key length]] == '/'))
+			return true;
+	}
+	return false;
+}
+
+// Creates, starts and saves a security-scoped bookmark of the file or
+// folder at key. False, with the store (and its file) as it was, when the
+// process cannot reach it or the bookmark cannot be saved. Called with
+// s_mutex held.
+static bool store_bookmark_locked(NSString* key, BOOL is_directory)
+{
+	// Already bookmarked and active: nothing to do.
+	if (s_active_urls[key] != nil)
+		return true;
+
+	NSURL* url = [NSURL fileURLWithPath:key isDirectory:is_directory];
+	if (!url)
+	{
+		write_log("Security bookmarks: invalid path '%s'\n", [key UTF8String]);
+		return false;
+	}
+
+	NSError* error = nil;
+	NSData* data = [url bookmarkDataWithOptions:NSURLBookmarkCreationWithSecurityScope
+		includingResourceValuesForKeys:nil
+		relativeToURL:nil
+		error:&error];
+
+	if (error || !data)
+	{
+		write_log("Security bookmarks: failed to create bookmark for '%s': %s\n",
+			[key UTF8String],
+			error ? [[error localizedDescription] UTF8String] : "nil data");
+		return false;
+	}
+
+	// Start access through the bookmark itself, as a restart will: the
+	// security scope belongs to the URL the bookmark resolves to. A path
+	// this process cannot use is not kept. Done before anything is stored,
+	// so a failure leaves the store (and its file) as it was.
+	BOOL stale = NO;
+	NSError* resolve_error = nil;
+	NSURL* scoped = [NSURL URLByResolvingBookmarkData:data
+		options:NSURLBookmarkResolutionWithSecurityScope
+		relativeToURL:nil
+		bookmarkDataIsStale:&stale
+		error:&resolve_error];
+	if (!scoped || ![scoped startAccessingSecurityScopedResource])
+	{
+		write_log("Security bookmarks: startAccess failed for new bookmark '%s'\n", [key UTF8String]);
+		return false;
+	}
+
+	// A bookmark this call replaces (stored, but not active: it did not
+	// resolve at startup) is put back when it cannot be saved. Copied,
+	// not referenced: replacing it releases the dictionary's reference.
+	NSData* stored = s_bookmark_data[key];
+	NSData* previous = stored ? [NSData dataWithData:stored] : nil;
+	s_bookmark_data[key] = data;
+	// A bookmark that is not on disk is gone after a restart: callers
+	// must not keep a path they could not reopen then. The file is
+	// written atomically, so a failed write leaves it as it was.
+	if (!save_bookmarks_plist())
+	{
+		write_log("Security bookmarks: could not save the bookmark for '%s'\n", [key UTF8String]);
+		[scoped stopAccessingSecurityScopedResource];
+		if (previous)
+			s_bookmark_data[key] = previous;
+		else
+			[s_bookmark_data removeObjectForKey:key];
+		return false;
+	}
+	s_active_urls[key] = scoped;
+
+	write_log("Security bookmarks: stored bookmark for '%s'\n", [key UTF8String]);
+	return true;
+}
+
+bool macos_bookmark_store(const std::string& requested)
+{
+	if (requested.empty())
+		return false;
+	const std::string path = canonical_path(requested);
 
 	@autoreleasepool
 	{
@@ -296,50 +399,24 @@ bool macos_bookmark_store(const std::string& path)
 		std::string dir_path = normalize_to_directory(path);
 		if (dir_path.empty())
 			return false;
+		NSString* dir_key = [NSString stringWithUTF8String:dir_path.c_str()];
+		NSString* ns_path = [NSString stringWithUTF8String:path.c_str()];
+		BOOL is_directory = NO;
+		const bool is_file = [[NSFileManager defaultManager] fileExistsAtPath:ns_path isDirectory:&is_directory]
+			&& !is_directory;
+		if (!is_file)
+			return store_bookmark_locked(dir_key, YES);
 
-		NSString* key = [NSString stringWithUTF8String:dir_path.c_str()];
-
-		// Already bookmarked and active — skip
-		if (s_active_urls[key] != nil)
+		// A file. Picking one grants the sandbox that file only, so its
+		// folder can be bookmarked only when the process already reaches
+		// it (a folder picked before, or the app's own); the folder is
+		// preferred, so files beside it (a CD's tracks) open too. Otherwise
+		// the file itself is bookmarked.
+		if (is_accessible_locked(ns_path))
 			return true;
-
-		NSURL* url = [NSURL fileURLWithPath:key isDirectory:YES];
-		if (!url)
-		{
-			write_log("Security bookmarks: invalid path '%s'\n", dir_path.c_str());
-			return false;
-		}
-
-		NSError* error = nil;
-		NSData* data = [url bookmarkDataWithOptions:NSURLBookmarkCreationWithSecurityScope
-			includingResourceValuesForKeys:nil
-			relativeToURL:nil
-			error:&error];
-
-		if (error || !data)
-		{
-			write_log("Security bookmarks: failed to create bookmark for '%s': %s\n",
-				dir_path.c_str(),
-				error ? [[error localizedDescription] UTF8String] : "nil data");
-			return false;
-		}
-
-		s_bookmark_data[key] = data;
-		save_bookmarks_plist();
-
-		// Start access immediately
-		if (![url startAccessingSecurityScopedResource])
-		{
-			write_log("Security bookmarks: startAccess failed for new bookmark '%s'\n",
-				dir_path.c_str());
-		}
-		else
-		{
-			s_active_urls[key] = url;
-		}
-
-		write_log("Security bookmarks: stored bookmark for '%s'\n", dir_path.c_str());
-		return true;
+		if (store_bookmark_locked(dir_key, YES))
+			return true;
+		return store_bookmark_locked(ns_path, NO);
 	}
 }
 
@@ -352,24 +429,7 @@ bool macos_bookmark_is_accessible(const std::string& path)
 	{
 		std::lock_guard<std::mutex> lock(s_mutex);
 
-		if (!s_active_urls)
-			return false;
-
-		NSString* nsPath = [NSString stringWithUTF8String:path.c_str()];
-
-		for (NSString* key in s_active_urls)
-		{
-			if ([nsPath hasPrefix:key])
-			{
-				// Ensure it's a proper path prefix (not just a string prefix)
-				if ([nsPath length] == [key length] ||
-					[nsPath characterAtIndex:[key length]] == '/')
-				{
-					return true;
-				}
-			}
-		}
-		return false;
+		return is_accessible_locked([NSString stringWithUTF8String:canonical_path(path).c_str()]);
 	}
 }
 
@@ -393,10 +453,67 @@ std::vector<std::string> macos_bookmarks_list()
 	return result;
 }
 
-void macos_bookmark_remove(const std::string& path)
+macos_bookmarks_state macos_bookmarks_save_state()
 {
-	if (path.empty())
+	macos_bookmarks_state state;
+	@autoreleasepool
+	{
+		std::lock_guard<std::mutex> lock(s_mutex);
+		if (!s_bookmark_data || !s_active_urls)
+			return state;
+		for (NSString* key in s_bookmark_data)
+		{
+			NSData* data = s_bookmark_data[key];
+			const auto* bytes = static_cast<const unsigned char*>(data.bytes);
+			state.data[[key UTF8String]].assign(bytes, bytes + data.length);
+		}
+		for (NSString* key in s_active_urls)
+			state.active.insert([key UTF8String]);
+	}
+	return state;
+}
+
+bool macos_bookmarks_restore(const macos_bookmarks_state& state)
+{
+	@autoreleasepool
+	{
+		std::lock_guard<std::mutex> lock(s_mutex);
+		if (!s_bookmark_data || !s_active_urls || !s_bookmarks_path)
+			return true;
+
+		// Compared as C strings, so nothing here allocates on the C++ side
+		// and the restore cannot stop halfway.
+		for (NSString* key in [s_active_urls allKeys])
+		{
+			const char* name = [key UTF8String];
+			const bool was_active = std::any_of(state.active.begin(), state.active.end(),
+				[name](const std::string& active) { return std::strcmp(active.c_str(), name) == 0; });
+			if (!was_active)
+			{
+				[s_active_urls[key] stopAccessingSecurityScopedResource];
+				[s_active_urls removeObjectForKey:key];
+			}
+		}
+		[s_bookmark_data removeAllObjects];
+		for (const auto& [path, bytes] : state.data)
+		{
+			NSString* key = [NSString stringWithUTF8String:path.c_str()];
+			s_bookmark_data[key] = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+		}
+		if (!save_bookmarks_plist())
+		{
+			write_log("Security bookmarks: could not save the restored bookmarks\n");
+			return false;
+		}
+		return true;
+	}
+}
+
+void macos_bookmark_remove(const std::string& requested)
+{
+	if (requested.empty())
 		return;
+	const std::string path = canonical_path(requested);
 
 	@autoreleasepool
 	{
@@ -405,7 +522,14 @@ void macos_bookmark_remove(const std::string& path)
 		if (!s_bookmark_data || !s_bookmarks_path)
 			return;
 
+		// The key macos_bookmark_store() used for the same path: the file's
+		// own when it was bookmarked alone, else its folder's.
 		NSString* key = [NSString stringWithUTF8String:path.c_str()];
+		if (!s_bookmark_data[key])
+		{
+			const std::string dir_path = normalize_to_directory(path);
+			key = [NSString stringWithUTF8String:dir_path.c_str()];
+		}
 
 		// Stop accessing if active
 		if (s_active_urls[key])
