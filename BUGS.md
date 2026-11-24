@@ -112,9 +112,10 @@ Fix: hoist the array to function scope so it outlives the branch.
 
 ---
 
-## 3. Non-cycle-exact blitter finished 512x too early — FIXED locally
+## 3. Non-cycle-exact blitter finished 512x too early — FIXED upstream
 
-**Status:** fixed in `src/blitter.cpp`; belongs upstream. Introduced by the
+**Status:** fixed upstream in 870287474 (WinUAE merge #2360), which scales
+by `CYCLE_UNIT` the same way; our local patch was dropped in that merge. Introduced by the
 WinUAE merge `552274b6`, which replaced `event2_newevent(ev2_blitter, n, 0)`
 (scales by `CYCLE_UNIT`) with `event2_newevent_xx(-1, n, 0, blitter_handler)`
 (raw `evt_t`) in three places. Every non-cycle-exact blit (anything with JIT)
@@ -150,4 +151,6 @@ never showed it.
 Cause: `get_line()` clears `xlinebuffer`, and when `gfx_ypos` is outside
 `vb->inheight` nothing sets it again, yet `buf1 = xlinebuffer` still runs and
 the line is drawn through null. The fix points it at the scratch row
-(`setxlinebuffer(0, -1)`) in that case. Worth sending upstream.
+(`setxlinebuffer(0, -1)`) in that case. Worth sending upstream. Upstream
+#2543 now only treats faults inside the live JIT cache as JIT faults, so the
+handler half is fixed there; the null write itself is not.
