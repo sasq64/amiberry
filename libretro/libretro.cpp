@@ -4,6 +4,7 @@
 #include "libretro_path_helpers.h"
 #include "amiberry_embed.h"
 #include "harddrive_emu.h"
+#include "harddrive_sound.h"
 #ifdef LIBRETRO
 #include "sdl_compat.h"
 #endif
@@ -736,6 +737,9 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_floppy_sound", "Floppy Drive Sound; disabled|enabled" },
 	{ "amiberry_floppy_sound_volume", "Floppy Drive Sound Volume (%); 67|0|10|20|30|40|50|60|70|80|90|100" },
 	{ "amiberry_hd_speed", "Hard Drive Speed (Directory Drives); off|fast|slow" },
+	{ "amiberry_hd_sound", "Hard Drive Sound; disabled|enabled" },
+	{ "amiberry_hd_sound_volume", "Hard Drive Sound Volume (%); 75|0|10|20|30|40|50|60|70|80|90|100" },
+	{ "amiberry_hd_idle_off", "Hard Drive Spin Down (Idle Seconds); off|2|5|10|20|30|60" },
 	{ "amiberry_video_standard", "Video Standard; auto|pal|ntsc" },
 	{ "amiberry_video_resolution", "Video Resolution; hires|auto|lores|superhires" },
 	{ "amiberry_video_vresolution", "Video Line Mode; double|auto|single" },
@@ -1270,6 +1274,63 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ "off", "Instant" },
 			{ "fast", "Fast (A1200 IDE)" },
 			{ "slow", "Slow (A590 SCSI)" },
+			{ NULL, NULL }
+		},
+		"off"
+	},
+	{
+		"amiberry_hd_sound",
+		"Hard Drive Sound",
+		"Hard Drive Sound",
+		"Play spindle and head seek sounds for directory drives. Needs a Hard Drive Speed and the samples in <system>/hdd_sounds/.",
+		NULL,
+		"system",
+		{
+			{ "disabled", NULL },
+			{ "enabled", NULL },
+			{ NULL, NULL }
+		},
+		"disabled"
+	},
+	{
+		"amiberry_hd_sound_volume",
+		"Hard Drive Sound Volume (%)",
+		"Hard Drive Sound Volume",
+		"Volume of the hard drive sounds.",
+		NULL,
+		"system",
+		{
+			{ "0", "0%" },
+			{ "10", "10%" },
+			{ "20", "20%" },
+			{ "30", "30%" },
+			{ "40", "40%" },
+			{ "50", "50%" },
+			{ "60", "60%" },
+			{ "70", "70%" },
+			{ "75", "75%" },
+			{ "80", "80%" },
+			{ "90", "90%" },
+			{ "100", "100%" },
+			{ NULL, NULL }
+		},
+		"75"
+	},
+	{
+		"amiberry_hd_idle_off",
+		"Hard Drive Spin Down (Idle Seconds)",
+		"Hard Drive Spin Down",
+		"Spin the drive down after this many seconds without loading, and up again on the next access.",
+		NULL,
+		"system",
+		{
+			{ "off", "Never" },
+			{ "2", "2 s" },
+			{ "5", "5 s" },
+			{ "10", "10 s" },
+			{ "20", "20 s" },
+			{ "30", "30 s" },
+			{ "60", "60 s" },
 			{ NULL, NULL }
 		},
 		"off"
@@ -3844,7 +3905,16 @@ static void snapshot_core_options()
 	cached_floppy_sound = floppy_snd && strcmp(floppy_snd, "enabled") == 0;
 	const char* floppy_vol = get_option_value("amiberry_floppy_sound_volume");
 	cached_floppy_sound_volume = floppy_vol ? std::clamp(atoi(floppy_vol), 0, 100) : 67;
-	hdemu_set_profile(get_option_value("amiberry_hd_speed"));
+	const char* hd_speed = get_option_value("amiberry_hd_speed");
+	hdemu_set_profile(hd_speed);
+	const char* hd_sound = get_option_value("amiberry_hd_sound");
+	const char* hd_vol = get_option_value("amiberry_hd_sound_volume");
+	hdsnd_set_volume((hd_vol ? std::clamp(atoi(hd_vol), 0, 100) : 75) / 25.0f);
+	const char* hd_idle = get_option_value("amiberry_hd_idle_off");
+	hdsnd_set_idle_off(hd_idle ? atof(hd_idle) : 0);
+	const bool hd_sound_on = hd_sound && strcmp(hd_sound, "enabled") == 0 && !system_dir.empty();
+	if (!hdsnd_configure(path_join(system_dir, "hdd_sounds").c_str(), hd_sound_on ? hd_speed : nullptr) && log_cb)
+		log_cb(RETRO_LOG_WARN, "Hard drive sound samples missing in %s\n", path_join(system_dir, "hdd_sounds").c_str());
 	const char* vid_std = get_option_value("amiberry_video_standard");
 	cached_video_standard = vid_std ? vid_std : "";
 	const char* vid_res = get_option_value("amiberry_video_resolution");
@@ -4093,8 +4163,10 @@ void libretro_audio_enqueue(const int16_t* stereo_frames, unsigned frames)
 {
 	if (!frames || !stereo_frames)
 		return;
+	const size_t start = libretro_audio_fifo.size();
 	libretro_audio_fifo.insert(libretro_audio_fifo.end(),
 		stereo_frames, stereo_frames + static_cast<size_t>(frames) * 2);
+	hdsnd_mix(libretro_audio_fifo.data() + start, frames, audio_rate_for_av_info());
 }
 
 void libretro_audio_reset(void)

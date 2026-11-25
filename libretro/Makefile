@@ -356,6 +356,7 @@ SOURCES_CORE := $(AMIBERRY_DIR)/src/a2065.cpp \
                $(AMIBERRY_DIR)/src/drawing.cpp \
                $(AMIBERRY_DIR)/src/driveclick.cpp \
                $(AMIBERRY_DIR)/src/harddrive_emu.cpp \
+               $(AMIBERRY_DIR)/src/harddrive_sound.cpp \
                $(AMIBERRY_DIR)/src/enforcer.cpp \
                $(AMIBERRY_DIR)/src/ethernet.cpp \
                $(AMIBERRY_DIR)/src/events.cpp \

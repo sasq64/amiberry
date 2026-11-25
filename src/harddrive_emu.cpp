@@ -38,6 +38,8 @@ constexpr Profile profiles[] = {
 constexpr int MAX_UNITS = 64;
 constexpr int CACHE_SIZE = 32;
 constexpr double BLOCK_BYTES = 512;
+constexpr int MAX_SEEKS = 64;
+constexpr int MAX_TRACK_STEPS = 16;
 
 struct Drive {
 	int cylinder;
@@ -55,6 +57,9 @@ double now_us;
 double frame_us = 20000;
 bool aborted;
 Drive drives[MAX_UNITS];
+bool spinning;
+double seeks[MAX_SEEKS];
+int seek_count;
 
 uint64_t hash_path(const char *path)
 {
@@ -90,9 +95,20 @@ int cylinder_of(uint64_t file, uint64_t pos)
 	return (int)((file + pos / profile->bytes_per_cylinder) % (uint64_t)profile->cylinders);
 }
 
+double start_of_next(const Drive &d)
+{
+	return std::max(d.busy_until, now_us);
+}
+
 void charge(Drive &d, double us)
 {
-	d.busy_until = std::max(d.busy_until, now_us) + us;
+	d.busy_until = start_of_next(d) + us;
+}
+
+void note_seek(double at_us)
+{
+	if (spinning && seek_count < MAX_SEEKS)
+		seeks[seek_count++] = at_us;
 }
 
 bool cache_hit(Drive &d, uint64_t h)
@@ -140,6 +156,14 @@ void hdemu_reset()
 	aborted = false;
 	now_us = 0;
 	memset(drives, 0, sizeof drives);
+	spinning = false;
+	seek_count = 0;
+}
+
+void hdemu_spinup()
+{
+	std::lock_guard<std::mutex> l(mutex);
+	spinning = true;
 }
 
 void hdemu_abort()
@@ -158,9 +182,16 @@ void hdemu_transfer(int unit, const char *path, uint64_t pos, uint64_t bytes)
 	const uint64_t file = hash_path(path);
 	const uint64_t first = pos / profile->bytes_per_cylinder;
 	const uint64_t last = (pos + bytes - 1) / profile->bytes_per_cylinder;
-	double us = profile->command_us + seek_to(*d, cylinder_of(file, pos));
+	double us = profile->command_us;
+	const double seek = seek_to(*d, cylinder_of(file, pos));
+	if (seek > 0)
+		note_seek(start_of_next(*d) + us);
+	us += seek;
 	if (file != d->last_file || pos != d->last_end)
 		us += half_revolution();
+	const double per_cylinder = profile->bytes_per_cylinder / profile->bytes_per_us + profile->track_to_track_us;
+	for (uint64_t c = 1; c <= std::min<uint64_t>(last - first, MAX_TRACK_STEPS); c++)
+		note_seek(start_of_next(*d) + us + c * per_cylinder);
 	us += bytes / profile->bytes_per_us;
 	us += (last - first) * profile->track_to_track_us;
 	d->cylinder = cylinder_of(file, pos + bytes - 1);
@@ -179,8 +210,10 @@ void hdemu_metadata(int unit, const char *path, bool cacheable)
 	if (cacheable && cache_hit(*d, h))
 		return;
 	d->last_file = 0;
-	charge(*d, profile->command_us + seek_to(*d, cylinder_of(h, 0))
-		+ half_revolution() + BLOCK_BYTES / profile->bytes_per_us);
+	const double seek = seek_to(*d, cylinder_of(h, 0));
+	if (seek > 0)
+		note_seek(start_of_next(*d) + profile->command_us);
+	charge(*d, profile->command_us + seek + half_revolution() + BLOCK_BYTES / profile->bytes_per_us);
 }
 
 void hdemu_wait(int unit)
@@ -213,4 +246,40 @@ double hdemu_pending_us(int unit)
 	std::lock_guard<std::mutex> l(mutex);
 	Drive *d = drive_for(unit);
 	return d ? std::max(0.0, d->busy_until - now_us) : 0;
+}
+
+double hdemu_busy_until_us()
+{
+	std::lock_guard<std::mutex> l(mutex);
+	double busy = 0;
+	for (const Drive &d : drives)
+		busy = std::max(busy, d.busy_until);
+	return busy;
+}
+
+double hdemu_now_us()
+{
+	std::lock_guard<std::mutex> l(mutex);
+	return now_us;
+}
+
+bool hdemu_spinning()
+{
+	std::lock_guard<std::mutex> l(mutex);
+	return spinning;
+}
+
+int hdemu_take_seeks(double until_us, double *out, int max)
+{
+	std::lock_guard<std::mutex> l(mutex);
+	int n = 0;
+	int kept = 0;
+	for (int i = 0; i < seek_count; i++) {
+		if (seeks[i] < until_us && n < max)
+			out[n++] = seeks[i];
+		else
+			seeks[kept++] = seeks[i];
+	}
+	seek_count = kept;
+	return n;
 }

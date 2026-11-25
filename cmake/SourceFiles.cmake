@@ -42,6 +42,7 @@ set(SOURCE_FILES
         src/drawing.cpp
         src/driveclick.cpp
         src/harddrive_emu.cpp
+        src/harddrive_sound.cpp
         src/enforcer.cpp
         src/ethernet.cpp
         src/events.cpp

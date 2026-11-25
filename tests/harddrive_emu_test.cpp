@@ -117,6 +117,27 @@ static void abort_releases_waiter()
 	hdemu_reset();
 }
 
+static void seeks_are_reported_while_spinning()
+{
+	hdemu_set_profile("fast");
+	hdemu_reset();
+	double seeks[64];
+	hdemu_metadata(0, "/a", false);
+	CHECK(hdemu_take_seeks(1e9, seeks, 64) == 0);
+	hdemu_spinup();
+	CHECK(hdemu_spinning());
+	hdemu_metadata(0, "/b", false);
+	hdemu_metadata(0, "/c", false);
+	CHECK(hdemu_take_seeks(0, seeks, 64) == 0);
+	CHECK(hdemu_take_seeks(1e9, seeks, 64) == 2);
+	CHECK(seeks[0] > 0 && seeks[1] > seeks[0]);
+	CHECK(hdemu_take_seeks(1e9, seeks, 64) == 0);
+	hdemu_transfer(0, "/c", 0, 1 << 20);
+	CHECK(hdemu_take_seeks(1e9, seeks, 64) == 7);
+	hdemu_reset();
+	CHECK(!hdemu_spinning());
+}
+
 int main()
 {
 	off_costs_nothing();
@@ -127,6 +148,7 @@ int main()
 	wait_follows_emulated_time();
 	activity_follows_busy_time();
 	abort_releases_waiter();
+	seeks_are_reported_while_spinning();
 	if (failures)
 		return 1;
 	std::puts("harddrive_emu: ok");

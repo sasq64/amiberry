@@ -7544,6 +7544,8 @@ void filesys_start_threads (void)
 		UnitInfo *ui = &mountinfo.ui[i];
 		if (ui->open <= 0)
 			continue;
+		if (is_virtual (i) && ui->unit_type != UNIT_CDFS)
+			hdemu_spinup();
 		filesys_start_thread (ui, i);
 	}
 }
