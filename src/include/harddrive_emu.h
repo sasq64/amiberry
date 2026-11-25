@@ -23,6 +23,8 @@ void hdemu_metadata(int unit, const char *path, bool cacheable);
 
 /* Filesystem thread: blocks until the drive has caught up with its work. */
 void hdemu_wait(int unit);
+/* Whether any drive was busy during the last frame; -1 before any work. */
+int hdemu_activity();
 /* Microseconds of queued work, for tests. */
 double hdemu_pending_us(int unit);
 

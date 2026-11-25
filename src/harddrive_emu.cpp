@@ -192,6 +192,22 @@ void hdemu_wait(int unit)
 	wake.wait(l, [d] { return aborted || !profile || d->busy_until <= now_us + frame_us; });
 }
 
+int hdemu_activity()
+{
+	std::lock_guard<std::mutex> l(mutex);
+	if (!profile)
+		return -1;
+	int activity = -1;
+	for (const Drive &d : drives) {
+		if (d.busy_until <= 0)
+			continue;
+		if (d.busy_until > now_us - frame_us)
+			return 1;
+		activity = 0;
+	}
+	return activity;
+}
+
 double hdemu_pending_us(int unit)
 {
 	std::lock_guard<std::mutex> l(mutex);

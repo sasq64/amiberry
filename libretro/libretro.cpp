@@ -588,8 +588,9 @@ static void update_led_interface()
 		}
 	}
 
-	if (gui_data.hd >= 0) {
-		led_state[RETRO_LED_HD] = gui_data.hd ? 1 : 0;
+	const int hd = hdemu_activity() >= 0 ? hdemu_activity() : gui_data.hd;
+	if (hd >= 0) {
+		led_state[RETRO_LED_HD] = hd ? 1 : 0;
 		if (!led_state[RETRO_LED_HDCDMD])
 			led_state[RETRO_LED_HDCDMD] = led_state[RETRO_LED_HD];
 	}

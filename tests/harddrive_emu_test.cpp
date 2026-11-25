@@ -89,6 +89,22 @@ static void wait_follows_emulated_time()
 	CHECK(hdemu_pending_us(0) <= 20000);
 }
 
+static void activity_follows_busy_time()
+{
+	hdemu_set_profile("fast");
+	hdemu_reset();
+	CHECK(hdemu_activity() == -1);
+	hdemu_transfer(0, "/a", 0, 4096);
+	CHECK(hdemu_activity() == 1);
+	hdemu_vsync(20000);
+	CHECK(hdemu_activity() == 1);
+	for (int i = 0; i < 5; i++)
+		hdemu_vsync(20000);
+	CHECK(hdemu_activity() == 0);
+	hdemu_set_profile("off");
+	CHECK(hdemu_activity() == -1);
+}
+
 static void abort_releases_waiter()
 {
 	hdemu_set_profile("slow");
@@ -109,6 +125,7 @@ int main()
 	interleaved_files_pay_for_seeks();
 	cached_metadata_is_free();
 	wait_follows_emulated_time();
+	activity_follows_busy_time();
 	abort_releases_waiter();
 	if (failures)
 		return 1;
