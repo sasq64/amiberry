@@ -65,6 +65,7 @@
 #ifdef RETROPLATFORM
 #include "rp.h"
 #endif
+#include "harddrive_emu.h"
 
 #define TRACING_ENABLED 1
 int log_filesys = 0;
@@ -7179,6 +7180,55 @@ end:
 	return 0;
 }
 
+static const TCHAR *hdemu_lock_path(TrapContext *ctx, Unit *unit, uae_u32 lock)
+{
+	if (!lock)
+		return unit->rootnode.nname;
+	a_inode *a = aino_from_lock(ctx, unit, lock << 2);
+	return a ? a->nname : NULL;
+}
+
+static void hdemu_packet(TrapContext *ctx, Unit *unit, dpacket *pck, uae_s32 type)
+{
+	if (unit->ui.unit_type == UNIT_CDFS || !hdemu_enabled())
+		return;
+	switch (type) {
+	case ACTION_READ:
+	case ACTION_WRITE: {
+		Key *k = lookup_key(unit, GET_PCK_ARG1(pck));
+		uae_s32 bytes = (uae_s32)GET_PCK_RES1(pck);
+		if (k && bytes > 0)
+			hdemu_transfer(unit->unit, k->aino->nname, k->file_pos - bytes, bytes);
+		break;
+	}
+	case ACTION_LOCATE_OBJECT: {
+		uae_u32 lock = GET_PCK_RES1(pck) ? GET_PCK_RES1(pck) : GET_PCK_ARG1(pck);
+		hdemu_metadata(unit->unit, hdemu_lock_path(ctx, unit, lock), true);
+		break;
+	}
+	case ACTION_FIND_INPUT:
+	case ACTION_FIND_OUTPUT:
+	case ACTION_FIND_WRITE:
+		hdemu_metadata(unit->unit, hdemu_lock_path(ctx, unit, GET_PCK_ARG2(pck)), true);
+		break;
+	case ACTION_EXAMINE_OBJECT:
+	case ACTION_PARENT:
+		hdemu_metadata(unit->unit, hdemu_lock_path(ctx, unit, GET_PCK_ARG1(pck)), true);
+		break;
+	case ACTION_EXAMINE_NEXT:
+	case ACTION_EXAMINE_NEXT64:
+	case ACTION_EXAMINE_ALL:
+	case ACTION_CREATE_DIR:
+	case ACTION_DELETE_OBJECT:
+	case ACTION_RENAME_OBJECT:
+	case ACTION_SET_PROTECT:
+	case ACTION_SET_COMMENT:
+	case ACTION_SET_DATE:
+		hdemu_metadata(unit->unit, hdemu_lock_path(ctx, unit, GET_PCK_ARG1(pck)), false);
+		break;
+	}
+}
+
 static int handle_packet(TrapContext *ctx, Unit *unit, dpacket *pck, uae_u32 msg, int isvolume)
 {
 	bool noidle = false;
@@ -7281,6 +7331,7 @@ static int handle_packet(TrapContext *ctx, Unit *unit, dpacket *pck, uae_u32 msg
 		write_log (_T("FILESYS: UNKNOWN PACKET %x\n"), type);
 		return 0;
 	}
+	hdemu_packet(ctx, unit, pck, type);
 	if (noidle) {
 		m68k_cancel_idle();
 	}
@@ -7342,6 +7393,7 @@ static int filesys_iteration(UnitInfo *ui)
 		PUT_PCK_RES1 (&packet, DOS_FALSE);
 		PUT_PCK_RES2 (&packet, ERROR_ACTION_NOT_KNOWN);
 	}
+	hdemu_wait(ui->self->unit);
 	writedpacket(ctx, &packet);
 
 	trapmd md2[] = {
@@ -7487,6 +7539,7 @@ void filesys_start_threads (void)
 	int i;
 
 	filesys_in_interrupt = 0;
+	hdemu_reset();
 	for (i = 0; i < MAX_FILESYSTEM_UNITS; i++) {
 		UnitInfo *ui = &mountinfo.ui[i];
 		if (ui->open <= 0)
@@ -7569,6 +7622,7 @@ static void filesys_prepare_reset2 (void)
 	int i;
 
 	uip = mountinfo.ui;
+	hdemu_abort();
 #ifdef UAE_FILESYS_THREADS
 	for (i = 0; i < MAX_FILESYSTEM_UNITS; i++) {
 		if (uip[i].open > 0 && uip[i].unit_pipe != 0) {
@@ -9432,6 +9486,7 @@ void filesys_vsync (void)
 	TrapContext *ctx = NULL;
 	Unit *u;
 
+	hdemu_vsync(vblank_hz > 0 ? 1e6 / vblank_hz : 0);
 	if (uae_boot_rom_type <= 0)
 		return;
 

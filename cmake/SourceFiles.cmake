@@ -41,6 +41,7 @@ set(SOURCE_FILES
         src/draco.cpp
         src/drawing.cpp
         src/driveclick.cpp
+        src/harddrive_emu.cpp
         src/enforcer.cpp
         src/ethernet.cpp
         src/events.cpp

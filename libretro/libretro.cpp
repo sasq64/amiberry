@@ -3,6 +3,7 @@
 #include "libretro_crop_helpers.h"
 #include "libretro_path_helpers.h"
 #include "amiberry_embed.h"
+#include "harddrive_emu.h"
 #ifdef LIBRETRO
 #include "sdl_compat.h"
 #endif
@@ -733,6 +734,7 @@ static const struct retro_variable variables[] = {
 	{ "amiberry_floppy_speed", "Floppy Speed; 0|100|200|400|800" },
 	{ "amiberry_floppy_sound", "Floppy Drive Sound; disabled|enabled" },
 	{ "amiberry_floppy_sound_volume", "Floppy Drive Sound Volume (%); 67|0|10|20|30|40|50|60|70|80|90|100" },
+	{ "amiberry_hd_speed", "Hard Drive Speed (Directory Drives); off|fast|slow" },
 	{ "amiberry_video_standard", "Video Standard; auto|pal|ntsc" },
 	{ "amiberry_video_resolution", "Video Resolution; hires|auto|lores|superhires" },
 	{ "amiberry_video_vresolution", "Video Line Mode; double|auto|single" },
@@ -1255,6 +1257,21 @@ static struct retro_core_option_v2_definition option_defs[] = {
 			{ NULL, NULL }
 		},
 		"67"
+	},
+	{
+		"amiberry_hd_speed",
+		"Hard Drive Speed (Directory Drives)",
+		"Hard Drive Speed",
+		"Delay directory drive accesses like a mechanical hard drive. 'fast' is an A1200 IDE drive, 'slow' an A590-era SCSI drive.",
+		NULL,
+		"system",
+		{
+			{ "off", "Instant" },
+			{ "fast", "Fast (A1200 IDE)" },
+			{ "slow", "Slow (A590 SCSI)" },
+			{ NULL, NULL }
+		},
+		"off"
 	},
 	{
 		"amiberry_video_standard",
@@ -3826,6 +3843,7 @@ static void snapshot_core_options()
 	cached_floppy_sound = floppy_snd && strcmp(floppy_snd, "enabled") == 0;
 	const char* floppy_vol = get_option_value("amiberry_floppy_sound_volume");
 	cached_floppy_sound_volume = floppy_vol ? std::clamp(atoi(floppy_vol), 0, 100) : 67;
+	hdemu_set_profile(get_option_value("amiberry_hd_speed"));
 	const char* vid_std = get_option_value("amiberry_video_standard");
 	cached_video_standard = vid_std ? vid_std : "";
 	const char* vid_res = get_option_value("amiberry_video_resolution");
