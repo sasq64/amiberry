@@ -1502,7 +1502,9 @@ static uae_u32 a_uniq, key_uniq;
 
 #define PUT_PCK_RES1(p,v) do { put_long_host((p)->packet_data + dp_Res1, ((uae_u32)v)); } while (0)
 #define PUT_PCK_RES2(p,v) do { put_long_host((p)->packet_data + dp_Res2, ((uae_u32)v)); } while (0)
-#define GET_PCK_TYPE(p) ((uae_s32)(get_long_host((p)->packet_data + dp_Type)))
+// Only the low word: the ROM filesystem ignores the upper one, and some
+// software (Psychedelic by Virtual Dreams) writes dp_Type with move.w.
+#define GET_PCK_TYPE(p) ((uae_s32)(uae_u16)(get_long_host((p)->packet_data + dp_Type)))
 #define GET_PCK_RES1(p) ((uae_s32)(get_long_host((p)->packet_data + dp_Res1)))
 #define GET_PCK_RES2(p) ((uae_s32)(get_long_host((p)->packet_data + dp_Res2)))
 #define GET_PCK_ARG1(p) ((uae_s32)(get_long_host((p)->packet_data + dp_Arg1)))
